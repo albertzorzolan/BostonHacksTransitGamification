@@ -72,16 +72,19 @@ To host `frontend/` somewhere else, set `window.EGG_API_BASE` in `frontend/confi
 
 ## How it works
 
-| Level | Points | Timer |
-|---|---|---|
-| 1 Easy | 10 | 2 min |
-| 2 Medium | 20 | 3 min |
-| 3 Hard | 30 | 4 min |
-| 4 Extreme | 40 | 5 min |
-| 5 Impossible | 60 | 6 min |
+| Level | Points | Timer | Photo the finder sees |
+|---|---|---|---|
+| 1 Easy | 10 | 3 min | sharp |
+| 2 Medium | 20 | 3 min | sharp |
+| 3 Hard | 30 | 3 min | sharp |
+| 4 Extreme | 40 | 3 min | blurred |
+| 5 Impossible | 60 | 3 min | heavily blurred |
+
+- **Blurred photos:** the server makes the blurred copy, so the sharp original's link is never sent to a finder. You see the original on the result screen once you've found it, and the photo check always compares against the original.
+- **Other players' find photos** stay hidden on their profiles while that egg can still be played, unless you've found it too.
 
 - Each station has one egg slot per level.
-- **Time bonus:** up to +50% of the level's points, depending on how much time is left.
+- **Time bonus:** up to +50% of the level's points, depending on how much of the 3 minutes is left.
 - **Race the next train:** the timer becomes the minutes until the next train, from MBTA `/predictions`. It's used only when the next train is 1.5–15 minutes away; otherwise you get the level timer.
 - **After a find**, the finder can hide the next egg at the same level within 30 minutes. If they skip, an older egg from that slot's pool rotates in. If the pool is empty, the found egg stays up.
 - **Empty slots** can be filled by anyone, which is how you seed a station.
