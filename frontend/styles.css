@@ -1,3 +1,12 @@
+/* Hallmark · checked: 2026-11-21 · genre: playful (inferred)
+ * floor: 0 FAIL · fixed: 16 (7a, 10a, 26a, 34, 39a, 40, 48, 63, 16, 39b, F1, F3, F6, F16, F23, F26) · structural: 3 printed (stations list length, map line colours, level ladder)
+ * built: the project · redesign: polish · v2.0.0 */
+/* Hallmark · waive 49b · leaderboard row link, the name over its find count · on the Leaderboard each player row stacks the username above how many finds they have, on purpose */
+/* Hallmark · dropped #/user/dd7a6273-3a46-493b-94b1-af2826da6a3c, #/user/a8e255a0-b138-4bc0-a6ee-785b5ec5b06e, 1073a41d-8bfd-4ae4-9b8f-746ce1aba034.jpg · the check database was reseeded after the before record, so the same players and photos have new ids; every leaderboard row still links to its player */
+/* Hallmark · dropped 6min · a live MBTA prediction, which changes between runs */
+/* Hallmark · reworded "find what's hiding in your station." to "Find what’s hiding in your station." · F1, a curly apostrophe in place of the straight one */
+/* Hallmark · dismissed 41 · .card paints var(--surface) and body text is var(--text); both swap together in the dark-mode token block */
+
 :root {
   --bg: #f4f2ee;
   --surface: #ffffff;
@@ -6,6 +15,7 @@
   --muted: #60646c;
   --border: #dcd8d0;
   --ink: #14161a;
+  --on-ink: #fbfaf7; /* text on ink and on the level colours; a warm near-white, never pure #fff */
   --accent: #f2c94c;
   --focus: var(--ink); /* yellow is only 1.4:1 on the light page; ink rings read on light, yellow on dark */
   --good: #1f8a4c;
@@ -20,6 +30,8 @@
   --l4: #e0682b;
   --l5: #14161a;
   --radius: 14px;
+  --shadow: 0 1px 3px rgb(20 22 26 / 0.14); /* the one shadow: the selected segment and the toast */
+  --ease-out: cubic-bezier(0.2, 0, 0, 1);
   --tabs-h: 64px;
   color-scheme: light;
 }
@@ -40,7 +52,12 @@
 * { box-sizing: border-box; }
 /* `hidden` must win over any display rule (the tab bar sets display: grid). */
 [hidden] { display: none !important; }
-html, body { margin: 0; }
+html, body { margin: 0; overflow-x: clip; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; scrollbar-color: var(--muted) var(--bg); }
+::selection { background: var(--accent); color: var(--ink); }
+/* No double-tap zoom delay on buttons and links. */
+a, button, label, select, input { touch-action: manipulation; }
+input, select { caret-color: var(--text); }
 body {
   font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   background: var(--bg);
@@ -59,7 +76,7 @@ button, input, select { font: inherit; color: inherit; }
   position: sticky; top: 0; z-index: 10;
   display: flex; align-items: center; justify-content: space-between;
   padding: calc(10px + env(safe-area-inset-top)) 16px 10px;
-  background: var(--ink); color: #fff;
+  background: var(--ink); color: var(--on-ink);
 }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 700; text-decoration: none; letter-spacing: -0.01em; }
 .me { font-size: 14px; opacity: 0.8; }
@@ -76,11 +93,17 @@ button, input, select { font: inherit; color: inherit; }
   font-size: 12px; text-decoration: none; color: var(--muted);
 }
 .tabs a.active { color: var(--text); font-weight: 600; }
+.tabs a:active { color: var(--text); background: var(--surface-2); }
 .tabs svg { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 
 main { max-width: 640px; margin: 0 auto; padding: 16px; }
-h1 { font-size: 26px; line-height: 1.15; margin: 4px 0 6px; letter-spacing: -0.02em; }
-h2 { font-size: 17px; margin: 22px 0 10px; }
+h1 { font-size: 26px; line-height: 1.15; margin: 4px 0 6px; letter-spacing: -0.02em; text-wrap: balance; }
+h2 { font-size: 17px; margin: 22px 0 10px; text-wrap: balance; }
+p { text-wrap: pretty; }
+/* Back links: a 44px tap target; the negative margin keeps them where they sat before. */
+.back { display: inline-flex; align-items: center; gap: 2px; min-height: 44px; margin: -12px 0 -8px -4px; padding-right: 8px; font-size: 13px; color: var(--muted); text-decoration: none; }
+.back svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
+.back:active { color: var(--text); }
 .sub { color: var(--muted); margin: 0 0 12px; }
 .small { font-size: 13px; color: var(--muted); }
 
@@ -95,13 +118,26 @@ h2 { font-size: 17px; margin: 22px 0 10px; }
   min-height: 46px; padding: 0 18px; border-radius: 12px; border: 1px solid var(--border);
   background: var(--surface); font-weight: 600; cursor: pointer; text-decoration: none;
   white-space: nowrap; flex-shrink: 0;
+  transition: transform 120ms var(--ease-out), background-color 120ms var(--ease-out);
 }
-.btn.primary { background: var(--ink); color: #fff; border-color: var(--ink); }
-@media (prefers-color-scheme: dark) { .btn.primary { background: var(--accent); color: #14161a; border-color: var(--accent); } }
+.btn:active { transform: translateY(1px); background: var(--surface-2); }
+.btn.primary { background: var(--ink); color: var(--on-ink); border-color: var(--ink); }
+.btn.primary:active { background: color-mix(in srgb, var(--ink) 82%, var(--on-ink)); }
+@media (prefers-color-scheme: dark) {
+  .btn.primary { background: var(--accent); color: var(--ink); border-color: var(--accent); }
+  .btn.primary:active { background: color-mix(in srgb, var(--accent) 82%, var(--ink)); }
+}
+@media (hover: hover) {
+  .btn:hover { background: var(--surface-2); }
+  .btn.primary:hover { background: color-mix(in srgb, var(--ink) 88%, var(--on-ink)); }
+}
+@media (hover: hover) and (prefers-color-scheme: dark) { .btn.primary:hover { background: color-mix(in srgb, var(--accent) 88%, var(--ink)); } }
 .btn.block { width: 100%; }
 .btn.small { min-height: 36px; padding: 0 12px; font-size: 14px; }
-.btn:disabled { opacity: 0.5; cursor: default; }
-.linkbtn { background: none; border: 0; padding: 0; color: var(--muted); text-decoration: underline; cursor: pointer; font-size: 14px; }
+/* Disabled reads three ways: faded, a not-allowed cursor, and the native disabled attribute (set in app.js). */
+.btn:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
+.linkbtn { display: inline-flex; align-items: center; min-height: 44px; background: none; border: 0; padding: 0; color: var(--muted); text-decoration: underline; cursor: pointer; font-size: 14px; }
+.linkbtn:active { color: var(--text); }
 
 .input {
   width: 100%; min-height: 46px; padding: 0 14px; border-radius: 12px;
@@ -112,7 +148,9 @@ h2 { font-size: 17px; margin: 22px 0 10px; }
 .dots { display: inline-flex; gap: 4px; }
 .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
 .pill { display: inline-block; font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 999px; background: var(--surface-2); }
-.pill.accent { background: var(--accent); color: #14161a; }
+.pill.accent { background: var(--accent); color: var(--ink); }
+/* The play screen's level badge: the level colour as the border, so the text stays readable on every level in both modes. */
+.pill.lvl { background: var(--surface); color: var(--text); border: 2px solid var(--lc); padding: 1px 8px; font-size: 13px; }
 
 .notice { padding: 12px 14px; border-radius: 12px; background: var(--surface-2); font-size: 14px; }
 .notice.bad { background: color-mix(in srgb, var(--bad) 15%, var(--surface)); }
@@ -121,16 +159,19 @@ h2 { font-size: 17px; margin: 22px 0 10px; }
 .toast {
   position: fixed; left: 50%; transform: translateX(-50%);
   bottom: calc(var(--tabs-h) + env(safe-area-inset-bottom) + 12px); z-index: 20;
-  background: var(--ink); color: #fff; padding: 10px 16px; border-radius: 12px; font-size: 14px;
-  max-width: calc(100% - 32px); box-shadow: 0 6px 20px rgb(0 0 0 / 0.25);
+  /* Text colour on a page-colour label, so it stands out in both modes (ink on the dark page was 1.03:1). */
+  background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 12px; font-size: 14px;
+  max-width: calc(100% - 32px); box-shadow: var(--shadow);
 }
 
 /* ---------- station list ---------- */
 .list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--surface); }
 .list li + li { border-top: 1px solid var(--border); }
 .list a, .list .item { display: flex; align-items: center; gap: 12px; padding: 13px 14px; text-decoration: none; }
+.list a:active { background: var(--surface-2); }
+@media (hover: hover) { .list a:hover { background: var(--surface-2); } }
 .list .name { font-weight: 600; }
-.list .meta { font-size: 13px; color: var(--muted); }
+.list .meta { display: inline-block; font-size: 13px; color: var(--muted); } /* its own line height when it runs to two lines */
 
 /* ---------- trains ---------- */
 .trains { display: grid; gap: 6px; }
@@ -146,41 +187,46 @@ h2 { font-size: 17px; margin: 22px 0 10px; }
 }
 .level .num {
   width: 44px; height: 44px; border-radius: 12px; display: grid; place-items: center;
-  font-weight: 800; font-size: 18px; color: #fff; background: var(--lc);
+  /* 20px bold is large text, where 3:1 is enough: levels 1 and 4 sit at 3.3:1. */
+  font-weight: 800; font-size: 20px; color: var(--on-ink); background: var(--lc);
 }
-@media (prefers-color-scheme: dark) { .level[data-level="5"] .num { color: #14161a; } }
+@media (prefers-color-scheme: dark) { .level[data-level="5"] .num { color: var(--ink); } }
 .level .title { font-weight: 700; }
-.level .desc { font-size: 13px; color: var(--muted); }
+.level .desc { font-size: 13px; color: var(--muted); text-wrap: pretty; }
 
 .toggle { display: flex; align-items: center; gap: 10px; font-size: 15px; }
 .toggle input { width: 22px; height: 22px; accent-color: var(--ink); }
 @media (prefers-color-scheme: dark) { .toggle input { accent-color: var(--accent); } } /* ink on the dark page is 1.03:1 */
 
 /* ---------- play ---------- */
-.play-photo { position: relative; border-radius: var(--radius); overflow: hidden; background: #000; }
+.play-photo { position: relative; border-radius: var(--radius); overflow: hidden; background: var(--ink); }
 .play-photo img { width: 100%; max-height: 58dvh; object-fit: contain; margin: 0 auto; touch-action: pinch-zoom; }
 .timer {
   font-size: 44px; font-weight: 800; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; line-height: 1;
 }
 .timer.low { color: var(--bad); }
 .timerbar { height: 8px; border-radius: 4px; background: var(--surface-2); overflow: hidden; }
-.timerbar > div { height: 100%; background: var(--ink); transition: width 1s linear; }
+/* The bar shrinks by scaleX (app.js sets it), never by width. Linear because it tracks the clock. */
+.timerbar > div { width: 100%; height: 100%; background: var(--ink); transform-origin: left center; transition: transform 1s linear; }
 @media (prefers-color-scheme: dark) { .timerbar > div { background: var(--accent); } }
-.big-points { font-size: 56px; font-weight: 800; line-height: 1; letter-spacing: -0.03em; }
+.big-points { font-size: 56px; font-weight: 800; line-height: 1; letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
 
 .file-hidden { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
-.preview { border-radius: var(--radius); overflow: hidden; background: #000; }
+.preview { border-radius: var(--radius); overflow: hidden; background: var(--ink); }
 .preview img { width: 100%; max-height: 45dvh; object-fit: contain; }
 .rules { margin: 0; padding-left: 18px; font-size: 14px; color: var(--muted); }
 
 /* ---------- leaderboard / profile ---------- */
 .seg { display: grid; grid-auto-flow: column; gap: 4px; padding: 4px; background: var(--surface-2); border-radius: 12px; }
 .seg button { border: 0; background: transparent; padding: 9px 6px; border-radius: 9px; font-weight: 600; font-size: 14px; cursor: pointer; color: var(--muted); }
-.seg button.on { background: var(--surface); color: var(--text); box-shadow: 0 1px 3px rgb(0 0 0 / 0.12); }
+.seg button:active { color: var(--text); }
+.seg button.on { background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
 .board { list-style: none; margin: 0; padding: 0; }
 .board li { position: relative; display: grid; grid-template-columns: 34px 1fr auto; gap: 10px; align-items: center; padding: 11px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; }
 .board li + li { margin-top: 6px; }
-.board li.me { outline: 2px solid var(--accent); }
+/* Your own row: the yellow ring alone is 1.4:1 on the light page, so the row is tinted too. */
+.board li.me { outline: 2px solid var(--accent); background: color-mix(in srgb, var(--accent) 16%, var(--surface)); }
+@media (hover: hover) { .board li:has(a.player:hover) { background: var(--surface-2); } }
 /* The player link stretches over its whole row, so anywhere on the row opens the profile. */
 .board a.player { text-decoration: none; }
 .board a.player::after { content: ''; position: absolute; inset: 0; border-radius: 12px; }
@@ -191,7 +237,7 @@ h2 { font-size: 17px; margin: 22px 0 10px; }
 .board .pts { font-weight: 800; font-variant-numeric: tabular-nums; }
 
 .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-.stat .v { font-size: 28px; font-weight: 800; line-height: 1.1; }
+.stat .v { font-size: 28px; font-weight: 800; line-height: 1.1; font-variant-numeric: tabular-nums; }
 .stat .k { font-size: 13px; color: var(--muted); }
 .finds { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
 .finds figure { margin: 0; }
@@ -199,8 +245,28 @@ h2 { font-size: 17px; margin: 22px 0 10px; }
 .finds figcaption { font-size: 12px; color: var(--muted); margin-top: 3px; }
 
 #map { height: calc(100dvh - 210px); min-height: 360px; border-radius: var(--radius); border: 1px solid var(--border); }
+/* Leaflet's controls in the app's colours, so they follow dark mode; #map outranks Leaflet's later stylesheet. */
+#map .leaflet-bar { border-color: var(--border); }
+#map .leaflet-bar a { background: var(--surface); color: var(--text); border-bottom-color: var(--border); }
+#map .leaflet-bar a:active { background: var(--surface-2); }
+#map .leaflet-bar a.leaflet-disabled { background: var(--surface-2); color: var(--muted); }
+#map .leaflet-control-attribution { background: var(--surface); color: var(--muted); }
+#map .leaflet-control-attribution a, #map .leaflet-popup-content a { color: var(--text); }
+#map .leaflet-popup-content-wrapper, #map .leaflet-popup-tip { background: var(--surface); color: var(--text); }
+#map a.leaflet-popup-close-button { color: var(--muted); }
+/* Rings drawn inside the control, over its own surface, not over the map tiles. */
+#map .leaflet-bar a:focus-visible { outline: 3px solid var(--focus); outline-offset: -4px; }
+#map .leaflet-control-attribution a:focus-visible { outline: 2px solid var(--focus); outline-offset: 0; }
 
 .empty { text-align: center; padding: 28px 12px; color: var(--muted); }
 .spin { width: 22px; height: 22px; border: 3px solid var(--surface-2); border-top-color: var(--text); border-radius: 50%; animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
-@media (prefers-reduced-motion: reduce) { .spin { animation-duration: 2.4s; } .timerbar > div { transition: none; } }
+@media (prefers-reduced-motion: reduce) {
+  .spin { animation-duration: 2.4s; }
+  .timerbar > div { transition: none; }
+  .btn { transition: background-color 120ms linear; }
+  .btn:active { transform: none; }
+}
+
+/* Shown only when JavaScript is off. */
+.noscript { max-width: 640px; margin: 0 auto; padding: 16px; }

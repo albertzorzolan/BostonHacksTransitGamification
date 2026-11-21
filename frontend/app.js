@@ -6,7 +6,7 @@ const app = $('#app');
 
 const LEVEL_COLORS = ['', 'var(--l1)', 'var(--l2)', 'var(--l3)', 'var(--l4)', 'var(--l5)'];
 const REPORT_REASONS = [
-  ['cant_find', "Can't be found"],
+  ['cant_find', "Can’t be found"],
   ['unsafe', 'Unsafe spot'],
   ['person', 'Shows a person'],
 ];
@@ -54,7 +54,7 @@ async function api(path, body) {
   try {
     res = await fetch(apiUrl(path), { method: body ? 'POST' : 'GET', headers, body: body ? JSON.stringify(body) : undefined });
   } catch {
-    throw new Error("Can't reach the game server. Check your connection.");
+    throw new Error("Can’t reach the game server. Check your connection.");
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -94,6 +94,12 @@ const lineDots = (lines) =>
     .join('')}</span>`;
 
 // The server refreshes a session's last-seen time at most once an hour, so don't claim more precision than that.
+// A back link with a chevron icon from the tab bar's icon set, sized for a thumb.
+const backLink = (href, label) =>
+  `<a href="${href}" class="back"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>${esc(label)}</a>`;
+// "found 2 times", "found once", "not found yet"
+const foundTimes = (n) => (n === 0 ? 'not found yet' : n === 1 ? 'found once' : `found ${n} times`);
+
 const relTime = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
 function fmtLastSeen(iso) {
   const hours = (Date.now() - new Date(iso).getTime()) / 3_600_000;
@@ -102,7 +108,7 @@ function fmtLastSeen(iso) {
   return relTime.format(-Math.floor(hours / 24), 'day');
 }
 
-// Sessions store the raw user-agent. Turn it into something like "iPhone · Safari".
+// Sessions store the raw user-agent. Turn it into something like "Safari on iPhone".
 function describeDevice(ua = '') {
   const os = /iPhone/.test(ua) ? 'iPhone'
     : /iPad/.test(ua) ? 'iPad'
@@ -119,7 +125,8 @@ function describeDevice(ua = '') {
     : /Chrome|CriOS/.test(ua) ? 'Chrome'
     : /Safari/.test(ua) ? 'Safari'
     : '';
-  return [os, browser].filter(Boolean).join(' · ') || 'Unknown device';
+  if (os && browser) return `${browser} on ${os}`;
+  return os || browser || 'Unknown device';
 }
 
 function distanceKm(a, b) {
@@ -140,7 +147,7 @@ async function photoToJpeg(file, max = 1280) {
     source = await new Promise((resolve, reject) => {
       const img = new Image();
       img.onload = () => resolve(img);
-      img.onerror = () => reject(new Error("Couldn't read that photo. Try again."));
+      img.onerror = () => reject(new Error("Couldn’t read that photo. Try again."));
       img.src = URL.createObjectURL(file);
     });
   }
@@ -169,7 +176,7 @@ const routes = [
   [/^#\/station\/([^/]+)$/, viewStation],
   [/^#\/play$/, viewPlay],
   [/^#\/hide$/, viewHide],
-  [/^#\/leaderboard$/, viewLeaderboard],
+  [/^#\/leaderboard(?:\?.*)?$/, viewLeaderboard],
   [/^#\/profile$/, viewProfile],
   [/^#\/user\/([^/]+)$/, viewPlayer],
   [/^#\/map$/, viewMap],
@@ -234,7 +241,7 @@ function viewSignup(mode = 'register') {
   const registering = mode === 'register';
   const min = state.config?.passwordMin ?? 8;
   app.innerHTML = `
-    <h1>Find what's hiding in your station.</h1>
+    <h1>Find what’s hiding in your station.</h1>
     <p class="sub">Riders photograph small things in MBTA stations. You get a photo and a timer, and you look around until you spot it. Find it, snap it, score points, then hide the next one.</p>
     <div class="seg" role="tablist" style="margin-bottom:12px">
       <button type="button" data-mode="register" class="${registering ? 'on' : ''}">Create account</button>
@@ -270,6 +277,14 @@ function viewSignup(mode = 'register') {
 }
 
 // ---------- stations ----------
+// "350 m away, 2 eggs hidden", or just the egg count when location is off.
+function stationMeta(s) {
+  const eggs = s.activeEggs ? `${s.activeEggs} egg${s.activeEggs > 1 ? 's' : ''} hidden` : 'no eggs yet';
+  if (s.km == null) return eggs[0].toUpperCase() + eggs.slice(1);
+  const dist = s.km < 1 ? `${Math.round(s.km * 1000)} m` : `${s.km.toFixed(1)} km`;
+  return `${dist} away, ${eggs}`;
+}
+
 async function viewStations() {
   loading('Loading stations…');
   const stations = await getStations();
@@ -299,7 +314,7 @@ async function viewStations() {
             (s) => `<li><a href="#/station/${encodeURIComponent(s.id)}">
               ${lineDots(s.lines)}
               <span><span class="name">${esc(s.name)}</span><br/>
-              <span class="meta">${s.km != null ? `${s.km < 1 ? Math.round(s.km * 1000) + ' m' : s.km.toFixed(1) + ' km'} · ` : ''}${s.activeEggs ? `${s.activeEggs} egg${s.activeEggs > 1 ? 's' : ''} hidden` : 'No eggs yet'}</span></span>
+              <span class="meta">${stationMeta(s)}</span></span>
               <span class="spacer"></span>${s.activeEggs ? `<span class="pill accent">${s.activeEggs}/5</span>` : ''}
             </a></li>`,
           )
@@ -321,7 +336,7 @@ async function viewStations() {
         const nearest = [...stations].sort((a, b) => distanceKm(origin, a) - distanceKm(origin, b))[0];
         msg.innerHTML = `Nearest: <a href="#/station/${encodeURIComponent(nearest.id)}"><strong>${esc(nearest.name)}</strong></a>`;
       },
-      () => (msg.textContent = "Couldn't get your location. Pick your station from the list."),
+      () => (msg.textContent = "Couldn’t get your location. Pick your station from the list."),
       { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 },
     );
   });
@@ -336,9 +351,9 @@ async function viewStation(id) {
   store('egg-last-station', id);
 
   app.innerHTML = `
-    <a href="#/" class="small">← All stations</a>
+    ${backLink('#/', 'All stations')}
     <h1>${esc(station.name)}</h1>
-    <div class="row" style="margin-bottom:6px">${lineDots(station.lines)}<span class="small">${esc([...new Set(station.lines.map((l) => l.name))].join(' · '))}</span></div>
+    <div class="row" style="margin-bottom:6px">${lineDots(station.lines)}<span class="small">${esc([...new Set(station.lines.map((l) => l.name))].join(', '))}</span></div>
 
     <h2>Next trains</h2>
     <div id="trains" class="card"><div class="small">Loading live times…</div></div>
@@ -347,7 +362,7 @@ async function viewStation(id) {
       <h2 style="margin:0">Eggs here</h2>
       <label class="toggle"><input id="race" type="checkbox" ${state.raceTrain ? 'checked' : ''}/> Race the next train</label>
     </div>
-    <p class="small" style="margin:6px 0 12px">${state.raceTrain ? 'Your timer is the time until the next train (1.5–15 min). Otherwise the level timer is used.' : 'Each level has its own timer. Turn on “Race the next train” to beat the train instead.'}</p>
+    <p class="small" style="margin:6px 0 12px">${state.raceTrain ? 'Your timer is the time until the next train (1.5 to 15 min). Otherwise the level timer is used.' : 'Each level has its own timer. Turn on “Race the next train” to beat the train instead.'}</p>
     <div class="levels">${slots.map(slotCard).join('')}</div>`;
 
   $('#race').addEventListener('change', (e) => {
@@ -403,18 +418,18 @@ function slotCard(slot) {
     desc = 'Empty. Be the first to hide one.';
     action = `<button class="btn small" data-hide="${slot.level}">Hide one</button>`;
   } else if (egg.mine) {
-    desc = `Your egg · found ${egg.timesFound}×`;
+    desc = `Your egg, ${foundTimes(egg.timesFound)}`;
     action = `<span class="pill">Yours</span>`;
   } else if (egg.foundByMe) {
-    desc = `Hidden by ${esc(egg.createdBy)} · found ${egg.timesFound}×`;
+    desc = `Hidden by ${esc(egg.createdBy)}, ${foundTimes(egg.timesFound)}`;
     action = `<span class="pill">Found ✓</span>`;
   } else {
-    desc = `Hidden by ${esc(egg.createdBy)} · ${Math.round(slot.seconds / 60)} min timer`;
+    desc = `Hidden by ${esc(egg.createdBy)}, with a ${Math.round(slot.seconds / 60)} min timer`;
     action = `<button class="btn small primary" data-play="${egg.id}">Play</button>`;
   }
   return `<div class="level" data-level="${slot.level}" style="--lc:${LEVEL_COLORS[slot.level]}">
     <div class="num">${slot.level}</div>
-    <div><div class="title">${esc(slot.name)} <span class="small">· ${slot.points} pts</span></div><div class="desc">${desc}</div></div>
+    <div><div class="title">${esc(slot.name)} <span class="small" style="margin-left:4px">${slot.points} pts</span></div><div class="desc">${desc}</div></div>
     ${action}
   </div>`;
 }
@@ -434,7 +449,7 @@ function viewPlay() {
 
   app.innerHTML = `
     <div class="row" style="justify-content:space-between">
-      <span class="pill" style="background:${LEVEL_COLORS[egg.level]};color:#fff">${egg.level} · ${esc(egg.levelName)} · ${egg.points} pts</span>
+      <span class="pill lvl" style="--lc:${LEVEL_COLORS[egg.level]}">Level ${egg.level}: ${esc(egg.levelName)}, ${egg.points} pts</span>
       <span class="small">${esc(egg.stationName)}</span>
     </div>
     <div class="row" style="margin:14px 0 8px; align-items:flex-end">
@@ -442,7 +457,7 @@ function viewPlay() {
       <span class="spacer"></span>
       <span class="small" style="text-align:right">${attempt.limitSource === 'train' ? `Beat the ${esc(attempt.train?.headsign || 'next')} train` : 'Level timer'}</span>
     </div>
-    <div class="timerbar"><div id="bar" style="width:100%"></div></div>
+    <div class="timerbar"><div id="bar"></div></div>
     <div class="play-photo" style="margin-top:12px"><img src="${apiUrl(egg.imageUrl)}" alt="The egg to find: a photo of something in this station" /></div>
     ${egg.hint ? `<p class="notice" style="margin-top:10px"><strong>Hint:</strong> ${esc(egg.hint)}</p>` : ''}
     <div id="status" style="margin-top:12px"></div>
@@ -451,7 +466,7 @@ function viewPlay() {
       I found it, take a photo
       <input id="cam" class="file-hidden" type="file" accept="image/*" capture="environment" />
     </label>
-    <div class="row" style="margin-top:14px; flex-wrap:wrap">
+    <div class="row" style="margin-top:14px; flex-wrap:wrap; row-gap:0">
       <span class="small">Report:</span>
       ${REPORT_REASONS.map(([k, label]) => `<button class="linkbtn" data-report="${k}">${label}</button>`).join('')}
       <span class="spacer"></span>
@@ -464,7 +479,7 @@ function viewPlay() {
     if (!clock) return;
     clock.textContent = fmtClock(s);
     clock.classList.toggle('low', s <= 20);
-    $('#bar').style.width = `${Math.max(0, (s / attempt.limitSeconds) * 100)}%`;
+    $('#bar').style.transform = `scaleX(${Math.max(0, Math.min(1, s / attempt.limitSeconds))})`;
     if (graceLeft() <= 0) {
       play.result = { status: 'expired' };
       renderResult();
@@ -521,7 +536,7 @@ function renderResult() {
 
   if (result.status === 'expired') {
     app.innerHTML = `
-      <h1>Time's up</h1>
+      <h1>Time’s up</h1>
       <p class="sub">The ${esc(egg.levelName)} egg at ${esc(egg.stationName)} stays hidden for now.</p>
       <a class="btn primary block" href="${back}">Try another level</a>`;
     state.play = null;
@@ -530,11 +545,12 @@ function renderResult() {
 
   const { points, verification } = result;
   app.innerHTML = `
-    <p class="small">${esc(egg.stationName)} · ${esc(egg.levelName)}</p>
+    <p class="small">${esc(egg.levelName)} egg at ${esc(egg.stationName)}</p>
     <h1>Found it!</h1>
     <div class="card" style="margin:12px 0">
       <div class="big-points">+${points.total}</div>
-      <div class="small" style="margin-top:6px">${points.base} for ${esc(egg.levelName)} + ${points.bonus} time bonus · ${fmtClock(result.secondsTaken)} taken</div>
+      <div class="small" style="margin-top:6px">${points.base} for ${esc(egg.levelName)} + ${points.bonus} time bonus</div>
+      <div class="small">Found in ${fmtClock(result.secondsTaken)}</div>
       <div class="small" style="margin-top:6px">${verification.method === 'gemini' ? `✓ Photo matched${verification.reason ? ': ' + esc(verification.reason) : ''}` : esc(verification.reason)}</div>
     </div>
     <h2>Hide the next one?</h2>
@@ -562,13 +578,13 @@ function viewHide() {
   let image = null;
 
   app.innerHTML = `
-    <a href="#/station/${encodeURIComponent(hide.stationId)}" class="small">← ${esc(hide.stationName)}</a>
+    ${backLink(`#/station/${encodeURIComponent(hide.stationId)}`, hide.stationName)}
     <h1>Hide a ${esc(level.name)} egg</h1>
     <p class="sub">Worth ${level.points} points to whoever finds it. Pick something that fits the level: Easy should be findable in a minute, Impossible should take real searching.</p>
     <ul class="rules">
       <li>Only things you can see from public areas. No tracks or staff-only spots.</li>
       <li>No other riders' faces.</li>
-      <li>Photograph something that's already there. Don't put up stickers or objects.</li>
+      <li>Photograph something that’s already there. Don’t put up stickers or objects.</li>
       <li>Stay behind the yellow line.</li>
     </ul>
     <div id="preview" class="preview" style="margin-top:14px" hidden></div>
@@ -610,7 +626,7 @@ function viewHide() {
       });
       state.pendingHide = null;
       state.stations = null; // egg counts changed
-      toast('Egg hidden. Now someone else has to find it.');
+      // No toast: the station page opens with the new egg in its slot, marked "Yours".
       location.hash = `#/station/${encodeURIComponent(hide.stationId)}`;
     } catch (err) {
       $('#err').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
@@ -621,13 +637,27 @@ function viewHide() {
 }
 
 // ---------- leaderboard ----------
+// The board's tab and station live in the URL (#/leaderboard?view=station&station=place-pktrm), so a reload
+// or a shared link opens the same board. state.board remembers them for the tab bar's plain #/leaderboard link.
+const BOARD_MODES = ['all', 'station', 'lines'];
+function boardHash({ mode, stationId } = state.board) {
+  if (mode === 'station' && stationId) return `#/leaderboard?view=station&station=${encodeURIComponent(stationId)}`;
+  return mode === 'lines' ? '#/leaderboard?view=lines' : '#/leaderboard';
+}
+
 async function viewLeaderboard() {
   loading();
   const stations = await getStations();
+  const params = new URLSearchParams(location.hash.split('?')[1] || '');
+  if (BOARD_MODES.includes(params.get('view'))) state.board.mode = params.get('view');
+  if (stations.some((s) => s.id === params.get('station'))) state.board.stationId = params.get('station');
   let { mode } = state.board;
   let stationId = state.board.stationId || state.lastStationId || stations.find((s) => s.activeEggs)?.id || stations[0]?.id;
+  // Rewrite the address without a new history entry (replaceState doesn't fire hashchange).
+  const syncUrl = () => history.replaceState(null, '', boardHash({ mode, stationId }));
+  syncUrl();
   const monthLabel = new Date().toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'America/New_York' });
-  const segButton = (m, label) => `<button data-mode="${m}" class="${mode === m ? 'on' : ''}">${label}</button>`;
+  const segButton = (m, label) => `<button type="button" role="tab" aria-selected="${mode === m}" data-mode="${m}" class="${mode === m ? 'on' : ''}">${label}</button>`;
 
   app.innerHTML = `
     <h1>Leaderboard</h1>
@@ -653,7 +683,7 @@ async function viewLeaderboard() {
     if (mode === 'lines') {
       const colors = { Red: 'var(--red)', Orange: 'var(--orange)', Blue: 'var(--blue)', Green: 'var(--green)' };
       box.innerHTML = data.lines.length
-        ? `<ol class="board">${data.lines.map((l, i) => `<li><span class="rank">${i + 1}</span><span class="row"><span class="dot" style="background:${colors[l.line] ?? '#888'}"></span><strong>${esc(l.line)} Line</strong></span><span class="pts">${l.points}</span></li>`).join('')}</ol>`
+        ? `<ol class="board">${data.lines.map((l, i) => `<li><span class="rank">${i + 1}</span><span class="row"><span class="dot" style="background:${colors[l.line] ?? 'var(--muted)'}"></span><strong>${esc(l.line)} Line</strong></span><span class="pts">${l.points}</span></li>`).join('')}</ol>`
         : '<div class="empty">No finds yet this month.</div>';
       return;
     }
@@ -671,13 +701,18 @@ async function viewLeaderboard() {
   app.querySelectorAll('.seg button').forEach((b) =>
     b.addEventListener('click', () => {
       mode = state.board.mode = b.dataset.mode;
-      app.querySelectorAll('.seg button').forEach((x) => x.classList.toggle('on', x === b));
+      app.querySelectorAll('.seg button').forEach((x) => {
+        x.classList.toggle('on', x === b);
+        x.setAttribute('aria-selected', String(x === b));
+      });
       $('#stationPick').hidden = mode !== 'station';
+      syncUrl();
       draw();
     }),
   );
   $('#sel').addEventListener('change', (e) => {
     stationId = state.board.stationId = e.target.value;
+    syncUrl();
     draw();
   });
   await draw();
@@ -701,14 +736,14 @@ function profileStats(p, mine) {
     <h2>Recent finds</h2>
     ${p.recentFinds.length
       ? `<div class="finds">${p.recentFinds
-          .map((f) => `<figure><img src="${apiUrl(f.photoUrl)}" alt="Find at ${esc(f.stationName)}" loading="lazy"/><figcaption>${esc(f.stationName)} · ${esc(f.levelName)} · +${f.points}</figcaption></figure>`)
+          .map((f) => `<figure><img src="${apiUrl(f.photoUrl)}" alt="Find at ${esc(f.stationName)}" loading="lazy"/><figcaption>${esc(f.stationName)}<br/>+${f.points} on ${esc(f.levelName)}</figcaption></figure>`)
           .join('')}</div>`
       : `<div class="empty">${mine ? 'No finds yet. Pick a station and play a round.' : 'No finds yet.'}</div>`}`;
 }
 
 // Every device signed in to this account, from /api/auth/sessions. `sessions` is null if that request failed.
 function deviceList(sessions) {
-  if (!sessions) return `<div class="notice">Couldn't load your devices right now.</div>`;
+  if (!sessions) return `<div class="notice">Couldn’t load your devices right now.</div>`;
   const thisYear = new Date().getFullYear();
   const fmtDay = (iso) => {
     const d = new Date(iso);
@@ -719,11 +754,11 @@ function deviceList(sessions) {
       .map(
         (s) => `<li><div class="item">
           <span><span class="name">${esc(describeDevice(s.device))}</span>${s.current ? ' <span class="pill accent">This device</span>' : ''}<br/>
-          <span class="meta">${s.current ? 'Active now' : `Active ${fmtLastSeen(s.lastSeenAt)}`} · signed in ${fmtDay(s.createdAt)}</span></span>
+          <span class="meta">${s.current ? 'Active now' : `Active ${fmtLastSeen(s.lastSeenAt)}`}<br/>Signed in ${fmtDay(s.createdAt)}</span></span>
         </div></li>`,
       )
       .join('')}</ul>
-    ${sessions.length > 1 ? `<p class="small" style="margin:8px 2px 0">Don't recognize one, or lost a phone? Use “Sign out on all devices” below, then sign back in here.</p>` : ''}`;
+    ${sessions.length > 1 ? `<p class="small" style="margin:8px 2px 0">Don’t recognize one, or lost a phone? Use “Sign out on all devices” below, then sign back in here.</p>` : ''}`;
 }
 
 async function viewProfile() {
@@ -758,7 +793,7 @@ async function viewPlayer(id) {
   loading();
   const p = await api(`/api/users/${encodeURIComponent(id)}`);
   app.innerHTML = `
-    <a href="#/leaderboard" class="small">← Leaderboard</a>
+    ${backLink(boardHash(), 'Leaderboard')}
     <h1>${esc(p.user.username)}</h1>
     ${profileStats(p, false)}`;
 }
@@ -774,7 +809,7 @@ function loadLeaflet() {
     const js = document.createElement('script');
     js.src = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js';
     js.onload = resolve;
-    js.onerror = () => reject(new Error("Couldn't load the map. Check the internet connection."));
+    js.onerror = () => reject(new Error("Couldn’t load the map. Check the internet connection."));
     document.head.append(js);
   });
 }
@@ -792,16 +827,20 @@ async function viewMap() {
     maxZoom: 18,
     attribution: '&copy; OpenStreetMap contributors',
   }).addTo(map);
+  // Marker colours come from the stylesheet's tokens; the line colours are MBTA data.
+  const css = getComputedStyle(document.documentElement);
+  const ring = css.getPropertyValue('--on-ink').trim();
+  const noLine = css.getPropertyValue('--muted').trim();
   for (const s of stations) {
     L.circleMarker([s.lat, s.lng], {
       radius: 5 + s.activeEggs * 1.6,
-      color: '#fff',
+      color: ring,
       weight: 2,
-      fillColor: s.lines[0]?.color ?? '#555',
+      fillColor: s.lines[0]?.color ?? noLine,
       fillOpacity: s.activeEggs ? 1 : 0.55,
     })
       .addTo(map)
-      .bindPopup(`<strong>${esc(s.name)}</strong><br/>${s.activeEggs}/5 eggs hidden<br/><a href="#/station/${encodeURIComponent(s.id)}">Open station →</a>`);
+      .bindPopup(`<strong>${esc(s.name)}</strong><br/>${s.activeEggs}/5 eggs hidden<br/><a href="#/station/${encodeURIComponent(s.id)}">Open station</a>`);
   }
 }
 
