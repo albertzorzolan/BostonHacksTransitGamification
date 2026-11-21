@@ -424,7 +424,7 @@ function slotCard(slot) {
     desc = `Hidden by ${esc(egg.createdBy)}, ${foundTimes(egg.timesFound)}`;
     action = `<span class="pill">Found ✓</span>`;
   } else {
-    desc = `Hidden by ${esc(egg.createdBy)}, with a ${Math.round(slot.seconds / 60)} min timer`;
+    desc = `Hidden by ${esc(egg.createdBy)}, with a ${Math.round(slot.seconds / 60)}&nbsp;min timer`;
     action = `<button class="btn small primary" data-play="${egg.id}">Play</button>`;
   }
   return `<div class="level" data-level="${slot.level}" style="--lc:${LEVEL_COLORS[slot.level]}">
