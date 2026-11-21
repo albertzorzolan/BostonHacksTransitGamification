@@ -41,7 +41,7 @@ By default the backend also serves `frontend/`, so phones need only one URL. To 
 
 - Players sign up with a username and password. Passwords are hashed with scrypt.
 - Each sign-in creates a session for that device, using a random bearer token. The database stores only a SHA-256 hash of the token.
-- A session expires after 30 days without use. Profile → "Sign out on all devices" ends every session on the account.
+- A session expires after 30 days without use. Profile lists every device signed in to the account, and "Sign out on all devices" ends all of those sessions.
 
 ### Environment (`backend/.env`)
 
@@ -76,7 +76,7 @@ By default the backend also serves `frontend/`, so phones need only one URL. To 
 - **Rules:**
   - You can't play your own egg, and each egg scores once per player.
   - An egg is retired after 3 reports, or after 7 days live with no finds.
-- **Leaderboard:** this month (Boston time) for everyone, by station, or by line (Red / Orange / Blue / Green).
+- **Leaderboard:** this month (Boston time) for everyone, by station, or by line (Red / Orange / Blue / Green). Tap a player to see their stats and recent finds.
 
 ## Code map
 

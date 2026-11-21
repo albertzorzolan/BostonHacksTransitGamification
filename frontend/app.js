@@ -25,6 +25,7 @@ const state = {
   raceTrain: readStored('egg-race-train') ?? false,
   play: null, // current round
   pendingHide: null, // { stationId, level, findId }
+  board: { mode: 'all', stationId: null }, // leaderboard tab, kept when you open a player and come back
   timers: [],
   map: null,
 };
@@ -92,6 +93,35 @@ const lineDots = (lines) =>
     .map((l) => `<span class="dot" style="background:${l.color}" title="${esc(l.name)}"></span>`)
     .join('')}</span>`;
 
+// The server refreshes a session's last-seen time at most once an hour, so don't claim more precision than that.
+const relTime = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
+function fmtLastSeen(iso) {
+  const hours = (Date.now() - new Date(iso).getTime()) / 3_600_000;
+  if (hours < 1) return 'within the last hour';
+  if (hours < 24) return relTime.format(-Math.floor(hours), 'hour');
+  return relTime.format(-Math.floor(hours / 24), 'day');
+}
+
+// Sessions store the raw user-agent. Turn it into something like "iPhone · Safari".
+function describeDevice(ua = '') {
+  const os = /iPhone/.test(ua) ? 'iPhone'
+    : /iPad/.test(ua) ? 'iPad'
+    : /Android/.test(ua) ? 'Android'
+    : /Windows/.test(ua) ? 'Windows'
+    : /CrOS/.test(ua) ? 'Chromebook'
+    : /Macintosh|Mac OS X/.test(ua) ? 'Mac'
+    : /Linux/.test(ua) ? 'Linux'
+    : '';
+  const browser = /Edg(A|iOS)?\//.test(ua) ? 'Edge'
+    : /OPR\//.test(ua) ? 'Opera'
+    : /SamsungBrowser/.test(ua) ? 'Samsung Internet'
+    : /Firefox|FxiOS/.test(ua) ? 'Firefox'
+    : /Chrome|CriOS/.test(ua) ? 'Chrome'
+    : /Safari/.test(ua) ? 'Safari'
+    : '';
+  return [os, browser].filter(Boolean).join(' · ') || 'Unknown device';
+}
+
 function distanceKm(a, b) {
   const R = 6371;
   const toRad = (d) => (d * Math.PI) / 180;
@@ -141,6 +171,7 @@ const routes = [
   [/^#\/hide$/, viewHide],
   [/^#\/leaderboard$/, viewLeaderboard],
   [/^#\/profile$/, viewProfile],
+  [/^#\/user\/([^/]+)$/, viewPlayer],
   [/^#\/map$/, viewMap],
 ];
 
@@ -155,7 +186,13 @@ async function render() {
   if (!state.user) return viewSignup();
 
   const hash = location.hash || '#/';
-  const tab = hash.startsWith('#/map') ? 'map' : hash.startsWith('#/leaderboard') ? 'leaderboard' : hash.startsWith('#/profile') ? 'profile' : 'stations';
+  const tab = hash.startsWith('#/map')
+    ? 'map'
+    : hash.startsWith('#/leaderboard') || hash.startsWith('#/user/')
+      ? 'leaderboard'
+      : hash.startsWith('#/profile')
+        ? 'profile'
+        : 'stations';
   document.querySelectorAll('#tabs a').forEach((a) => a.classList.toggle('active', a.dataset.tab === tab));
 
   for (const [re, view] of routes) {
@@ -587,19 +624,20 @@ function viewHide() {
 async function viewLeaderboard() {
   loading();
   const stations = await getStations();
-  let mode = 'all';
-  let stationId = state.lastStationId || stations.find((s) => s.activeEggs)?.id || stations[0]?.id;
+  let { mode } = state.board;
+  let stationId = state.board.stationId || state.lastStationId || stations.find((s) => s.activeEggs)?.id || stations[0]?.id;
   const monthLabel = new Date().toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'America/New_York' });
+  const segButton = (m, label) => `<button data-mode="${m}" class="${mode === m ? 'on' : ''}">${label}</button>`;
 
   app.innerHTML = `
     <h1>Leaderboard</h1>
-    <p class="sub">${esc(monthLabel)}. Points reset at the start of each month.</p>
+    <p class="sub">${esc(monthLabel)}. Points reset at the start of each month. Tap a player to see their finds.</p>
     <div class="seg" role="tablist">
-      <button data-mode="all" class="on">Everyone</button>
-      <button data-mode="station">By station</button>
-      <button data-mode="lines">By line</button>
+      ${segButton('all', 'Everyone')}
+      ${segButton('station', 'By station')}
+      ${segButton('lines', 'By line')}
     </div>
-    <div id="stationPick" style="margin-top:10px" hidden>
+    <div id="stationPick" style="margin-top:10px" ${mode === 'station' ? '' : 'hidden'}>
       <select id="sel" class="input" aria-label="Station">${[...stations]
         .sort((a, b) => a.name.localeCompare(b.name))
         .map((s) => `<option value="${esc(s.id)}" ${s.id === stationId ? 'selected' : ''}>${esc(s.name)}</option>`)
@@ -621,38 +659,40 @@ async function viewLeaderboard() {
     }
     box.innerHTML = data.rows.length
       ? `<ol class="board">${data.rows
-          .map((r) => `<li class="${r.userId === state.user.id ? 'me' : ''}"><span class="rank">${r.rank}</span><span><strong>${esc(r.username)}</strong><br/><span class="small">${r.finds} find${r.finds === 1 ? '' : 's'}</span></span><span class="pts">${r.points}</span></li>`)
+          .map((r) => {
+            const mine = r.userId === state.user.id;
+            const href = mine ? '#/profile' : `#/user/${encodeURIComponent(r.userId)}`;
+            return `<li class="${mine ? 'me' : ''}"><span class="rank">${r.rank}</span><a class="player" href="${href}"><strong>${esc(r.username)}</strong><br/><span class="small">${r.finds} find${r.finds === 1 ? '' : 's'}</span></a><span class="pts">${r.points}</span></li>`;
+          })
           .join('')}</ol>`
       : '<div class="empty">No finds yet. Be the first on the board.</div>';
   };
 
   app.querySelectorAll('.seg button').forEach((b) =>
     b.addEventListener('click', () => {
-      mode = b.dataset.mode;
+      mode = state.board.mode = b.dataset.mode;
       app.querySelectorAll('.seg button').forEach((x) => x.classList.toggle('on', x === b));
       $('#stationPick').hidden = mode !== 'station';
       draw();
     }),
   );
   $('#sel').addEventListener('change', (e) => {
-    stationId = e.target.value;
+    stationId = state.board.stationId = e.target.value;
     draw();
   });
   await draw();
 }
 
-// ---------- profile ----------
-async function viewProfile() {
-  loading();
-  const p = await api(`/api/users/${state.user.id}`);
-  app.innerHTML = `
-    <h1>${esc(p.user.username)}</h1>
+// ---------- profiles ----------
+// Rank, stats, finds by level and recent finds. `mine` switches the wording between "you" and "they".
+function profileStats(p, mine) {
+  return `
     <p class="sub">${p.monthRank ? `#${p.monthRank} this month` : 'Not on the board yet this month'}</p>
     <div class="stats">
       <div class="card stat"><div class="v">${p.monthPoints}</div><div class="k">Points this month</div></div>
       <div class="card stat"><div class="v">${p.allTimePoints}</div><div class="k">Points all-time</div></div>
-      <div class="card stat"><div class="v">${p.eggsHidden}</div><div class="k">Eggs you hid</div></div>
-      <div class="card stat"><div class="v">${p.timesYourEggsWereFound}</div><div class="k">Times others found yours</div></div>
+      <div class="card stat"><div class="v">${p.eggsHidden}</div><div class="k">${mine ? 'Eggs you hid' : 'Eggs hidden'}</div></div>
+      <div class="card stat"><div class="v">${p.timesYourEggsWereFound}</div><div class="k">${mine ? 'Times others found yours' : 'Times others found theirs'}</div></div>
     </div>
     <h2>Finds by level</h2>
     <div class="card">${Object.entries(p.findsByLevel)
@@ -663,7 +703,41 @@ async function viewProfile() {
       ? `<div class="finds">${p.recentFinds
           .map((f) => `<figure><img src="${apiUrl(f.photoUrl)}" alt="Find at ${esc(f.stationName)}" loading="lazy"/><figcaption>${esc(f.stationName)} · ${esc(f.levelName)} · +${f.points}</figcaption></figure>`)
           .join('')}</div>`
-      : '<div class="empty">No finds yet. Pick a station and play a round.</div>'}
+      : `<div class="empty">${mine ? 'No finds yet. Pick a station and play a round.' : 'No finds yet.'}</div>`}`;
+}
+
+// Every device signed in to this account, from /api/auth/sessions. `sessions` is null if that request failed.
+function deviceList(sessions) {
+  if (!sessions) return `<div class="notice">Couldn't load your devices right now.</div>`;
+  const thisYear = new Date().getFullYear();
+  const fmtDay = (iso) => {
+    const d = new Date(iso);
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', ...(d.getFullYear() !== thisYear && { year: 'numeric' }) });
+  };
+  return `
+    <ul class="list devices">${sessions
+      .map(
+        (s) => `<li><div class="item">
+          <span><span class="name">${esc(describeDevice(s.device))}</span>${s.current ? ' <span class="pill accent">This device</span>' : ''}<br/>
+          <span class="meta">${s.current ? 'Active now' : `Active ${fmtLastSeen(s.lastSeenAt)}`} · signed in ${fmtDay(s.createdAt)}</span></span>
+        </div></li>`,
+      )
+      .join('')}</ul>
+    ${sessions.length > 1 ? `<p class="small" style="margin:8px 2px 0">Don't recognize one, or lost a phone? Use “Sign out on all devices” below, then sign back in here.</p>` : ''}`;
+}
+
+async function viewProfile() {
+  loading();
+  const [p, sessions] = await Promise.all([
+    api(`/api/users/${state.user.id}`),
+    // The devices list is extra: if it fails, still show the rest of the profile.
+    api('/api/auth/sessions').then((d) => d.sessions, () => null),
+  ]);
+  app.innerHTML = `
+    <h1>${esc(p.user.username)}</h1>
+    ${profileStats(p, true)}
+    <h2>Signed-in devices</h2>
+    ${deviceList(sessions)}
     <h2>Account</h2>
     <div class="card stack">
       <p class="small">Signed in as <strong>${esc(state.user.username)}</strong>. Use the same username and password to play on another device.</p>
@@ -676,6 +750,17 @@ async function viewProfile() {
   $('#outAll').addEventListener('click', () => {
     if (confirm('Sign out on every phone and computer using this account?')) signOut({ remote: true, everywhere: true });
   });
+}
+
+// Another player's public profile, opened from the leaderboard.
+async function viewPlayer(id) {
+  if (id === state.user.id) return location.replace('#/profile');
+  loading();
+  const p = await api(`/api/users/${encodeURIComponent(id)}`);
+  app.innerHTML = `
+    <a href="#/leaderboard" class="small">← Leaderboard</a>
+    <h1>${esc(p.user.username)}</h1>
+    ${profileStats(p, false)}`;
 }
 
 // ---------- map ----------
