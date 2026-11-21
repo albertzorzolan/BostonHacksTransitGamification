@@ -17,6 +17,7 @@ const SCHEMA = `test_${crypto.randomBytes(4).toString('hex')}`;
 const STATIONS = [
   { id: 'place-kencl', name: 'Kenmore', lat: 42.3489, lng: -71.0952, lines: [{ id: 'Green-B', name: 'Green Line B', color: '#00843D' }] },
   { id: 'place-pktrm', name: 'Park Street', lat: 42.3564, lng: -71.0624, lines: [{ id: 'Red', name: 'Red Line', color: '#DA291C' }, { id: 'Green-B', name: 'Green Line B', color: '#00843D' }] },
+  { id: 'place-dwnxg', name: 'Downtown Crossing', lat: 42.3555, lng: -71.0605, lines: [{ id: 'Red', name: 'Red Line', color: '#DA291C' }, { id: 'Orange', name: 'Orange Line', color: '#ED8B00' }] },
 ];
 const fakeMbta = {
   loadStations: async () => STATIONS,
@@ -143,7 +144,8 @@ test('full round: hide, find, hide next, leaderboard', async () => {
   assert.deepEqual(found.points, { base: 20, bonus: 7, total: 27 });
 
   assert.equal((await call('/api/attempts', { eggId: egg.id }, ben)).status, 409, 'no double finds');
-  assert.equal((await call(`/api/attempts/${round.attempt.id}/find`, { image: IMG }, ben)).status, 409);
+  const resent = await ok(`/api/attempts/${round.attempt.id}/find`, { image: IMG }, ben);
+  assert.deepEqual([resent.findId, resent.replayed, resent.points.total], [found.findId, true, 27], 'a resent find gets the saved find back');
 
   // Hide-next must match the station and level of the find.
   assert.equal((await call('/api/eggs', { stationId: 'place-kencl', level: 3, findId: found.findId, image: IMG }, ben)).status, 400);
@@ -181,9 +183,122 @@ test('the same round submitted twice at once scores once', async () => {
   const eggId = (await ok('/api/stations/place-pktrm')).slots[1].egg.id;
   const round = await ok('/api/attempts', { eggId }, ned);
   const results = await Promise.all([1, 2, 3].map(() => call(`/api/attempts/${round.attempt.id}/find`, { image: IMG }, ned)));
-  assert.deepEqual(results.map((r) => r.status).sort(), [200, 409, 409]);
+  // Every copy gets the same saved find back (a retry after lost signal must not look like an error).
+  assert.deepEqual(results.map((r) => r.status), [200, 200, 200]);
+  assert.equal(new Set(results.map((r) => r.data.findId)).size, 1);
+  assert.equal(results.filter((r) => r.data.replayed).length, 2);
   const { rows } = await db.query('select count(*)::int as n from finds where user_id = $1', [ned.id]);
   assert.equal(rows[0].n, 1);
+});
+
+test('a running round resumes instead of restarting; giving up or running out starts a cooldown', async () => {
+  const oli = await user('oli');
+  const pat = await user('pat');
+  await ok('/api/eggs', { stationId: 'place-kencl', level: 1, image: IMG }, oli);
+  const eggId = (await ok('/api/stations/place-kencl')).slots[0].egg.id;
+
+  const round = await ok('/api/attempts', { eggId, mode: 'fixed' }, pat);
+  assert.equal(round.attempt.secondsLeft, 120);
+  clock += 30_000;
+  // The app was closed or reloaded: playing again picks up the same round, 30 s in.
+  const again = await ok('/api/attempts', { eggId, mode: 'fixed' }, pat);
+  assert.equal(again.resumed, true);
+  assert.equal(again.attempt.id, round.attempt.id);
+  assert.equal(again.attempt.secondsLeft, 90);
+
+  const active = await ok('/api/me/active', null, pat);
+  assert.equal(active.round.attempt.id, round.attempt.id);
+  assert.equal(active.round.attempt.secondsLeft, 90);
+  assert.equal(active.round.station.id, 'place-kencl');
+  assert.equal(active.round.egg.imageUrl, round.egg.imageUrl);
+  assert.equal((await call('/api/me/active')).status, 401);
+  const slot = (await ok('/api/stations/place-kencl', null, pat)).slots[0].egg;
+  assert.equal(slot.round.secondsLeft, 90);
+  assert.equal(slot.retryAt, null);
+
+  assert.equal((await call(`/api/attempts/${round.attempt.id}/give-up`, {}, oli)).status, 403, "can't end someone else's round");
+  const gaveUp = await ok(`/api/attempts/${round.attempt.id}/give-up`, {}, pat);
+  assert.equal(gaveUp.status, 'given_up');
+  assert.equal(Date.parse(gaveUp.retryAt), clock + 60 * 60_000);
+  const blocked = await call('/api/attempts', { eggId, mode: 'fixed' }, pat);
+  assert.equal(blocked.status, 409);
+  assert.match(blocked.data.error, /gave up on this egg.*60 minutes/);
+  assert.equal((await ok('/api/me/active', null, pat)).round, null);
+  const cooling = (await ok('/api/stations/place-kencl', null, pat)).slots[0].egg;
+  assert.equal(cooling.round, null);
+  assert.ok(cooling.retryAt);
+  assert.equal((await call(`/api/attempts/${round.attempt.id}/find`, { image: IMG }, pat)).status, 409, 'a given-up round takes no finds');
+
+  clock += 61 * 60_000;
+  const fresh = await ok('/api/attempts', { eggId, mode: 'fixed' }, pat);
+  assert.notEqual(fresh.attempt.id, round.attempt.id);
+  assert.equal(fresh.attempt.secondsLeft, 120);
+  assert.equal(fresh.resumed, undefined);
+
+  clock += (120 + 16) * 1000; // let it run out without submitting anything
+  const late = await call('/api/attempts', { eggId, mode: 'fixed' }, pat);
+  assert.equal(late.status, 409);
+  assert.match(late.data.error, /ran out of time/);
+  assert.equal((await ok('/api/me/active', null, pat)).round, null);
+});
+
+test('finds you can still hide for are listed; the upload time does not count against the clock', async () => {
+  const una = await user('una');
+  const vic = await user('vic');
+  await ok('/api/eggs', { stationId: 'place-kencl', level: 3, image: IMG }, una);
+  const eggId = (await ok('/api/stations/place-kencl')).slots[2].egg.id;
+  const round = await ok('/api/attempts', { eggId, mode: 'fixed' }, vic);
+
+  // Headers arrive at 230 s (inside 240 s), then the photo takes 60 s to upload.
+  clock += 230_000;
+  const body = JSON.stringify({ image: IMG });
+  const res = await new Promise((resolve, reject) => {
+    const req = http.request(`${base}/api/attempts/${round.attempt.id}/find`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body), authorization: `Bearer ${vic.token}` },
+    }, (r) => {
+      let data = '';
+      r.on('data', (c) => (data += c));
+      r.on('end', () => resolve({ status: r.statusCode, data: JSON.parse(data) }));
+    });
+    req.on('error', reject);
+    req.write(body.slice(0, 10));
+    setTimeout(() => {
+      clock += 60_000;
+      req.end(body.slice(10));
+    }, 100);
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.data.status, 'found', 'judged on when the upload started');
+  assert.equal(res.data.secondsTaken, 230);
+
+  const { hides } = await ok('/api/me/active', null, vic);
+  assert.equal(hides.length, 1);
+  assert.deepEqual([hides[0].findId, hides[0].stationId, hides[0].level, hides[0].levelName], [res.data.findId, 'place-kencl', 3, 'Hard']);
+  assert.equal(Date.parse(hides[0].expiresAt), clock + 30 * 60_000, '30 minutes from when the find was saved');
+
+  await ok('/api/eggs', { stationId: 'place-kencl', level: 3, findId: res.data.findId, image: IMG }, vic);
+  assert.equal((await ok('/api/me/active', null, vic)).hides.length, 0, 'used up once the next egg is hidden');
+});
+
+test('finds at one two-line station are not a transfer; a find at a second station is', async () => {
+  const wes = await user('wes');
+  const xia = await user('xia');
+  await ok('/api/eggs', { stationId: 'place-dwnxg', level: 1, image: IMG }, wes);
+  await ok('/api/eggs', { stationId: 'place-dwnxg', level: 2, image: IMG }, wes);
+  await ok('/api/eggs', { stationId: 'place-kencl', level: 4, image: IMG }, wes);
+  const [one, two] = (await ok('/api/stations/place-dwnxg')).slots.map((s) => s.egg?.id);
+  const transfer = async () => (await ok('/api/me/progress', null, xia)).stamps.find((s) => s.id === 'transfer');
+  for (const eggId of [one, two]) {
+    const r = await ok('/api/attempts', { eggId, mode: 'fixed' }, xia);
+    await ok(`/api/attempts/${r.attempt.id}/find`, { image: IMG }, xia);
+    const t = await transfer();
+    assert.deepEqual([t.earned, t.progress], [false, 1], 'Downtown Crossing is Red and Orange, but it is one station');
+  }
+  const kenmore = (await ok('/api/stations/place-kencl')).slots[3].egg.id;
+  const r3 = await ok('/api/attempts', { eggId: kenmore, mode: 'fixed' }, xia);
+  await ok(`/api/attempts/${r3.attempt.id}/find`, { image: IMG }, xia);
+  assert.equal((await transfer()).earned, true, 'rode to Kenmore (Green) and found one there');
 });
 
 test('no match keeps the round open; time runs out', async () => {

@@ -14,6 +14,9 @@ export const MAX_TIME_BONUS = 0.5; // up to +50% of the level's points
 export const RETIRE_AFTER_DAYS = 7;
 export const REPORTS_TO_RETIRE = 3;
 export const HIDE_WINDOW_MINUTES = 30; // how long after a find you can hide the next egg
+// After a round ends without a find (time up or given up), the same player can try
+// that egg again after this long. Without it, "give up and restart" resets the timer.
+export const RETRY_COOLDOWN_MINUTES = 60;
 // "Race the next train" mode uses the next train only if it's in this range.
 export const TRAIN_MIN_SECONDS = 90;
 export const TRAIN_MAX_SECONDS = 900;
@@ -66,7 +69,7 @@ export function dayKey(date, timeZone = 'America/New_York') {
 
 // One challenge a day, the same for everyone, rotating through this list.
 export const CHALLENGES = [
-  { id: 'transfer', title: 'Transfer', description: 'Find eggs on 2 different lines today.', target: 2 },
+  { id: 'transfer', title: 'Transfer', description: 'Find eggs at 2 stations on different lines today.', target: 2 },
   { id: 'racer', title: 'Beat the train', description: 'Find an egg while racing a train today.', target: 1 },
   { id: 'climber', title: 'Go hard', description: 'Find a Hard egg or harder today.', target: 1 },
   { id: 'triple', title: 'Hat trick', description: 'Find 3 eggs today.', target: 3 },

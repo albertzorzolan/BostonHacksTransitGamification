@@ -16,6 +16,10 @@ const MAIN_LINES = ['Red', 'Orange', 'Blue', 'Green'];
 const RANGE_METERS = 400; // closer than this to a station counts as "at" it
 const ACCURACY_CAP = 150; // forgive up to this much GPS error
 const PUNCH_HOLES = 18; // the play clock is a row of holes, punched as time runs out
+const EXIT_EXTRA = 150; // once you're at a station, leaving it takes this much more distance (GPS wobbles underground)
+const AWAY_MS = 45_000; // away from the app longer than this (a train ride, say) and the old location fix no longer counts
+const STALE_MS = 120_000; // refetch egg counts and progress after this long
+const DEFAULT_GRACE = 15; // seconds after the clock hits zero that a find is still accepted (the server sends the real value)
 
 const API_BASE = String(window.EGG_API_BASE ?? '').replace(/\/$/, '');
 const apiUrl = (path) => API_BASE + path;
@@ -27,14 +31,20 @@ const state = {
   token: session?.token ?? null,
   config: null,
   stations: null,
+  stationsAt: 0,
   lastStationId: readStored('egg-last-station'),
   raceTrain: readStored('egg-race-train') ?? false,
   line: readStored('egg-line'), // colour family the app is wearing: Red | Orange | Blue | Green | null
-  play: null, // current round
-  pendingHide: null, // { stationId, stationName, level, findId }
+  // The round on the clock. Kept in localStorage, so a reload, a closed app or the camera
+  // app pushing this tab out of memory all come back to the same round.
+  play: readPlay(),
+  pendingHide: readStored('egg-pending-hide'), // the hide in progress: { stationId, stationName, level, levelName, findId, expiresAt }
+  hides: (readStored('egg-hides') ?? []).filter((h) => Date.parse(h.expiresAt) > Date.now()), // finds you can still hide the next egg for
+  skippedHides: readStored('egg-hides-skipped') ?? [],
   board: { mode: 'all', stationId: null },
   hud: null, // { rank, points, rival, gap, rows, lines, at }
   progress: null, // /api/me/progress
+  progressAt: 0,
   timers: [],
   map: null,
 };
@@ -55,18 +65,33 @@ function store(key, value) {
   }
 }
 
-async function api(path, body) {
+// Every call has a timeout: in a dead spot underground a request can otherwise hang for minutes.
+async function api(path, body, { timeout = body?.image ? 60_000 : 20_000 } = {}) {
   const headers = {};
   if (body) headers['content-type'] = 'application/json';
-  if (state.token) headers.authorization = `Bearer ${state.token}`;
+  const sentToken = state.token;
+  if (sentToken) headers.authorization = `Bearer ${sentToken}`;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeout);
   let res;
+  let data;
   try {
-    res = await fetch(apiUrl(path), { method: body ? 'POST' : 'GET', headers, body: body ? JSON.stringify(body) : undefined });
+    res = await fetch(apiUrl(path), { method: body ? 'POST' : 'GET', headers, body: body ? JSON.stringify(body) : undefined, signal: ctrl.signal });
+    data = await res.json().catch(() => ({}));
   } catch {
-    throw new Error("Can't reach the game server. Check your connection.");
+    throw new Error(
+      ctrl.signal.aborted
+        ? 'The connection timed out. Signal is patchy in stations, so try again.'
+        : "Can't reach the game server. Check your signal and try again.",
+    );
+  } finally {
+    clearTimeout(timer);
   }
-  const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    // Signed out on another device, or the session expired: back to sign-in, wherever this happened.
+    if (res.status === 401 && sentToken && sentToken === state.token && !/^\/api\/auth\/(login|register)$/.test(path)) {
+      sessionEnded();
+    }
     const err = new Error(data.error || `Request failed (${res.status})`);
     err.status = res.status;
     throw err;
@@ -107,6 +132,7 @@ const ordinal = (n) => {
   return `${n}${s[(v - 20) % 10] || s[v] || s[0]}`;
 };
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+const an = (word) => (/^[aeiou]/i.test(word) ? 'an' : 'a');
 
 // The server refreshes a session's last-seen time at most once an hour, so don't claim more precision than that.
 const relTime = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
@@ -147,30 +173,165 @@ function distanceM(a, b) {
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
-// Downscale photos on the phone before upload (faster, and enough for matching).
-async function photoToJpeg(file, max = 1280) {
+// Downscale photos on the phone before upload: small enough to send on one bar of signal,
+// big enough for the photo check.
+async function photoToJpeg(file, max = 1024) {
   let source;
   try {
     source = await createImageBitmap(file);
   } catch {
+    const url = URL.createObjectURL(file);
     source = await new Promise((resolve, reject) => {
       const img = new Image();
       img.onload = () => resolve(img);
       img.onerror = () => reject(new Error("Couldn't read that photo. Try again."));
-      img.src = URL.createObjectURL(file);
-    });
+      img.src = url;
+    }).finally(() => setTimeout(() => URL.revokeObjectURL(url), 0));
   }
   const scale = Math.min(1, max / Math.max(source.width, source.height));
   const canvas = document.createElement('canvas');
   canvas.width = Math.round(source.width * scale);
   canvas.height = Math.round(source.height * scale);
   canvas.getContext('2d').drawImage(source, 0, 0, canvas.width, canvas.height);
-  return canvas.toDataURL('image/jpeg', 0.82);
+  return canvas.toDataURL('image/jpeg', 0.8);
 }
 
+// Station list with egg counts. Refetched when it's a couple of minutes old; with no
+// signal the last copy is still good for picking a station.
 async function getStations() {
-  if (!state.stations) state.stations = (await api('/api/stations')).stations;
+  if (!state.stations || Date.now() - state.stationsAt > STALE_MS) {
+    try {
+      state.stations = (await api('/api/stations')).stations;
+      state.stationsAt = Date.now();
+    } catch (err) {
+      if (!state.stations) throw err;
+    }
+  }
   return state.stations;
+}
+
+// ---------- the round on the clock, kept across reloads ----------
+// The deadline is wall-clock time, not performance.now(): phones stop that clock while the screen is off.
+function readPlay() {
+  const p = readStored('egg-play');
+  return p?.attempt && p.deadline + DEFAULT_GRACE * 1000 > Date.now() ? { ...p, result: null, before: null, restored: true } : null;
+}
+function savePlay() {
+  const p = state.play;
+  store(
+    'egg-play',
+    p && !p.result
+      ? { attempt: p.attempt, egg: p.egg, station: p.station, deadline: p.deadline, firstChance: p.firstChance, requestedTrain: p.requestedTrain }
+      : null,
+  );
+}
+function setPlay(round, extra = {}) {
+  state.play = {
+    attempt: round.attempt,
+    egg: round.egg,
+    station: extra.station ?? state.stations?.find((s) => s.id === round.egg.stationId) ?? null,
+    deadline: Date.now() + round.attempt.secondsLeft * 1000,
+    firstChance: Boolean(extra.firstChance),
+    requestedTrain: Boolean(extra.requestedTrain),
+    restored: Boolean(round.resumed),
+    before: extra.before ?? null,
+    result: null,
+  };
+  savePlay();
+}
+function endPlay() {
+  state.play = null;
+  savePlay();
+  store('egg-photo', null);
+}
+const graceSeconds = () => state.config?.graceSeconds ?? DEFAULT_GRACE;
+const secondsLeftOf = (p) => (p.deadline - Date.now()) / 1000;
+// The round still takes a find (there's a grace period after the clock hits zero).
+const liveRound = () => (state.play && !state.play.result && secondsLeftOf(state.play) + graceSeconds() > 0 ? state.play : null);
+
+// ---------- finds you can still hide the next egg for ----------
+// Kept on the phone and refreshed from the server, so closing the app after a find doesn't lose the hide.
+function setHides(list) {
+  state.hides = list.filter((h) => Date.parse(h.expiresAt) > Date.now());
+  store('egg-hides', state.hides);
+}
+const addHide = (h) => setHides([h, ...state.hides.filter((x) => x.findId !== h.findId)]);
+const dropHide = (findId) => setHides(state.hides.filter((h) => h.findId !== findId));
+function skipHide(findId) {
+  state.skippedHides = [...state.skippedHides.slice(-20), findId];
+  store('egg-hides-skipped', state.skippedHides);
+}
+const openHides = () => state.hides.filter((h) => Date.parse(h.expiresAt) > Date.now() && !state.skippedHides.includes(h.findId));
+function startHide(h) {
+  state.pendingHide = h;
+  store('egg-pending-hide', h);
+  location.hash = '#/hide';
+}
+function forgetRounds() {
+  endPlay();
+  state.pendingHide = null;
+  store('egg-pending-hide', null);
+  store('egg-giveups', null);
+  setHides([]);
+}
+
+// Giving up has to reach the server, or the round comes back on the next sync (and Play on
+// that egg would resume it). With no signal, it's remembered and sent on the next sync.
+const pendingGiveUps = () => readStored('egg-giveups') ?? [];
+async function giveUp(attemptId) {
+  store('egg-giveups', [...new Set([...pendingGiveUps(), attemptId])]);
+  try {
+    await api(`/api/attempts/${attemptId}/give-up`, {}, { timeout: 6000 });
+  } catch (err) {
+    if (!err.status || err.status >= 500) return; // no signal: try again later
+    // 403/404/409: not yours or already over, so there's nothing left to give up.
+  }
+  store('egg-giveups', pendingGiveUps().filter((id) => id !== attemptId));
+}
+
+// Ask the server what's running: after a reload, a closed app, or coming back to the tab.
+async function syncActive() {
+  if (!state.user) return;
+  for (const id of pendingGiveUps()) await giveUp(id);
+  let data;
+  try {
+    data = await api('/api/me/active', null, { timeout: 8000 });
+  } catch {
+    return; // no signal, or an older server without this endpoint: keep what this phone remembers
+  }
+  if (data.round && pendingGiveUps().includes(data.round.attempt.id)) data.round = null; // given up offline
+  const local = state.play;
+  if (data.round) {
+    if (local && !local.result && local.attempt.id === data.round.attempt.id) {
+      local.deadline = Date.now() + data.round.attempt.secondsLeft * 1000; // the server's clock wins
+      savePlay();
+    } else if (!local?.result) {
+      setPlay(data.round, { station: data.round.station });
+      state.play.restored = true;
+    }
+  } else if (local && !local.result) {
+    // It ran out, was scored, or was given up on another device.
+    const saved = data.hides.some((h) => h.stationId === local.egg.stationId && h.level === local.egg.level);
+    endPlay();
+    if (saved) toast(`Your find at ${local.egg.stationName} was saved.`);
+  }
+  setHides(data.hides);
+}
+
+// Keep the screen on while the clock runs, so the timer stays in view while you search.
+let wakeLock = null;
+async function keepAwake(on) {
+  try {
+    if (on && !wakeLock && navigator.wakeLock && document.visibilityState === 'visible') {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => (wakeLock = null));
+    } else if (!on && wakeLock) {
+      await wakeLock.release();
+      wakeLock = null;
+    }
+  } catch {
+    /* not supported, or battery saver said no: fine */
+  }
 }
 
 // Station names as a big head: break after "/" and step down the size for long names.
@@ -217,7 +378,13 @@ function lineBand(station, right = '') {
 
 // ---------- location: detected automatically ----------
 // status: idle | locating | ok | denied | unavailable | insecure
-const loc = { status: 'idle', pos: null, watchId: null, subs: new Set() };
+// hereId: the station you're at (sticky, see hereStation). pinned: you picked it yourself.
+// minFixAt: ignore fixes older than this (the phone may hand back one from the last station).
+// prev / lastHereId: where you were before the app went away, to suggest it and sort the list.
+const loc = {
+  status: 'idle', pos: null, watchId: null, subs: new Set(),
+  hereId: null, pinned: false, minFixAt: 0, prev: null, lastHereId: null, slowTimer: null,
+};
 
 function startLocation() {
   if (!window.isSecureContext || !navigator.geolocation) {
@@ -227,8 +394,17 @@ function startLocation() {
   if (loc.watchId != null) return;
   if (!loc.pos) loc.status = 'locating';
   notifyLoc();
+  // Deep underground there may be no fresh fix at all: stop the spinner and offer the list.
+  clearTimeout(loc.slowTimer);
+  loc.slowTimer = setTimeout(() => {
+    if (!loc.pos && loc.status === 'locating') {
+      loc.status = 'unavailable';
+      notifyLoc();
+    }
+  }, 15_000);
   loc.watchId = navigator.geolocation.watchPosition(
     (p) => {
+      if (p.timestamp < loc.minFixAt) return; // taken before you left the last station
       loc.pos = { lat: p.coords.latitude, lng: p.coords.longitude, accuracy: p.coords.accuracy };
       loc.status = 'ok';
       notifyLoc();
@@ -249,6 +425,23 @@ function retryLocation() {
   loc.watchId = null;
   startLocation();
 }
+// Back after a while (off a train, say): the fix we have belongs to the last station.
+function freshLocation(awayFrom) {
+  loc.minFixAt = awayFrom;
+  if (loc.pos) loc.prev = loc.pos;
+  if (loc.hereId) loc.lastHereId = loc.hereId;
+  loc.pos = null;
+  loc.hereId = null;
+  loc.pinned = false;
+  if (loc.status === 'ok') loc.status = 'locating';
+  retryLocation();
+}
+// Remember where you were when the app goes away, for the next open.
+function markAway() {
+  hiddenAt = Date.now();
+  store('egg-away-at', { at: hiddenAt, pos: loc.pos ?? loc.prev, hereId: loc.hereId ?? loc.lastHereId });
+}
+let hiddenAt = null;
 function notifyLoc() {
   loc.subs.forEach((fn) => fn());
 }
@@ -265,7 +458,20 @@ function nearestStation(stations) {
   }
   return best;
 }
-const isInRange = (n) => Boolean(n && n.m <= RANGE_METERS + Math.min(loc.pos?.accuracy ?? 0, ACCURACY_CAP));
+const slack = () => Math.min(loc.pos?.accuracy ?? 0, ACCURACY_CAP);
+const isInRange = (n) => Boolean(n && n.m <= RANGE_METERS + slack() + (n.station.id === loc.hereId ? EXIT_EXTRA : 0));
+// The station you're at. GPS wobbles underground, so once you're at one it takes a clear move
+// to switch: past the exit distance, or another station much nearer. A station you picked
+// yourself ("Not this station?") sticks while you're in range of it.
+function hereStation(stations) {
+  const n = nearestStation(stations);
+  if (!n || !loc.hereId || n.station.id === loc.hereId) return n;
+  const cur = stations.find((s) => s.id === loc.hereId);
+  if (!cur) return n;
+  const m = distanceM(loc.pos, cur);
+  const keep = m <= RANGE_METERS + slack() + EXIT_EXTRA && (loc.pinned || m - n.m < 150);
+  return keep ? { station: cur, m } : n;
+}
 
 // ---------- the HUD: rank, points and the rival just above you ----------
 async function refreshHud(force = false) {
@@ -306,21 +512,45 @@ function drawHud() {
   } else if (h?.rank === 1) {
     rival = '<span class="rival-txt"><b>1st this month.</b> Hold on to it.</span><span class="rival-bar" style="--p:100%"></span>';
   }
+  // Left the round's screen (back button, another tab) while the clock is still running.
+  const live = liveRound();
+  const round = live && !(location.hash || '').startsWith('#/play')
+    ? `<a class="round-call" href="#/play"><span><b>Round running:</b> ${esc(live.egg.levelName)} at ${esc(live.egg.stationName)}</span><span class="rc-clock" data-live-clock>${fmtClock(secondsLeftOf(live))}</span><span class="rc-go">Back to it</span></a>`
+    : '';
   el.innerHTML = `
     <div class="hud-top">
       <a href="#/" class="brand"><img src="icon.svg" alt="" width="28" height="28" />Lookout</a>
       <a class="mypts" href="#/leaderboard">${chip}<b>${h?.points ?? 0}</b> pts</a>
     </div>
-    <a class="rival" href="#/leaderboard">${rival}</a>`;
+    <a class="rival" href="#/leaderboard">${rival}</a>
+    ${round}`;
 }
 
 async function refreshProgress() {
   try {
     state.progress = await api('/api/me/progress');
+    state.progressAt = Date.now();
   } catch {
     /* extra */
   }
   return state.progress;
+}
+
+// "Hide the next egg" calls for finds whose 30 minutes aren't up, shown on the station screens.
+function hideCalls() {
+  return openHides()
+    .slice(0, 2)
+    .map((h) => {
+      const mins = Math.max(1, Math.ceil((Date.parse(h.expiresAt) - Date.now()) / 60_000));
+      return `<section class="hide-call" aria-label="Hide the next egg">
+        <p><b>Hide the next ${esc(h.levelName)} egg at ${esc(h.stationName)}.</b> You have ${plural(mins, 'minute')} to photograph one there.</p>
+        <div class="hide-call-act">
+          <button class="btn btn-primary" type="button" data-hide-find="${esc(h.findId)}">Hide it</button>
+          <button class="link" type="button" data-skip-find="${esc(h.findId)}">Skip</button>
+        </div>
+      </section>`;
+    })
+    .join('');
 }
 
 // ---------- router ----------
@@ -336,7 +566,14 @@ const routes = [
   [/^#\/map$/, viewMap],
 ];
 
+// Each render gets an id. A view that awaited something checks it's still the latest before
+// drawing, so a slow screen finishing late can't cover the one you tapped after it.
+let renderId = 0;
+let booted = false;
+
+const route = { prev: null, now: null };
 async function render() {
+  const rid = ++renderId;
   clearTimers();
   if (state.map) {
     state.map.remove();
@@ -349,6 +586,7 @@ async function render() {
     return viewSignup();
   }
   const hash = location.hash || '#/';
+  if (hash !== route.now) [route.prev, route.now] = [route.now, hash];
   const playing = hash.startsWith('#/play') || hash.startsWith('#/hide');
   $('#hud').classList.toggle('hud-quiet', playing);
   $('#tabs').hidden = playing;
@@ -371,8 +609,12 @@ async function render() {
     try {
       await view(...m.slice(1).map(decodeURIComponent));
     } catch (err) {
-      if (err.status === 401) return signOut();
-      app.innerHTML = `<div class="notice bad">${esc(err.message)}</div><p><a class="btn btn-ghost" href="#/">Back</a></p>`;
+      if (rid !== renderId || err.status === 401) return; // a newer screen, or sessionEnded() is already showing sign-in
+      // No signal (or a server error): offer a retry, and retry by itself when signal comes back.
+      const retry = !err.status || err.status >= 500;
+      app.innerHTML = `<div class="notice bad" data-load-failed="${retry}">${esc(err.message)}</div>
+        <p class="btn-row">${retry ? '<button class="btn btn-ink" type="button" id="retryView">Try again</button>' : ''}<a class="btn btn-ghost" href="#/">Back</a></p>`;
+      $('#retryView')?.addEventListener('click', render);
     }
     return;
   }
@@ -385,6 +627,18 @@ function setSession(data) {
   store('egg-session', data ? { user: data.user, token: data.token } : null);
 }
 
+// The server said this device's session is gone (signed out elsewhere, or expired).
+function sessionEnded() {
+  setSession(null);
+  forgetRounds();
+  state.hud = null;
+  state.progress = null;
+  if (booted) {
+    toast('You were signed out. Sign in again to keep playing.');
+    setTimeout(render);
+  }
+}
+
 // Forget this device's session. `everywhere` signs out every device on the account.
 async function signOut({ remote = false, everywhere = false } = {}) {
   if (remote && state.token) {
@@ -395,6 +649,7 @@ async function signOut({ remote = false, everywhere = false } = {}) {
     }
   }
   setSession(null);
+  forgetRounds();
   state.hud = null;
   state.progress = null;
   render();
@@ -456,7 +711,9 @@ function viewSignup(mode = 'register') {
       });
       setSession(data);
       startLocation();
-      if (location.hash && location.hash !== '#/') location.hash = '#/';
+      await syncActive(); // a round started on another phone carries on here
+      const to = liveRound() ? '#/play' : '#/';
+      if ((location.hash || '#/') !== to) location.hash = to;
       else render();
     } catch (err) {
       $('#err').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
@@ -473,11 +730,13 @@ function viewSignup(mode = 'register') {
 
 // ---------- Here: the station you're standing in ----------
 async function viewHere() {
+  const rid = renderId;
   loading('Finding your station');
   const stations = await getStations();
+  if (rid !== renderId) return;
   let lastKey = null;
   const keyNow = () => {
-    const n = nearestStation(stations);
+    const n = hereStation(stations);
     return { n, key: `${loc.status}|${n?.station.id ?? ''}|${isInRange(n)}` };
   };
   onLoc(() => {
@@ -489,7 +748,12 @@ async function viewHere() {
   if (loc.status === 'idle') startLocation();
   const { n, key } = keyNow();
   lastKey = key;
-  if (isInRange(n)) return showStation(n.station.id, { here: true, distance: n.m });
+  if (isInRange(n)) {
+    loc.hereId = n.station.id;
+    return showStation(n.station.id, { here: true, distance: n.m, rid });
+  }
+  loc.hereId = null;
+  loc.pinned = false;
   if (n) {
     setLine(familiesOf(n.station.lines)[0]);
     return showNearby(stations, n);
@@ -504,11 +768,14 @@ function showLocating(stations) {
     idle: ['Finding your station', 'Lookout uses your location to open the station you are in.'],
     locating: ['Finding your station', "Underground? A fix from the last couple of minutes works, so it's fine if you got one on the way in."],
     denied: ['Location is off for Lookout', 'Allow location for this site in your browser settings, then try again. Or pick your station below.'],
-    unavailable: ['No location fix yet', 'Step closer to the entrance or above ground, then try again. Or pick your station below.'],
+    unavailable: ['No location fix yet', "Underground the phone often can't get one. Pick your station below, or try again near the entrance."],
     insecure: ['Pick your station', 'Phones only share location with https:// pages. Open the https link to detect your station automatically.'],
   }[loc.status] ?? ['Pick your station', ''];
   const canRetry = loc.status === 'denied' || loc.status === 'unavailable';
+  // Where you were the last time the app was open: one tap if you're still there.
+  const last = loc.lastHereId && stations.find((s) => s.id === loc.lastHereId);
   app.innerHTML = `
+    ${hideCalls()}
     <section class="tk locate">
       ${BAND_LINES}
       <div class="tk-top">
@@ -516,6 +783,7 @@ function showLocating(stations) {
         <h1 class="locate-h">${esc(msg[0])}</h1>
         <p class="locate-p">${esc(msg[1])}</p>
         ${canRetry ? '<button id="retry" class="btn btn-ink btn-block" type="button">Try again</button>' : ''}
+        ${last ? `<a class="btn btn-ghost btn-block still-here" href="#/station/${encodeURIComponent(last.id)}">Still at ${esc(last.name)}?</a>` : ''}
       </div>
     </section>
     <h2 class="sec-h">Stations</h2>
@@ -526,6 +794,7 @@ function showLocating(stations) {
 
 function showNearby(stations, n) {
   app.innerHTML = `
+    ${hideCalls()}
     <section class="tk locate">
       ${lineBand(n.station)}
       <div class="tk-top">
@@ -552,8 +821,11 @@ function wireStationSearch(stations) {
   const draw = () => {
     const q = $('#q').value.trim().toLowerCase();
     let rows = stations.filter((s) => s.name.toLowerCase().includes(q));
-    rows = loc.pos
-      ? rows.map((s) => ({ ...s, m: distanceM(loc.pos, s) })).sort((a, b) => a.m - b.m)
+    // With no fix yet, sort around where you last were (the next station is near the last one),
+    // but only show distances from a real fix.
+    const ref = loc.pos ?? loc.prev;
+    rows = ref
+      ? rows.map((s) => ({ ...s, m: distanceM(ref, s) })).sort((a, b) => a.m - b.m).map((s) => (loc.pos ? s : { ...s, m: null }))
       : [...rows].sort((a, b) => b.activeEggs - a.activeEggs || a.name.localeCompare(b.name));
     $('#list').innerHTML = rows.length
       ? rows
@@ -573,20 +845,31 @@ function wireStationSearch(stations) {
 }
 
 async function viewStations() {
+  const rid = renderId;
   loading();
   const stations = await getStations();
+  if (rid !== renderId) return;
   app.innerHTML = `<h1 class="page-h">Stations</h1><p class="page-sub">Any station on the T. Play opens wherever you are.</p>${stationSearch()}`;
   wireStationSearch(stations);
 }
 
 // ---------- one station ----------
 async function viewStation(id) {
+  const rid = renderId;
   loading();
   const stations = await getStations();
-  const n = nearestStation(stations);
-  const here = isInRange(n) && n.station.id === id;
+  if (rid !== renderId) return;
   const st = stations.find((s) => s.id === id);
-  await showStation(id, { here, distance: st && loc.pos ? distanceM(loc.pos, st) : null });
+  const m = st && loc.pos ? distanceM(loc.pos, st) : null;
+  // Picking a station you're in range of from the list means you're there. This is how a wrong
+  // GPS guess gets fixed: "Not this station?" -> pick yours, and Here sticks to it. (Opening a
+  // nearby station from the map is just looking, so it doesn't move Here.)
+  const here = m != null && isInRange({ station: st, m });
+  if (here && loc.hereId !== id && route.prev === '#/stations') {
+    loc.hereId = id;
+    loc.pinned = true;
+  }
+  await showStation(id, { here, distance: m, rid });
 }
 
 // Which eggs here you can still score, and how many you've found.
@@ -596,11 +879,12 @@ function stationCard(slots) {
   return { playable: playable.length, found, cleared: playable.length > 0 && found === playable.length };
 }
 
-async function showStation(id, { here = false, distance = null } = {}) {
+async function showStation(id, { here = false, distance = null, rid = renderId } = {}) {
   const [{ station, slots }] = await Promise.all([
     api(`/api/stations/${encodeURIComponent(id)}`),
-    state.progress ? null : refreshProgress(),
+    state.progress && Date.now() - state.progressAt < STALE_MS ? null : refreshProgress(),
   ]);
+  if (rid !== renderId) return;
   state.lastStationId = id;
   store('egg-last-station', id);
   setLine(familiesOf(station.lines)[0]);
@@ -614,12 +898,14 @@ async function showStation(id, { here = false, distance = null } = {}) {
 
   app.innerHTML = `
     ${here ? '' : '<a class="back" href="#/stations"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>All stations</a>'}
+    ${hideCalls()}
     <section class="tk station-tk">
       ${lineBand(station)}
       <div class="tk-top">
         <p class="here">${here ? "You're at" : 'Station'}</p>
         ${stationHead(station.name)}
         ${stamp}
+        ${here ? '<a class="link not-here" href="#/stations">Not this station? Pick yours</a>' : ''}
       </div>
       <div class="tk-perf" aria-hidden="true"></div>
       <div class="tk-bottom">
@@ -651,12 +937,21 @@ async function showStation(id, { here = false, distance = null } = {}) {
   app.querySelectorAll('[data-play]').forEach((btn) =>
     btn.addEventListener('click', async () => {
       if (btn.getAttribute('aria-disabled') === 'true') return;
+      const eggId = btn.dataset.play;
+      const live = liveRound();
+      if (live?.egg.id === eggId) {
+        location.hash = '#/play'; // already on the clock for this one
+        return;
+      }
+      if (live && !confirm(`Your ${live.egg.levelName} round at ${live.egg.stationName} is still running. Give it up and start this one?`)) return;
       btn.setAttribute('aria-disabled', 'true');
-      const slot = slots.find((s) => s.egg?.id === btn.dataset.play);
+      const slot = slots.find((s) => s.egg?.id === eggId);
       const before = { hud: state.hud, progress: state.progress, card };
       try {
-        const round = await api('/api/attempts', { eggId: btn.dataset.play, mode: state.raceTrain ? 'train' : 'fixed' });
-        state.play = { ...round, station, receivedAt: performance.now(), result: null, firstChance: slot?.egg?.timesFound === 0, before };
+        // The server picks up a round that's still running instead of restarting the clock.
+        const round = await api('/api/attempts', { eggId, mode: state.raceTrain ? 'train' : 'fixed' });
+        if (live) giveUp(live.attempt.id);
+        setPlay(round, { station, firstChance: slot?.egg?.timesFound === 0, before, requestedTrain: state.raceTrain && !round.resumed });
         location.hash = '#/play';
       } catch (err) {
         toast(err.message);
@@ -666,8 +961,8 @@ async function showStation(id, { here = false, distance = null } = {}) {
   );
   app.querySelectorAll('[data-hide]').forEach((btn) =>
     btn.addEventListener('click', () => {
-      state.pendingHide = { stationId: id, stationName: station.name, level: Number(btn.dataset.hide), findId: null };
-      location.hash = '#/hide';
+      const level = state.config.levels.find((l) => l.level === Number(btn.dataset.hide));
+      startHide({ stationId: id, stationName: station.name, level: level.level, levelName: level.name, findId: null, expiresAt: null });
     }),
   );
 
@@ -715,6 +1010,25 @@ function stubRow(slot) {
       <div class="stub-act"><p class="stamp stamp-s">Found</p></div>
     </li>`;
   }
+  // Your round on this egg is still running (here or on another phone): pick it back up.
+  const live = liveRound();
+  const running = live?.egg.id === egg.id ? secondsLeftOf(live) : egg.round?.secondsLeft;
+  if (running != null) {
+    return `<li class="stub is-open is-live">
+      <span class="punch" aria-hidden="true">${slot.level}</span>
+      <div class="stub-body"><p class="stub-name">${esc(slot.name)}</p>${pips}<p class="stub-meta">Your round is running.</p></div>
+      <button class="stub-act" type="button" data-play="${egg.id}"><b ${live?.egg.id === egg.id ? 'data-live-clock' : ''}>${fmtClock(running)}</b><span>Resume</span></button>
+    </li>`;
+  }
+  // Ran out of time or gave up on it: you can try again after the cooldown.
+  const wait = egg.retryAt ? Math.ceil((Date.parse(egg.retryAt) - Date.now()) / 60_000) : 0;
+  if (wait > 0) {
+    return `<li class="stub is-open is-wait">
+      <span class="punch" aria-hidden="true">${slot.level}</span>
+      <div class="stub-body"><p class="stub-name">${esc(slot.name)}</p>${pips}<p class="stub-meta">Not this time. Try it again in ${plural(wait, 'minute')}.</p></div>
+      <div class="stub-act"><b>${wait}</b><span>min</span></div>
+    </li>`;
+  }
   const hot = egg.timesFound === 0;
   return `<li class="stub is-open ${hot ? 'is-hot' : ''}">
     <span class="punch" aria-hidden="true">${slot.level}</span>
@@ -725,9 +1039,11 @@ function stubRow(slot) {
 
 function challengeTicket(today) {
   if (!today) return '';
+  // Transfer: fill one circle per line that counts (one find at a two-line station counts once).
+  const lines = MAIN_LINES.filter((l) => today.lines?.includes(l)).slice(0, today.progress);
   const steps = today.id === 'transfer'
-    ? MAIN_LINES.filter((l) => today.lines?.includes(l)).map((l) => `<li class="done" style="--ln:${LINE_VAR[l]}">${l[0]}</li>`).join('') +
-      Array.from({ length: Math.max(0, today.target - (today.lines?.length ?? 0)) }, () => '<li></li>').join('')
+    ? lines.map((l) => `<li class="done" style="--ln:${LINE_VAR[l]}">${l[0]}</li>`).join('') +
+      Array.from({ length: Math.max(0, today.target - lines.length) }, () => '<li></li>').join('')
     : Array.from({ length: today.target }, (_, i) => `<li class="${i < today.progress ? 'done' : ''}"></li>`).join('');
   return `<section class="challenge ${today.done ? 'is-done' : ''}" aria-label="Today's challenge">
     <span class="seal-mini" aria-hidden="true"><svg viewBox="0 0 40 40"><circle cx="20" cy="20" r="17" fill="none" stroke="currentColor" stroke-width="2.5" ${today.done ? '' : 'stroke-dasharray="3 2.4"'}/><path d="M12 22h16M24 17l4 5-4 5" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
@@ -751,17 +1067,26 @@ function viewPlay() {
   if (play.station) setLine(familiesOf(play.station.lines)[0]);
 
   const { attempt, egg } = play;
-  const secondsLeft = () => attempt.secondsLeft - (performance.now() - play.receivedAt) / 1000;
-  const graceLeft = () => secondsLeft() + (state.config?.graceSeconds ?? 15);
+  const secondsLeft = () => secondsLeftOf(play);
+  const graceLeft = () => secondsLeft() + graceSeconds();
   const maxBonus = state.config?.maxTimeBonus ?? 0.5;
   const perHole = attempt.limitSeconds / PUNCH_HOLES;
+  const back = `#/station/${encodeURIComponent(egg.stationId)}`;
+  const welcomeBack = play.restored;
+  play.restored = false;
+  const timerNote = attempt.limitSource === 'train'
+    ? `Racing the ${esc(attempt.train?.headsign || 'next')} train. `
+    : play.requestedTrain
+      ? 'No train due in 1.5 to 15 minutes, so this round uses the level timer. '
+      : '';
 
   app.innerHTML = `
     <div class="play-bar">
-      <a class="icon-btn" href="#/station/${encodeURIComponent(egg.stationId)}" id="quitX" aria-label="Give up and go back"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></a>
+      <a class="icon-btn" href="${back}" aria-label="Back to ${esc(egg.stationName)}. Your round keeps running."><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg></a>
       <p class="play-title"><b>${esc(egg.levelName)}</b> at ${esc(egg.stationName)}</p>
       <p class="mypts mypts-here"><b>${egg.points}</b> pts</p>
     </div>
+    ${welcomeBack ? '<p class="notice">Welcome back. The clock kept running while you were away.</p>' : ''}
     <section class="tk play-tk">
       <div class="tk-top">
         <div class="egg-photo">
@@ -773,17 +1098,17 @@ function viewPlay() {
       <div class="tk-perf" aria-hidden="true"></div>
       <div class="tk-bottom">
         <div class="clock-row">
-          <p id="clock" class="clock">${fmtClock(secondsLeft())}</p>
+          <p id="clock" class="clock" role="timer" aria-label="Time left">${fmtClock(secondsLeft())}</p>
           <div class="bonus"><p class="bonus-label">Bonus right now</p><p class="bonus-val">+<span id="bonus">0</span></p></div>
         </div>
         <ol id="holes" class="punchclock" aria-hidden="true">${'<li></li>'.repeat(PUNCH_HOLES)}</ol>
-        <p class="clock-ctx">${attempt.limitSource === 'train' ? `Racing the ${esc(attempt.train?.headsign || 'next')} train. ` : ''}Each hole is ${Math.round(perHole)} seconds. The bonus drains as they go.</p>
+        <p class="clock-ctx">${timerNote}Each hole is ${Math.round(perHole)} seconds. The bonus drains as they go.</p>
       </div>
     </section>
-    <div id="status"></div>
+    <div id="status" aria-live="polite"></div>
     <label class="btn btn-ink btn-block btn-l" id="snap">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
-      Found it, take a photo
+      <span id="snapText">Found it, take a photo</span>
       <input id="cam" class="file-hidden" type="file" accept="image/*" capture="environment" />
     </label>
     <div class="play-foot">
@@ -791,7 +1116,9 @@ function viewPlay() {
       <button class="link" type="button" id="quit">Give up</button>
     </div>`;
 
+  // The clock runs on the deadline (wall-clock time), so it's right after the screen was off.
   const holes = [...app.querySelectorAll('#holes li')];
+  let sending = false;
   const tick = () => {
     const s = secondsLeft();
     const clock = $('#clock');
@@ -801,38 +1128,82 @@ function viewPlay() {
     $('#bonus').textContent = Math.round(egg.points * maxBonus * Math.max(0, Math.min(1, s / attempt.limitSeconds)));
     const punched = Math.floor((attempt.limitSeconds - Math.max(0, s)) / perHole);
     holes.forEach((h, i) => h.classList.toggle('p', i < punched));
-    if (graceLeft() <= 0) {
+    // Out of time, unless a photo is on its way (the server judges it by when the upload started).
+    if (graceLeft() <= 0 && !sending) {
       play.result = { status: 'expired' };
       renderResult();
     }
   };
   tick();
   every(250, tick);
+  keepAwake(true);
+  onCleanup(() => keepAwake(false));
 
-  $('#cam').addEventListener('change', async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const status = $('#status');
-    $('#snap').hidden = true;
+  const status = $('#status');
+  const snap = $('#snap');
+  function showRetry(message, image) {
+    status.innerHTML = `<div class="notice bad">${esc(message)}</div>
+      <div class="retry">
+        <img src="${image}" alt="Your photo" />
+        <button id="resend" class="btn btn-primary btn-block" type="button">Send this photo again</button>
+      </div>`;
+    snap.hidden = false;
+    $('#snapText').textContent = 'Take a new photo';
+    $('#resend').addEventListener('click', () => send(image));
+  }
+  async function send(image) {
+    sending = true;
+    snap.hidden = true;
     status.innerHTML = `<div class="notice row"><div class="spin" aria-hidden="true"></div>${state.config?.gemini ? 'Checking your photo against the egg' : 'Saving your find'}</div>`;
     try {
-      const image = await photoToJpeg(file);
       const result = await api(`/api/attempts/${attempt.id}/find`, { image });
+      if (state.play !== play) return; // left this round meanwhile
+      store('egg-photo', null);
       if (result.status === 'no_match') {
         status.innerHTML = `<div class="notice bad"><b>Not a match.</b> ${esc(result.reason)} Keep looking.</div>`;
-        $('#snap').hidden = false;
-        e.target.value = '';
+        snap.hidden = false;
+        $('#snapText').textContent = 'Found it, take a photo';
         return;
       }
       play.result = result;
       play.myPhoto = image;
+      savePlay();
       renderResult();
     } catch (err) {
-      status.innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
-      $('#snap').hidden = false;
-      e.target.value = '';
+      if (state.play !== play || err.status === 401) return;
+      if ([403, 404, 409].includes(err.status)) {
+        // The round is over (given up on another phone, say): nothing to resend.
+        endPlay();
+        status.innerHTML = `<div class="notice bad">${esc(err.message)}</div><a class="btn btn-ghost btn-block" href="${back}">Back to ${esc(egg.stationName)}</a>`;
+        return;
+      }
+      showRetry(err.message, image);
+    } finally {
+      sending = false;
     }
+  }
+
+  $('#cam').addEventListener('change', async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    let image;
+    try {
+      image = await photoToJpeg(file);
+    } catch (err) {
+      status.innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+      return;
+    }
+    // Keep the photo until the server has it: if the signal drops or the app closes, it can still go.
+    store('egg-photo', { attemptId: attempt.id, image });
+    send(image);
   });
+  // A photo that didn't finish sending last time: send it now (or when there's signal).
+  const pending = readStored('egg-photo');
+  if (pending?.attemptId === attempt.id && pending.image) {
+    if (navigator.onLine === false) showRetry("Your photo hasn't been sent yet. Send it when you have signal.", pending.image);
+    else send(pending.image);
+  }
 
   app.querySelectorAll('[data-report]').forEach((b) =>
     b.addEventListener('click', async () => {
@@ -845,12 +1216,14 @@ function viewPlay() {
       }
     }),
   );
-  const quit = () => (state.play = null);
-  $('#quit').addEventListener('click', () => {
-    quit();
-    location.hash = `#/station/${encodeURIComponent(egg.stationId)}`;
+  $('#quit').addEventListener('click', async (e) => {
+    const mins = state.config?.retryCooldownMinutes ?? 60;
+    if (!confirm(`Give up this round? You can try this egg again in ${mins} minutes.`)) return;
+    e.currentTarget.disabled = true;
+    endPlay();
+    await giveUp(attempt.id); // before the station loads, so it shows the cooldown and not Play
+    location.hash = back;
   });
-  $('#quitX').addEventListener('click', quit);
 }
 
 // The round stamp shown when a station is cleared.
@@ -877,11 +1250,11 @@ async function renderResult() {
         ${play.station ? lineBand(play.station, esc(egg.levelName)) : ''}
         <div class="tk-top">
           <h1 class="win-head">Time's up</h1>
-          <p class="win-sub">The ${esc(egg.levelName)} egg at ${esc(egg.stationName)} stays hidden for now. Every hole is punched.</p>
+          <p class="win-sub">The ${esc(egg.levelName)} egg at ${esc(egg.stationName)} stays hidden for now. Every hole is punched. You can try it again in ${plural(state.config?.retryCooldownMinutes ?? 60, 'minute')}.</p>
         </div>
       </section>
       <a class="btn btn-ink btn-block btn-l" href="${back}">Try another level</a>`;
-    state.play = null;
+    endPlay();
     return;
   }
 
@@ -934,12 +1307,27 @@ async function renderResult() {
     requestAnimationFrame(step);
   }
 
+  // The right to hide the next egg lasts 30 minutes and survives closing the app: the station
+  // screens show a "Hide the next egg" call until it's used, skipped or runs out.
+  const hideRight = {
+    findId: result.findId,
+    stationId: egg.stationId,
+    stationName: egg.stationName,
+    level: egg.level,
+    levelName: egg.levelName,
+    points: egg.points,
+    expiresAt: new Date(Date.now() + (state.config?.hideWindowMinutes ?? 30) * 60_000).toISOString(),
+  };
+  addHide(hideRight);
+  state.stationsAt = 0; // egg counts may have changed
   $('#hide').addEventListener('click', () => {
-    state.pendingHide = { stationId: egg.stationId, stationName: egg.stationName, level: egg.level, findId: result.findId };
-    state.play = null;
-    location.hash = '#/hide';
+    endPlay();
+    startHide(hideRight);
   });
-  $('#skip').addEventListener('click', () => (state.play = null));
+  $('#skip').addEventListener('click', () => {
+    skipHide(result.findId);
+    endPlay();
+  });
 
   // What this find changed: rank, rival, line war, challenge, stamps, the station card.
   const before = play.before ?? {};
@@ -959,15 +1347,21 @@ async function renderResult() {
     }
     if (h.rival) gains.push(['rival', `<b>Next: ${esc(h.rival.username)}.</b> ${plural(h.gap, 'point')} to pass.`]);
   }
-  const fam = play.station ? familiesOf(play.station.lines)[0] : null;
-  if (MAIN_LINES.includes(fam) && h?.lines?.length) {
+  // A find scores for every line at the station (Park Street: Red and Green).
+  const fams = play.station ? familiesOf(play.station.lines).filter((f) => MAIN_LINES.includes(f)) : [];
+  const fam = fams[0] ?? null;
+  if (fam && h?.lines?.length) {
     const sorted = MAIN_LINES.map((l) => ({ line: l, points: h.lines.find((x) => x.line === l)?.points ?? 0 })).sort((a, b) => b.points - a.points);
     const i = sorted.findIndex((x) => x.line === fam);
     const line = sorted[i];
-    const note = i === 0
-      ? `${fam} leads ${sorted[1].line} by ${(line.points - sorted[1].points).toLocaleString()}.`
-      : `${fam} is ${ordinal(i + 1)}, ${(sorted[i - 1].points - line.points).toLocaleString()} behind ${sorted[i - 1].line}.`;
-    gains.push(['line', `<b>+${points.total} for the ${fam} Line.</b> ${note}`, fam]);
+    const tied = sorted.filter((x) => x.line !== fam && x.points === line.points).map((x) => x.line);
+    const note = tied.length
+      ? `${fam} is tied with ${tied.join(' and ')}.`
+      : i === 0
+        ? `${fam} leads ${sorted[1].line} by ${(line.points - sorted[1].points).toLocaleString()}.`
+        : `${fam} is ${ordinal(i + 1)}, ${(sorted[i - 1].points - line.points).toLocaleString()} behind ${sorted[i - 1].line}.`;
+    const lines = fams.length > 1 ? `the ${fams.slice(0, -1).join(', ')} and ${fams.at(-1)} Lines` : `the ${fam} Line`;
+    gains.push(['line', `<b>+${points.total} for ${lines}.</b> ${note}`, fam]);
   }
   if (progress?.today?.done && before.progress && !before.progress.today?.done) {
     gains.push(['stamp', `<b>Challenge done: ${esc(progress.today.title)}.</b> Stamp earned.`]);
@@ -1000,7 +1394,11 @@ async function renderResult() {
 // ---------- hide an egg ----------
 function viewHide() {
   const hide = state.pendingHide;
-  if (!hide) {
+  const expired = hide?.findId && Date.parse(hide.expiresAt) < Date.now();
+  if (!hide || expired) {
+    state.pendingHide = null;
+    store('egg-pending-hide', null);
+    if (expired) toast('More than 30 minutes since your find, so that hide has run out.');
     location.hash = '#/';
     return;
   }
@@ -1010,7 +1408,7 @@ function viewHide() {
   app.innerHTML = `
     <div class="play-bar">
       <a class="icon-btn" href="#/station/${encodeURIComponent(hide.stationId)}" aria-label="Back to ${esc(hide.stationName)}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg></a>
-      <p class="play-title">Hide a <b>${esc(level.name)}</b> egg</p>
+      <p class="play-title">Hide ${an(level.name)} <b>${esc(level.name)}</b> egg</p>
       <p class="mypts mypts-here"><b>${level.points}</b> pts</p>
     </div>
     <section class="tk hide-tk">
@@ -1060,11 +1458,16 @@ function viewHide() {
     btn.textContent = 'Hiding';
     try {
       await api('/api/eggs', { stationId: hide.stationId, level: hide.level, findId: hide.findId, hint: $('#hint').value, image });
+      if (hide.findId) dropHide(hide.findId);
       state.pendingHide = null;
-      state.stations = null; // egg counts changed
+      store('egg-pending-hide', null);
+      state.stationsAt = 0; // egg counts changed
       toast('Egg hidden. Now someone else has to find it.');
       location.hash = `#/station/${encodeURIComponent(hide.stationId)}`;
     } catch (err) {
+      if (err.status === 401) return;
+      // Too late or already used: that hide is gone, so stop offering it.
+      if (err.status === 409 && hide.findId) dropHide(hide.findId);
       $('#err').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
       btn.disabled = false;
       btn.textContent = 'Hide this egg';
@@ -1074,8 +1477,10 @@ function viewHide() {
 
 // ---------- ranks ----------
 async function viewLeaderboard() {
+  const rid = renderId;
   loading();
   const stations = await getStations();
+  if (rid !== renderId) return;
   let { mode } = state.board;
   let stationId = state.board.stationId || state.lastStationId || stations.find((s) => s.activeEggs)?.id || stations[0]?.id;
   const monthLabel = new Date().toLocaleString('en-US', { month: 'long', timeZone: 'America/New_York' });
@@ -1105,7 +1510,12 @@ async function viewLeaderboard() {
     box.innerHTML = '<div class="empty"><div class="spin" aria-hidden="true"></div></div>';
     const q = mode === 'station' ? `?stationId=${encodeURIComponent(stationId)}` : '';
     const data = await api(`/api/leaderboard${q}`);
-    if (mode === 'all') {
+    if (!box.isConnected) return;
+    if (mode !== 'all') {
+      // The rival and the line war are about everyone; don't show them over one station's list.
+      $('#war').innerHTML = '';
+      $('#versus').innerHTML = '';
+    } else {
       $('#war').innerHTML = data.lines.length ? lineWar(data.lines) : '';
       const mine = data.rows.find((r) => r.userId === state.user.id);
       const rival = mine && data.rows.find((r) => r.rank === mine.rank - 1);
@@ -1186,7 +1596,14 @@ function deviceList(sessions) {
     .join('')}</ul>`;
 }
 
+// Finds per level, Easy to Impossible.
+const levelFinds = (p) =>
+  `<ol class="lv-finds" aria-label="Finds by level">${(state.config?.levels ?? [])
+    .map((l) => `<li><b>${p.findsByLevel?.[l.name] ?? 0}</b><span>${esc(l.name)}</span></li>`)
+    .join('')}</ol>`;
+
 async function viewProfile() {
+  const rid = renderId;
   loading();
   const [p, progress, sessions] = await Promise.all([
     api(`/api/users/${state.user.id}`),
@@ -1194,6 +1611,7 @@ async function viewProfile() {
     api('/api/auth/sessions').then((d) => d.sessions, () => null),
     getStations(),
   ]);
+  if (rid !== renderId) return;
   const lv = progress?.level;
   const xp = lv?.next ? Math.round(((lv.points - lv.floor) / (lv.next - lv.floor)) * 100) : 100;
   const earned = progress?.stamps.filter((s) => s.earned).length ?? 0;
@@ -1216,6 +1634,7 @@ async function viewProfile() {
           <div><dt>Eggs hidden</dt><dd>${p.eggsHidden}</dd></div>
           <div><dt>Found by others</dt><dd>${p.timesYourEggsWereFound}</dd></div>
         </dl>
+        ${levelFinds(p)}
       </div>
     </section>
     ${challengeTicket(progress?.today)}
@@ -1247,19 +1666,24 @@ async function viewProfile() {
 // Another player's public profile, opened from the ranks.
 async function viewPlayer(id) {
   if (id === state.user.id) return location.replace('#/profile');
+  const rid = renderId;
   loading();
   const [p] = await Promise.all([api(`/api/users/${encodeURIComponent(id)}`), getStations()]);
+  if (rid !== renderId) return;
   app.innerHTML = `
     <a class="back" href="#/leaderboard"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>Ranks</a>
     <section class="tk level-tk">
       <div class="tk-top"><h1 class="page-h">${esc(p.user.username)}</h1><p class="page-sub">${p.monthRank ? `${ordinal(p.monthRank)} this month` : 'Not on the board yet this month'}</p></div>
       <div class="tk-perf" aria-hidden="true"></div>
-      <dl class="tk-bottom mini-stats">
-        <div><dt>This month</dt><dd>${p.monthPoints}</dd></div>
-        <div><dt>All time</dt><dd>${p.allTimePoints}</dd></div>
-        <div><dt>Eggs hidden</dt><dd>${p.eggsHidden}</dd></div>
-        <div><dt>Found by others</dt><dd>${p.timesYourEggsWereFound}</dd></div>
-      </dl>
+      <div class="tk-bottom">
+        <dl class="mini-stats">
+          <div><dt>This month</dt><dd>${p.monthPoints}</dd></div>
+          <div><dt>All time</dt><dd>${p.allTimePoints}</dd></div>
+          <div><dt>Eggs hidden</dt><dd>${p.eggsHidden}</dd></div>
+          <div><dt>Found by others</dt><dd>${p.timesYourEggsWereFound}</dd></div>
+        </dl>
+        ${levelFinds(p)}
+      </div>
     </section>
     <div class="eggs-head"><h2 class="sec-h">Punched tickets</h2></div>
     ${ticketsGrid(p.recentFinds)}`;
@@ -1282,8 +1706,10 @@ function loadLeaflet() {
 }
 
 async function viewMap() {
+  const rid = renderId;
   loading('Loading the map');
   const [stations] = await Promise.all([getStations(), loadLeaflet()]);
+  if (rid !== renderId) return;
   const css = getComputedStyle(document.documentElement);
   const ink = css.getPropertyValue('--ink').trim();
   const ticket = css.getPropertyValue('--ticket').trim();
@@ -1312,26 +1738,128 @@ async function viewMap() {
   }
 }
 
+// ---------- coming back to the app ----------
+// Phones put a backgrounded tab to sleep, or throw it away and reload it later. Either way,
+// pick up the real state: the round's clock, finds to hide for, and (after a while away,
+// like a train ride) a fresh location instead of the last station's.
+async function onResume() {
+  const away = hiddenAt ? Date.now() - hiddenAt : 0;
+  const since = hiddenAt;
+  hiddenAt = null;
+  if (!booted || !state.user) return;
+  const hash = location.hash || '#/';
+  // Never redraw these on return: a photo (from the camera app) or a hint may be in progress.
+  const busy = hash.startsWith('#/play') || hash.startsWith('#/hide');
+  if (hash.startsWith('#/play') && liveRound()) keepAwake(true);
+  if (away > AWAY_MS) {
+    state.stationsAt = 0;
+    state.progressAt = 0;
+    state.hud = null;
+    freshLocation(since); // on Here, this redraws by itself as the new fix comes in
+  }
+  const before = JSON.stringify([state.play?.attempt.id ?? null, openHides().map((h) => h.findId)]);
+  await syncActive();
+  const changed = JSON.stringify([state.play?.attempt.id ?? null, openHides().map((h) => h.findId)]) !== before;
+  if (busy) {
+    if (hash.startsWith('#/play') && !state.play) render(); // the round ended elsewhere
+    return;
+  }
+  if (changed || (away > AWAY_MS && !(hash === '#/' || hash === '#'))) render();
+  else drawHud();
+}
+document.addEventListener('visibilitychange', () => (document.hidden ? markAway() : onResume()));
+window.addEventListener('pagehide', markAway);
+window.addEventListener('pageshow', (e) => e.persisted && onResume());
+
+// No signal: say so, and catch up as soon as it's back.
+function drawNet() {
+  $('#net').hidden = navigator.onLine !== false;
+}
+window.addEventListener('offline', drawNet);
+window.addEventListener('online', () => {
+  drawNet();
+  if (!booted || !state.user) return;
+  syncActive().then(() => (app.querySelector('[data-load-failed="true"]') ? render() : drawHud()));
+});
+
+// One clock for everything outside the play screen: the "Round running" call and Resume
+// buttons count down, and a round that ran out while you were elsewhere is cleared.
+setInterval(() => {
+  const live = liveRound();
+  document.querySelectorAll('[data-live-clock]').forEach((el) => {
+    if (live) el.textContent = fmtClock(secondsLeftOf(live));
+  });
+  if (state.play && !state.play.result && !live && !(location.hash || '').startsWith('#/play')) {
+    endPlay();
+    drawHud();
+  }
+}, 1000);
+
+// "Hide the next egg" calls can be on any station screen.
+app.addEventListener('click', (e) => {
+  const go = e.target.closest('[data-hide-find]');
+  const skip = e.target.closest('[data-skip-find]');
+  if (go) {
+    const h = state.hides.find((x) => x.findId === go.dataset.hideFind);
+    if (h) startHide(h);
+  } else if (skip) {
+    skipHide(skip.dataset.skipFind);
+    skip.closest('.hide-call')?.remove();
+  }
+});
+
+// Opening the app with no signal (underground) waits for signal instead of a dead end.
+function waitForServer() {
+  app.innerHTML = `<div class="notice bad">Can't reach the game server. No signal down here? Lookout connects by itself once you have signal.</div>
+    <p><button id="retryBoot" class="btn btn-ink btn-block" type="button">Try again</button></p>`;
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      window.removeEventListener('online', done);
+      resolve();
+    };
+    const timer = setTimeout(done, 8000);
+    window.addEventListener('online', done);
+    $('#retryBoot').addEventListener('click', done);
+  });
+}
+
 // ---------- boot ----------
 (async function boot() {
   setLine(state.line);
-  try {
-    state.config = await api('/api/config');
-  } catch {
-    app.innerHTML = '<div class="notice bad">Can\'t reach the game server. Is it running?</div>';
-    return;
+  drawNet();
+  while (!state.config) {
+    try {
+      state.config = await api('/api/config', null, { timeout: 10_000 });
+    } catch {
+      await waitForServer();
+    }
   }
   // Make sure this device's session is still valid (it may have been signed out elsewhere).
+  // A 401 signs out inside api(); with no signal, keep the session and carry on.
   if (state.token) {
     try {
       const { user } = await api('/api/auth/me');
       setSession({ user, token: state.token });
-    } catch (err) {
-      if (err.status === 401) setSession(null);
+    } catch {
+      /* see above */
     }
   }
-  // Detect the station automatically as soon as a player is signed in.
-  if (state.user) startLocation();
+  if (state.user) {
+    // Reopened soon after using it somewhere else (off a train, say): fixes from before that
+    // belong to the last station, so wait for a fresh one and offer the last station as a guess.
+    const away = readStored('egg-away-at');
+    if (away?.at && Date.now() - away.at < 30 * 60_000) {
+      loc.minFixAt = away.at;
+      loc.prev = away.pos ?? null;
+      loc.lastHereId = away.hereId ?? null;
+    }
+    startLocation();
+    await syncActive();
+    // Closed the app mid-round: go straight back to the clock.
+    if (liveRound() && !/^#\/(play|hide)/.test(location.hash)) history.replaceState(null, '', '#/play');
+  }
   window.addEventListener('hashchange', render);
+  booted = true;
   render();
 })();

@@ -71,6 +71,70 @@ export async function createApp({
   const publicUser = (u) => ({ id: u.id, username: u.username, createdAt: u.created_at });
   const requireUser = (ctx) => ctx.user ?? fail(401, 'Sign in to play.');
 
+  // ---------- rounds: resume, retry cooldown ----------
+  // A round can be submitted until limit + grace after it started.
+  const roundEnd = (a) => new Date(a.started_at.getTime() + (a.limit_seconds + game.GRACE_SECONDS) * 1000);
+  const isRunning = (a, t) => a?.status === 'open' && t < roundEnd(a);
+  // When this player may start a new round on an egg, given their latest round on it.
+  // null means right now (or never, if they found it).
+  function retryAt(a, t) {
+    if (!a || a.status === 'found' || isRunning(a, t)) return null;
+    const ended = Math.min(roundEnd(a).getTime(), a.ended_at?.getTime() ?? Infinity);
+    const at = new Date(ended + game.RETRY_COOLDOWN_MINUTES * 60_000);
+    return at > t ? at : null;
+  }
+  const latestAttempt = (userId, eggId) =>
+    db.one('select * from attempts where user_id = $1 and egg_id = $2 order by started_at desc limit 1', [userId, eggId]);
+
+  // The round as the app sees it. secondsLeft is worked out from the server clock, so a
+  // phone that reloads, slept or lost signal picks up exactly where the round really is.
+  function roundPayload(a, egg, t, train = null) {
+    const info = game.levelInfo(egg.level);
+    return {
+      attempt: {
+        id: a.id,
+        limitSeconds: a.limit_seconds,
+        limitSource: a.limit_source,
+        secondsLeft: Math.round(a.limit_seconds - (t - a.started_at) / 1000),
+        train,
+      },
+      egg: {
+        id: egg.id,
+        level: egg.level,
+        levelName: info.name,
+        points: info.points,
+        hint: egg.hint,
+        imageUrl: photoUrl(egg.photo_id),
+        stationId: egg.station_id,
+        stationName: stationName(egg.station_id),
+      },
+    };
+  }
+
+  // A find replayed for a retried upload (the first response never reached the phone).
+  async function replayFind(attempt, userId) {
+    const f = await db.one(
+      `select f.*, not exists (select 1 from finds g where g.egg_id = f.egg_id and g.id <> f.id
+                and (g.found_at < f.found_at or (g.found_at = f.found_at and g.id < f.id))) as first
+         from finds f where f.user_id = $1 and f.egg_id = $2`,
+      [userId, attempt.egg_id],
+    );
+    if (!f) fail(409, `This round is already ${attempt.status.replace('_', ' ')}.`);
+    return {
+      status: 'found',
+      findId: f.id,
+      points: { base: f.base, bonus: f.bonus, total: f.points },
+      secondsTaken: f.seconds_taken,
+      verification: f.verified
+        ? { method: 'gemini', match: true, reason: '' }
+        : { method: 'honor', match: true, reason: 'Counted on the honor system.' },
+      stationId: f.station_id,
+      level: f.level,
+      firstFind: f.first,
+      replayed: true,
+    };
+  }
+
   function decodeImage(dataUrl) {
     const m = /^data:image\/(jpeg|png|webp);base64,(.+)$/s.exec(String(dataUrl ?? ''));
     if (!m) fail(400, 'Photo must be a JPEG, PNG or WebP image.');
@@ -161,6 +225,8 @@ export async function createApp({
         graceSeconds: game.GRACE_SECONDS,
         maxTimeBonus: game.MAX_TIME_BONUS,
         passwordMin: auth.PASSWORD_MIN,
+        hideWindowMinutes: game.HIDE_WINDOW_MINUTES,
+        retryCooldownMinutes: game.RETRY_COOLDOWN_MINUTES,
       };
     },
 
@@ -246,6 +312,7 @@ export async function createApp({
       await ensureStations();
       await housekeeping();
       const s = station(id);
+      const t = now();
       const eggs = await db.many(
         `select e.id, e.level, e.times_found, e.created_by, u.username as creator,
                 exists (select 1 from finds f where f.egg_id = e.id and f.user_id = $2::uuid) as found_by_me
@@ -253,9 +320,19 @@ export async function createApp({
           where e.station_id = $1 and e.status = 'active'`,
         [id, user?.id ?? null],
       );
+      // Your latest round on each egg here: running (resume it) or cooling down.
+      const mine = user && eggs.length
+        ? await db.many(
+            `select distinct on (egg_id) * from attempts
+              where user_id = $1 and egg_id = any($2::uuid[]) order by egg_id, started_at desc`,
+            [user.id, eggs.map((e) => e.id)],
+          )
+        : [];
+      const lastRound = new Map(mine.map((a) => [a.egg_id, a]));
       const byLevel = new Map(eggs.map((e) => [e.level, e]));
       const slotsOut = game.LEVELS.map((l) => {
         const egg = byLevel.get(l.level);
+        const a = egg && lastRound.get(egg.id);
         return {
           ...l,
           egg: egg
@@ -265,6 +342,8 @@ export async function createApp({
                 createdBy: egg.creator,
                 mine: egg.created_by === user?.id,
                 foundByMe: egg.found_by_me,
+                round: isRunning(a, t) ? { attemptId: a.id, secondsLeft: roundPayload(a, egg, t).attempt.secondsLeft } : null,
+                retryAt: retryAt(a, t),
               }
             : null,
         };
@@ -346,6 +425,18 @@ export async function createApp({
         fail(409, 'You already found this egg.');
       }
 
+      // A round that's still running is picked up where it is (after a reload, a closed
+      // app, or "give up" then "play" again), so the timer can't be reset.
+      const t = now();
+      const last = await latestAttempt(user.id, egg.id);
+      if (isRunning(last, t)) return { ...roundPayload(last, egg, t), resumed: true };
+      const wait = retryAt(last, t);
+      if (wait) {
+        const mins = Math.ceil((wait - t) / 60_000);
+        const how = last.status === 'given_up' ? 'gave up on' : 'ran out of time on';
+        fail(409, `You ${how} this egg. Try it again in ${mins} ${mins === 1 ? 'minute' : 'minutes'}.`);
+      }
+
       const info = game.levelInfo(egg.level);
       let limitSeconds = info.seconds;
       let limitSource = 'fixed';
@@ -363,24 +454,67 @@ export async function createApp({
         }
       }
 
-      const attemptId = crypto.randomUUID();
+      const attempt = {
+        id: crypto.randomUUID(),
+        started_at: t,
+        limit_seconds: limitSeconds,
+        limit_source: limitSource,
+      };
       await db.query(
         `insert into attempts (id, user_id, egg_id, started_at, limit_seconds, limit_source, status)
          values ($1, $2, $3, $4, $5, $6, 'open')`,
-        [attemptId, user.id, egg.id, now(), limitSeconds, limitSource],
+        [attempt.id, user.id, egg.id, attempt.started_at, limitSeconds, limitSource],
+      );
+      return roundPayload(attempt, egg, attempt.started_at, train);
+    },
+
+    // Ends a round on purpose. The retry cooldown starts now.
+    async giveUp(ctx) {
+      const user = requireUser(ctx);
+      const [attemptId] = ctx.params;
+      if (!isUuid(attemptId)) fail(404, 'Round not found');
+      const attempt = (await db.one('select * from attempts where id = $1', [attemptId])) ?? fail(404, 'Round not found');
+      if (attempt.user_id !== user.id) fail(403, 'Not your round');
+      const t = now();
+      const row = await db.one(
+        `update attempts set status = 'given_up', ended_at = $2 where id = $1 and status = 'open' returning *`,
+        [attempt.id, t],
+      );
+      const after = row ?? attempt;
+      return { status: after.status, retryAt: retryAt(after, t) };
+    },
+
+    // What this player has going on right now, for an app that was closed or reloaded:
+    // a round still on the clock, and finds they can still hide the next egg for.
+    async active(ctx) {
+      const user = requireUser(ctx);
+      await ensureStations();
+      const t = now();
+      const a = await db.one(
+        `select a.* from attempts a
+          where a.user_id = $1 and a.status = 'open'
+            and a.started_at + make_interval(secs => a.limit_seconds + $3) > $2
+            and not exists (select 1 from finds f where f.user_id = a.user_id and f.egg_id = a.egg_id)
+          order by a.started_at desc limit 1`,
+        [user.id, t, game.GRACE_SECONDS],
+      );
+      const egg = a && (await db.one('select * from eggs where id = $1', [a.egg_id]));
+      const hides = await db.many(
+        `select id, station_id, level, found_at from finds
+          where user_id = $1 and can_hide and found_at > $2 order by found_at desc`,
+        [user.id, new Date(t.getTime() - game.HIDE_WINDOW_MINUTES * 60_000)],
       );
       return {
-        attempt: { id: attemptId, limitSeconds, limitSource, secondsLeft: limitSeconds, train },
-        egg: {
-          id: egg.id,
-          level: egg.level,
-          levelName: info.name,
-          points: info.points,
-          hint: egg.hint,
-          imageUrl: photoUrl(egg.photo_id),
-          stationId: egg.station_id,
-          stationName: stationName(egg.station_id),
-        },
+        round: egg ? { ...roundPayload(a, egg, t), station: stationById.get(egg.station_id) ?? null } : null,
+        hides: hides.map((f) => ({
+          findId: f.id,
+          stationId: f.station_id,
+          stationName: stationName(f.station_id),
+          level: f.level,
+          levelName: game.levelInfo(f.level).name,
+          points: game.levelInfo(f.level).points,
+          expiresAt: new Date(f.found_at.getTime() + game.HIDE_WINDOW_MINUTES * 60_000),
+        })),
       };
     },
 
@@ -390,15 +524,23 @@ export async function createApp({
       if (!isUuid(attemptId)) fail(404, 'Round not found');
       const attempt = (await db.one('select * from attempts where id = $1', [attemptId])) ?? fail(404, 'Round not found');
       if (attempt.user_id !== user.id) fail(403, 'Not your round');
-      if (attempt.status !== 'open') fail(409, `This round is already ${attempt.status}.`);
+      // Signal drops underground: if the phone resends a find that was already saved,
+      // answer with that find instead of an error.
+      if (attempt.status === 'found') return replayFind(attempt, user.id);
+      if (attempt.status !== 'open') fail(409, `This round is already ${attempt.status.replace('_', ' ')}.`);
       const egg = (await db.one('select * from eggs where id = $1', [attempt.egg_id])) ?? fail(404, 'Egg not found');
       if (await db.one('select 1 from finds where user_id = $1 and egg_id = $2', [user.id, egg.id])) {
         fail(409, 'You already found this egg.');
       }
 
-      const elapsed = (now() - attempt.started_at) / 1000;
+      // Time counts until the upload started arriving, not until the last byte did,
+      // so a slow connection in a station doesn't eat the player's clock.
+      const elapsed = ((ctx.at ?? now()) - attempt.started_at) / 1000;
       if (elapsed > attempt.limit_seconds + game.GRACE_SECONDS) {
-        await db.query(`update attempts set status = 'expired' where id = $1 and status = 'open'`, [attempt.id]);
+        await db.query(`update attempts set status = 'expired', ended_at = $2 where id = $1 and status = 'open'`, [
+          attempt.id,
+          roundEnd(attempt),
+        ]);
         return { status: 'expired' };
       }
 
@@ -419,11 +561,16 @@ export async function createApp({
       const findId = crypto.randomUUID();
       const t = now();
       let firstFind = false;
+      let alreadySaved = false;
       await db.tx(async (c) => {
         await slots.lockSlot(c, egg.station_id, egg.level);
-        // Re-check under lock: the same round may have been submitted from another tab.
+        // Re-check under lock: the same round may have been submitted twice (a retry, another tab).
         const locked = await c.one('select status from attempts where id = $1 for update', [attempt.id]);
-        if (locked.status !== 'open') fail(409, `This round is already ${locked.status}.`);
+        if (locked.status === 'found') {
+          alreadySaved = true;
+          return;
+        }
+        if (locked.status !== 'open') fail(409, `This round is already ${locked.status.replace('_', ' ')}.`);
         const photoId = await savePhoto(c, candidate);
         try {
           await c.query(
@@ -443,10 +590,11 @@ export async function createApp({
             where id = $1 returning *`,
           [egg.id, Math.round(secondsTaken)],
         );
-        await c.query(`update attempts set status = 'found' where id = $1`, [attempt.id]);
+        await c.query(`update attempts set status = 'found', ended_at = $2 where id = $1`, [attempt.id, t]);
         firstFind = fresh.times_found === 1;
         if (fresh.status === 'active') await slots.rotateAfterFind(c, fresh, user.id, t);
       });
+      if (alreadySaved) return replayFind(attempt, user.id);
       return {
         status: 'found',
         findId,
@@ -534,7 +682,7 @@ export async function createApp({
       const families = (stationId) =>
         [...new Set((stationById.get(stationId)?.lines ?? []).map((l) => game.lineFamily(l.id)))];
       const allLines = new Set();
-      const linesByDay = new Map();
+      const days = new Map(); // day -> { stations, lines }
       const byStation = new Map();
       let allTime = 0;
       for (const f of finds) {
@@ -542,15 +690,21 @@ export async function createApp({
         const day = game.dayKey(f.found_at);
         const fams = families(f.station_id);
         fams.forEach((x) => allLines.add(x));
-        if (!linesByDay.has(day)) linesByDay.set(day, new Set());
-        fams.forEach((x) => linesByDay.get(day).add(x));
+        const d = days.get(day) ?? { stations: new Set(), lines: new Set() };
+        d.stations.add(f.station_id);
+        fams.forEach((x) => d.lines.add(x));
+        days.set(day, d);
         const st = byStation.get(f.station_id) ?? { finds: 0, points: 0, firstFoundAt: f.found_at };
         st.finds += 1;
         st.points += f.points;
         byStation.set(f.station_id, st);
       }
       const todays = finds.filter((f) => game.dayKey(f.found_at) === today);
-      const mostLinesInADay = Math.max(0, ...[...linesByDay.values()].map((x) => x.size));
+      // "Transfer" means riding somewhere on another line, so finds at a single station count as
+      // one line, even at a two-line station like Park Street (Red and Green), until you find an
+      // egg at a second station.
+      const transferLines = (stations, lines) => (stations.size >= 2 ? lines.size : Math.min(1, lines.size));
+      const mostLinesInADay = Math.max(0, ...[...days.values()].map((d) => transferLines(d.stations, d.lines)));
       const mainLinesFound = game.MAIN_LINES.filter((x) => allLines.has(x)).length;
 
       const stamp = (id, name, description, target, progress) => ({
@@ -558,7 +712,7 @@ export async function createApp({
       });
       const stamps = [
         stamp('first_find', 'First find', 'Find your first egg.', 1, finds.length),
-        stamp('transfer', 'Transfer', 'Find eggs on 2 lines in one day.', 2, mostLinesInADay),
+        stamp('transfer', 'Transfer', 'Find eggs at 2 stations on different lines in one day.', 2, mostLinesInADay),
         stamp('beat_train', 'Beat the train', 'Find an egg while racing a train.', 1, finds.filter((f) => f.raced).length),
         stamp('first_to_find', 'First', 'Be the first to find an egg.', 1, finds.filter((f) => f.first).length),
         stamp('speedy', '30 s', 'Find an egg in 30 seconds or less.', 1, finds.filter((f) => f.seconds_taken <= 30).length),
@@ -571,7 +725,7 @@ export async function createApp({
       const ch = game.challengeFor(today);
       const todayLines = [...new Set(todays.flatMap((f) => families(f.station_id)))];
       const measure = {
-        transfer: todayLines.length,
+        transfer: transferLines(new Set(todays.map((f) => f.station_id)), new Set(todayLines)),
         racer: todays.filter((f) => f.raced).length,
         climber: todays.filter((f) => f.level >= 3).length,
         triple: todays.length,
@@ -648,6 +802,8 @@ export async function createApp({
     ['GET', /^\/api\/users\/([^/]+)$/, api.profile, 'optional'],
     ['POST', /^\/api\/attempts$/, api.startAttempt, 'optional'],
     ['POST', /^\/api\/attempts\/([^/]+)\/find$/, api.submitFind, 'optional'],
+    ['POST', /^\/api\/attempts\/([^/]+)\/give-up$/, api.giveUp, 'optional'],
+    ['GET', /^\/api\/me\/active$/, api.active, 'optional'],
     ['POST', /^\/api\/eggs$/, api.createEgg, 'optional'],
     ['POST', /^\/api\/eggs\/([^/]+)\/report$/, api.reportEgg, 'optional'],
     ['GET', /^\/api\/me\/progress$/, api.progress, 'optional'],
@@ -670,6 +826,7 @@ export async function createApp({
 
   async function handler(req, res) {
     const cors = corsHeaders(req);
+    const at = now(); // when the request arrived, before a slow body upload
     try {
       const url = new URL(req.url, 'http://localhost');
       const pathname = decodeURIComponent(url.pathname);
@@ -684,7 +841,7 @@ export async function createApp({
           if (!m || req.method !== method) continue;
           const session = authMode === 'none' ? null : await authenticate(req);
           const body = method === 'POST' ? await readJson(req) : null;
-          const ctx = { params: m.slice(1), query: url.searchParams, body, req, user: session?.user ?? null, sessionId: session?.sessionId ?? null };
+          const ctx = { params: m.slice(1), query: url.searchParams, body, req, at, user: session?.user ?? null, sessionId: session?.sessionId ?? null };
           return sendJson(res, 200, await fn(ctx), cors);
         }
         fail(404, 'Not found');
