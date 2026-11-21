@@ -44,3 +44,37 @@ export function lineFamily(routeId) {
   if (routeId === 'Mattapan') return 'Red';
   return routeId;
 }
+
+// ---------- progress: rider levels, daily challenges, stamps ----------
+// Everything below is derived from finds/attempts/eggs; nothing extra is stored.
+
+// All-time points needed to reach each rider level (index 0 = level 1).
+export const RIDER_LEVELS = [0, 50, 150, 300, 500, 800, 1200, 1700, 2300, 3000];
+
+export function riderLevel(points) {
+  let i = 0;
+  while (i + 1 < RIDER_LEVELS.length && points >= RIDER_LEVELS[i + 1]) i++;
+  return { level: i + 1, points, floor: RIDER_LEVELS[i], next: RIDER_LEVELS[i + 1] ?? null };
+}
+
+// "2026-11-21" in Boston time, so daily challenges flip at local midnight.
+export function dayKey(date, timeZone = 'America/New_York') {
+  return new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(
+    new Date(date),
+  );
+}
+
+// One challenge a day, the same for everyone, rotating through this list.
+export const CHALLENGES = [
+  { id: 'transfer', title: 'Transfer', description: 'Find eggs on 2 different lines today.', target: 2 },
+  { id: 'racer', title: 'Beat the train', description: 'Find an egg while racing a train today.', target: 1 },
+  { id: 'climber', title: 'Go hard', description: 'Find a Hard egg or harder today.', target: 1 },
+  { id: 'triple', title: 'Hat trick', description: 'Find 3 eggs today.', target: 3 },
+];
+
+export function challengeFor(day) {
+  const n = Math.floor(Date.parse(`${day}T00:00:00Z`) / 86_400_000);
+  return CHALLENGES[((n % CHALLENGES.length) + CHALLENGES.length) % CHALLENGES.length];
+}
+
+export const MAIN_LINES = ['Red', 'Orange', 'Blue', 'Green'];

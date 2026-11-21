@@ -418,6 +418,7 @@ export async function createApp({
       const score = game.scoreFind(egg.level, secondsTaken, attempt.limit_seconds);
       const findId = crypto.randomUUID();
       const t = now();
+      let firstFind = false;
       await db.tx(async (c) => {
         await slots.lockSlot(c, egg.station_id, egg.level);
         // Re-check under lock: the same round may have been submitted from another tab.
@@ -443,6 +444,7 @@ export async function createApp({
           [egg.id, Math.round(secondsTaken)],
         );
         await c.query(`update attempts set status = 'found' where id = $1`, [attempt.id]);
+        firstFind = fresh.times_found === 1;
         if (fresh.status === 'active') await slots.rotateAfterFind(c, fresh, user.id, t);
       });
       return {
@@ -453,6 +455,7 @@ export async function createApp({
         verification,
         stationId: egg.station_id,
         level: egg.level,
+        firstFind,
       };
     },
 
@@ -511,6 +514,90 @@ export async function createApp({
       });
     },
 
+    // Rider level, today's challenge, stamps, and the stations and lines you've found eggs on.
+    // All derived from finds, attempts and eggs: nothing extra is stored.
+    async progress(ctx) {
+      const user = requireUser(ctx);
+      await ensureStations();
+      const today = game.dayKey(now());
+      const finds = await db.many(
+        `select f.station_id, f.level, f.found_at, f.seconds_taken, f.points,
+                not exists (select 1 from finds g where g.egg_id = f.egg_id and g.id <> f.id
+                              and (g.found_at < f.found_at or (g.found_at = f.found_at and g.id < f.id))) as first,
+                exists (select 1 from attempts a where a.user_id = f.user_id and a.egg_id = f.egg_id
+                          and a.status = 'found' and a.limit_source = 'train') as raced
+           from finds f where f.user_id = $1 order by f.found_at, f.id`,
+        [user.id],
+      );
+      const { n: hidden } = await db.one('select count(*)::int as n from eggs where created_by = $1', [user.id]);
+
+      const families = (stationId) =>
+        [...new Set((stationById.get(stationId)?.lines ?? []).map((l) => game.lineFamily(l.id)))];
+      const allLines = new Set();
+      const linesByDay = new Map();
+      const byStation = new Map();
+      let allTime = 0;
+      for (const f of finds) {
+        allTime += f.points;
+        const day = game.dayKey(f.found_at);
+        const fams = families(f.station_id);
+        fams.forEach((x) => allLines.add(x));
+        if (!linesByDay.has(day)) linesByDay.set(day, new Set());
+        fams.forEach((x) => linesByDay.get(day).add(x));
+        const st = byStation.get(f.station_id) ?? { finds: 0, points: 0, firstFoundAt: f.found_at };
+        st.finds += 1;
+        st.points += f.points;
+        byStation.set(f.station_id, st);
+      }
+      const todays = finds.filter((f) => game.dayKey(f.found_at) === today);
+      const mostLinesInADay = Math.max(0, ...[...linesByDay.values()].map((x) => x.size));
+      const mainLinesFound = game.MAIN_LINES.filter((x) => allLines.has(x)).length;
+
+      const stamp = (id, name, description, target, progress) => ({
+        id, name, description, target, progress: Math.min(target, progress), earned: progress >= target,
+      });
+      const stamps = [
+        stamp('first_find', 'First find', 'Find your first egg.', 1, finds.length),
+        stamp('transfer', 'Transfer', 'Find eggs on 2 lines in one day.', 2, mostLinesInADay),
+        stamp('beat_train', 'Beat the train', 'Find an egg while racing a train.', 1, finds.filter((f) => f.raced).length),
+        stamp('first_to_find', 'First', 'Be the first to find an egg.', 1, finds.filter((f) => f.first).length),
+        stamp('speedy', '30 s', 'Find an egg in 30 seconds or less.', 1, finds.filter((f) => f.seconds_taken <= 30).length),
+        stamp('impossible', 'Impossible', 'Find a level 5 egg.', 1, finds.filter((f) => f.level === 5).length),
+        stamp('all_lines', '4 lines', 'Find eggs on the Red, Orange, Blue and Green lines.', 4, mainLinesFound),
+        stamp('hider', 'Hider', 'Hide 5 eggs.', 5, hidden),
+        stamp('ten_finds', '10 finds', 'Find 10 eggs.', 10, finds.length),
+      ];
+
+      const ch = game.challengeFor(today);
+      const todayLines = [...new Set(todays.flatMap((f) => families(f.station_id)))];
+      const measure = {
+        transfer: todayLines.length,
+        racer: todays.filter((f) => f.raced).length,
+        climber: todays.filter((f) => f.level >= 3).length,
+        triple: todays.length,
+      }[ch.id];
+
+      return {
+        level: game.riderLevel(allTime),
+        today: { day: today, ...ch, progress: Math.min(ch.target, measure), done: measure >= ch.target, lines: todayLines },
+        stamps,
+        stations: [...byStation]
+          .map(([id, st]) => ({
+            stationId: id,
+            name: stationName(id),
+            lines: families(id),
+            finds: st.finds,
+            points: st.points,
+            firstFoundAt: st.firstFoundAt,
+          }))
+          .sort((a, b) => new Date(a.firstFoundAt) - new Date(b.firstFoundAt)),
+        lines: game.MAIN_LINES.map((line) => ({
+          line,
+          stations: [...byStation.keys()].filter((id) => families(id).includes(line)).length,
+        })),
+      };
+    },
+
     async leaderboard({ query }) {
       await ensureStations();
       const month = query.get('month') || game.monthKey(now());
@@ -563,6 +650,7 @@ export async function createApp({
     ['POST', /^\/api\/attempts\/([^/]+)\/find$/, api.submitFind, 'optional'],
     ['POST', /^\/api\/eggs$/, api.createEgg, 'optional'],
     ['POST', /^\/api\/eggs\/([^/]+)\/report$/, api.reportEgg, 'optional'],
+    ['GET', /^\/api\/me\/progress$/, api.progress, 'optional'],
     ['GET', /^\/api\/leaderboard$/, api.leaderboard, 'none'],
   ];
 

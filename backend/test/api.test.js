@@ -266,3 +266,45 @@ test('bad input, CORS, health and static files', async () => {
   assert.equal((await fetch(`${base}/photos/..%2f..%2fserver.js`)).status, 404);
   assert.equal((await fetch(`${base}/photos/${crypto.randomUUID()}.jpg`)).status, 404);
 });
+
+test('progress: rider level, daily challenge, stamps, stations and lines', async () => {
+  const quin = await user('quin');
+  const rae = await user('rae');
+  // An empty account has level 1 and nothing earned.
+  const empty = await ok('/api/me/progress', null, rae);
+  assert.equal(empty.level.level, 1);
+  assert.equal(empty.stamps.filter((s) => s.earned).length, 0);
+  assert.equal((await call('/api/me/progress')).status, 401, 'must be signed in');
+
+  // quin hides at Kenmore (Green) and Park Street (Red + Green); rae finds both, racing a train at Park Street.
+  await ok('/api/eggs', { stationId: 'place-kencl', level: 5, image: IMG }, quin);
+  await ok('/api/eggs', { stationId: 'place-pktrm', level: 5, image: IMG }, quin);
+  const ken = (await ok('/api/stations/place-kencl')).slots[4].egg.id;
+  const pk = (await ok('/api/stations/place-pktrm')).slots[4].egg.id;
+
+  const r1 = await ok('/api/attempts', { eggId: ken, mode: 'fixed' }, rae);
+  clock += 20_000;
+  const f1 = await ok(`/api/attempts/${r1.attempt.id}/find`, { image: IMG }, rae);
+  assert.equal(f1.firstFind, true, 'first to find this egg');
+
+  const r2 = await ok('/api/attempts', { eggId: pk, mode: 'train' }, rae);
+  clock += 60_000;
+  await ok(`/api/attempts/${r2.attempt.id}/find`, { image: IMG }, rae);
+
+  const p = await ok('/api/me/progress', null, rae);
+  const earned = new Set(p.stamps.filter((s) => s.earned).map((s) => s.id));
+  for (const id of ['first_find', 'transfer', 'beat_train', 'first_to_find', 'speedy', 'impossible']) {
+    assert.ok(earned.has(id), `${id} should be earned`);
+  }
+  assert.equal(earned.has('all_lines'), false);
+  assert.equal(p.stamps.find((s) => s.id === 'all_lines').progress, 2, 'Red and Green');
+  assert.equal(p.stations.length, 2);
+  assert.deepEqual(p.lines.find((l) => l.line === 'Green'), { line: 'Green', stations: 2 });
+  assert.deepEqual(p.lines.find((l) => l.line === 'Red'), { line: 'Red', stations: 1 });
+  assert.deepEqual(new Set(p.today.lines), new Set(['Green', 'Red']));
+  // 60 + 28 bonus at Kenmore, 60 + 23 bonus racing the train = 171 -> level 3 (150 to 300)
+  assert.equal(p.level.points, 171);
+  assert.deepEqual([p.level.level, p.level.floor, p.level.next], [3, 150, 300]);
+  assert.ok(['transfer', 'racer', 'climber', 'triple'].includes(p.today.id));
+  assert.equal(p.today.target >= p.today.progress, true);
+});
