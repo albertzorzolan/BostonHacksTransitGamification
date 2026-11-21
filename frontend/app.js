@@ -1,4 +1,5 @@
 // Station Egg Hunt: single-page app, hash routing, no build step.
+// Talks to the backend at window.EGG_API_BASE (set in config.js; empty = same origin).
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const app = $('#app');
@@ -10,8 +11,14 @@ const REPORT_REASONS = [
   ['person', 'Shows a person'],
 ];
 
+const API_BASE = String(window.EGG_API_BASE ?? '').replace(/\/$/, '');
+const apiUrl = (path) => API_BASE + path;
+
+// session = { user, token } from register/login. Each device gets its own token.
+const session = readStored('egg-session');
 const state = {
-  user: readStored('egg-user'),
+  user: session?.user ?? null,
+  token: session?.token ?? null,
   config: null,
   stations: null,
   lastStationId: readStored('egg-last-station'),
@@ -39,11 +46,15 @@ function store(key, value) {
 }
 
 async function api(path, body) {
-  const res = await fetch(path, {
-    method: body ? 'POST' : 'GET',
-    headers: body ? { 'content-type': 'application/json' } : {},
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  const headers = {};
+  if (body) headers['content-type'] = 'application/json';
+  if (state.token) headers.authorization = `Bearer ${state.token}`;
+  let res;
+  try {
+    res = await fetch(apiUrl(path), { method: body ? 'POST' : 'GET', headers, body: body ? JSON.stringify(body) : undefined });
+  } catch {
+    throw new Error("Can't reach the game server. Check your connection.");
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const err = new Error(data.error || `Request failed (${res.status})`);
@@ -161,34 +172,62 @@ async function render() {
   location.hash = '#/';
 }
 
-function signOut() {
-  state.user = null;
-  store('egg-user', null);
+function setSession(data) {
+  state.user = data?.user ?? null;
+  state.token = data?.token ?? null;
+  store('egg-session', data ? { user: data.user, token: data.token } : null);
+}
+
+// Forget this device's session. `everywhere` signs out every device on the account.
+async function signOut({ remote = false, everywhere = false } = {}) {
+  if (remote && state.token) {
+    try {
+      await api(everywhere ? '/api/auth/logout-all' : '/api/auth/logout', {});
+    } catch {
+      /* already invalid: fine */
+    }
+  }
+  setSession(null);
   render();
 }
 
-// ---------- sign up ----------
-function viewSignup() {
+// ---------- sign in / create account ----------
+function viewSignup(mode = 'register') {
   $('#tabs').hidden = true;
+  const registering = mode === 'register';
+  const min = state.config?.passwordMin ?? 8;
   app.innerHTML = `
     <h1>Find what's hiding in your station.</h1>
     <p class="sub">Riders photograph small things in MBTA stations. You get a photo and a timer, and you look around until you spot it. Find it, snap it, score points, then hide the next one.</p>
-    <form id="signup" class="card stack">
-      <label for="username"><strong>Pick a username</strong></label>
-      <input id="username" class="input" maxlength="20" autocomplete="nickname" placeholder="e.g. kenmore_kid" required />
-      <button class="btn primary block">Start playing</button>
+    <div class="seg" role="tablist" style="margin-bottom:12px">
+      <button type="button" data-mode="register" class="${registering ? 'on' : ''}">Create account</button>
+      <button type="button" data-mode="login" class="${registering ? '' : 'on'}">Sign in</button>
+    </div>
+    <form id="auth" class="card stack">
+      <label for="username"><strong>Username</strong></label>
+      <input id="username" class="input" maxlength="20" autocomplete="username" autocapitalize="none" placeholder="e.g. kenmore_kid" required />
+      <label for="password"><strong>Password</strong>${registering ? ` <span class="small">(at least ${min} characters)</span>` : ''}</label>
+      <input id="password" class="input" type="password" maxlength="200" ${registering ? `minlength="${min}"` : ''} autocomplete="${registering ? 'new-password' : 'current-password'}" required />
+      <button class="btn primary block">${registering ? 'Create account' : 'Sign in'}</button>
+      <p class="small">${registering ? 'Your account works on any phone or laptop. Sign in with the same username and password.' : 'Signing in here keeps you signed in on your other devices too.'}</p>
       <div id="err"></div>
     </form>`;
-  $('#signup').addEventListener('submit', async (e) => {
+  app.querySelectorAll('.seg button').forEach((b) => b.addEventListener('click', () => viewSignup(b.dataset.mode)));
+  $('#auth').addEventListener('submit', async (e) => {
     e.preventDefault();
+    const btn = $('#auth button.primary');
+    btn.disabled = true;
     try {
-      const { user } = await api('/api/users', { username: $('#username').value });
-      state.user = user;
-      store('egg-user', user);
+      const data = await api(registering ? '/api/auth/register' : '/api/auth/login', {
+        username: $('#username').value,
+        password: $('#password').value,
+      });
+      setSession(data);
       $('#tabs').hidden = false;
       render();
     } catch (err) {
       $('#err').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+      btn.disabled = false;
     }
   });
 }
@@ -255,7 +294,7 @@ async function viewStations() {
 // ---------- one station ----------
 async function viewStation(id) {
   loading();
-  const { station, slots } = await api(`/api/stations/${encodeURIComponent(id)}?userId=${state.user.id}`);
+  const { station, slots } = await api(`/api/stations/${encodeURIComponent(id)}`);
   state.lastStationId = id;
   store('egg-last-station', id);
 
@@ -284,7 +323,7 @@ async function viewStation(id) {
     btn.addEventListener('click', async () => {
       btn.disabled = true;
       try {
-        const round = await api('/api/attempts', { userId: state.user.id, eggId: btn.dataset.play, mode: state.raceTrain ? 'train' : 'fixed' });
+        const round = await api('/api/attempts', { eggId: btn.dataset.play, mode: state.raceTrain ? 'train' : 'fixed' });
         state.play = { ...round, receivedAt: performance.now(), result: null };
         location.hash = '#/play';
       } catch (err) {
@@ -367,7 +406,7 @@ function viewPlay() {
       <span class="small" style="text-align:right">${attempt.limitSource === 'train' ? `Beat the ${esc(attempt.train?.headsign || 'next')} train` : 'Level timer'}</span>
     </div>
     <div class="timerbar"><div id="bar" style="width:100%"></div></div>
-    <div class="play-photo" style="margin-top:12px"><img src="${egg.imageUrl}" alt="The egg to find: a photo of something in this station" /></div>
+    <div class="play-photo" style="margin-top:12px"><img src="${apiUrl(egg.imageUrl)}" alt="The egg to find: a photo of something in this station" /></div>
     ${egg.hint ? `<p class="notice" style="margin-top:10px"><strong>Hint:</strong> ${esc(egg.hint)}</p>` : ''}
     <div id="status" style="margin-top:12px"></div>
     <label class="btn primary block" id="snap" style="margin-top:12px">
@@ -405,7 +444,7 @@ function viewPlay() {
     status.innerHTML = `<div class="notice row"><div class="spin"></div>${state.config?.gemini ? 'Checking your photo against the egg…' : 'Saving your find…'}</div>`;
     try {
       const image = await photoToJpeg(file);
-      const result = await api(`/api/attempts/${attempt.id}/find`, { userId: state.user.id, image });
+      const result = await api(`/api/attempts/${attempt.id}/find`, { image });
       if (result.status === 'no_match') {
         status.innerHTML = `<div class="notice bad"><strong>Not a match.</strong> ${esc(result.reason)} Keep looking.</div>`;
         $('#snap').style.display = '';
@@ -425,7 +464,7 @@ function viewPlay() {
     b.addEventListener('click', async () => {
       if (!confirm(`Report this egg as “${b.textContent}”?`)) return;
       try {
-        const r = await api(`/api/eggs/${egg.id}/report`, { userId: state.user.id, reason: b.dataset.report });
+        const r = await api(`/api/eggs/${egg.id}/report`, { reason: b.dataset.report });
         toast(r.retired ? 'Thanks. That egg has been removed.' : 'Thanks, report sent.');
       } catch (err) {
         toast(err.message);
@@ -526,7 +565,6 @@ function viewHide() {
     $('#submit').textContent = 'Hiding…';
     try {
       await api('/api/eggs', {
-        userId: state.user.id,
         stationId: hide.stationId,
         level: hide.level,
         findId: hide.findId,
@@ -623,12 +661,20 @@ async function viewProfile() {
     <h2>Recent finds</h2>
     ${p.recentFinds.length
       ? `<div class="finds">${p.recentFinds
-          .map((f) => `<figure><img src="${f.photoUrl}" alt="Find at ${esc(f.stationName)}" loading="lazy"/><figcaption>${esc(f.stationName)} · ${esc(f.levelName)} · +${f.points}</figcaption></figure>`)
+          .map((f) => `<figure><img src="${apiUrl(f.photoUrl)}" alt="Find at ${esc(f.stationName)}" loading="lazy"/><figcaption>${esc(f.stationName)} · ${esc(f.levelName)} · +${f.points}</figcaption></figure>`)
           .join('')}</div>`
       : '<div class="empty">No finds yet. Pick a station and play a round.</div>'}
-    <p style="margin-top:24px"><button id="out" class="linkbtn">Switch player on this phone</button></p>`;
-  $('#out').addEventListener('click', () => {
-    if (confirm('Switch player? You can make a new username, but this one stays on the leaderboard.')) signOut();
+    <h2>Account</h2>
+    <div class="card stack">
+      <p class="small">Signed in as <strong>${esc(state.user.username)}</strong>. Use the same username and password to play on another device.</p>
+      <div class="row" style="flex-wrap:wrap">
+        <button id="out" class="btn small">Sign out</button>
+        <button id="outAll" class="linkbtn">Sign out on all devices</button>
+      </div>
+    </div>`;
+  $('#out').addEventListener('click', () => signOut({ remote: true }));
+  $('#outAll').addEventListener('click', () => {
+    if (confirm('Sign out on every phone and computer using this account?')) signOut({ remote: true, everywhere: true });
   });
 }
 
@@ -682,15 +728,13 @@ async function viewMap() {
     app.innerHTML = '<div class="notice bad">Can\'t reach the game server. Is it running?</div>';
     return;
   }
-  // Make sure a saved player still exists on this server.
-  if (state.user) {
+  // Make sure this device's session is still valid (it may have been signed out elsewhere).
+  if (state.token) {
     try {
-      await api(`/api/users/${state.user.id}`);
+      const { user } = await api('/api/auth/me');
+      setSession({ user, token: state.token });
     } catch (err) {
-      if (err.status === 404) {
-        state.user = null;
-        store('egg-user', null);
-      }
+      if (err.status === 401) setSession(null);
     }
   }
   $('#tabs').hidden = !state.user;

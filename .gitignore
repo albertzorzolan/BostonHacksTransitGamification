@@ -1,6 +1,3 @@
 node_modules/
 .env
-data/db.json
-data/db.json.tmp
-data/photos/
 .DS_Store

@@ -4,24 +4,51 @@ BostonHacks 2026 · Transit Gamification track. Team: Jonathan & Albert.
 
 Riders photograph small things in MBTA stations (a sticker, a tile, a mark on a bench). Other riders get the photo and a timer and have to find the real thing. You find it, take a photo to prove it and score points, then hide the next one.
 
+## Project layout
+
+```
+backend/    Node API + Postgres (accounts, sessions, game state, photos)
+frontend/   Phone web app: static HTML/JS/CSS, no build step
+```
+
+The backend keeps no state in memory between requests: users, sessions, eggs and photos all live in Postgres. You can run as many backend instances as you like behind a load balancer, and players can sign in to the same account on any number of devices.
+
 ## Run it
 
-Needs Node 22.9+ and no `npm install` (no dependencies).
+Needs Node 22.9+ and Postgres 14+.
 
 ```bash
-npm start          # http://localhost:3000
-npm run dev        # same, restarts on file changes
-npm test           # API + game-rule tests
+npm install                      # installs the backend's one dependency (pg)
+createdb egg_hunt                # the tables are created on first start
+createdb egg_hunt_test           # used by npm test
+cp backend/.env.example backend/.env
+
+npm run dev                      # API + web app on http://localhost:3000
+npm test                         # API tests against Postgres
 ```
 
-The first start downloads the station list from the MBTA API and caches it in `data/stations.json`.
+The first start downloads the station list from the MBTA API and caches it in `backend/data/stations.json`.
 
-### Optional keys (`.env`)
+### Running the frontend on its own
 
-```bash
-cp .env.example .env
-```
+By default the backend also serves `frontend/`, so phones need only one URL. To host the frontend separately (Vercel, Netlify, S3, any static host):
 
+- Set `window.EGG_API_BASE` in `frontend/config.js` to the API's URL.
+- Set `CORS_ORIGINS` on the backend to the frontend's origin, and `SERVE_FRONTEND=false`.
+- For local development: `npm run dev:frontend` serves it on http://localhost:5173 and points it at `http://localhost:3000`.
+
+### Accounts
+
+- Players sign up with a username and password. Passwords are hashed with scrypt.
+- Each sign-in creates a session for that device, using a random bearer token. The database stores only a SHA-256 hash of the token.
+- A session expires after 30 days without use. Profile → "Sign out on all devices" ends every session on the account.
+
+### Environment (`backend/.env`)
+
+- `DATABASE_URL`: Postgres connection string. Any managed Postgres works (Neon, Supabase, RDS).
+- `DB_POOL_SIZE`: connections per instance (default 10).
+- `CORS_ORIGINS`: allowed browser origins, comma-separated, or `*`.
+- `SERVE_FRONTEND`: set to `false` when the frontend is hosted elsewhere.
 - `GEMINI_API_KEY`: turns on the photo check. Without it, finds count on the honor system, and the result screen says so.
 - `GEMINI_MODEL`: defaults to `gemini-2.5-flash`. Change it if Google has retired that model.
 - `MBTA_API_KEY`: a free key from api-v3.mbta.com that raises the rate limit. The app works without one.
@@ -53,14 +80,20 @@ cp .env.example .env
 
 ## Code map
 
-- `server.js`: HTTP server and API routes
-- `lib/game.js`: levels, scoring, slot rotation, retiring
-- `lib/mbta.js`: MBTA V3 stations + predictions
-- `lib/verify.js`: Gemini photo match, with honor-system fallback
-- `lib/store.js`: JSON-file database (`data/db.json`) + photos (`data/photos/`)
-- `public/`: phone web app (no build step)
-- `test/api.test.js`: end-to-end API tests with a fake MBTA, fake verifier and fake clock
+- `backend/server.js`: entry point that reads env vars, runs migrations and starts the server
+- `backend/src/app.js`: HTTP routes, auth middleware, CORS
+- `backend/src/auth.js`: password hashing and session tokens
+- `backend/src/db.js`: Postgres pool, transactions, migration runner
+- `backend/src/slots.js`: egg slot rotation and retiring, in SQL with per-slot locks
+- `backend/src/game.js`: levels, scoring, timers (pure functions)
+- `backend/src/mbta.js`: MBTA V3 stations + predictions
+- `backend/src/verify.js`: Gemini photo match, with honor-system fallback
+- `backend/migrations/`: SQL schema, applied in order on startup
+- `backend/test/api.test.js`: end-to-end API tests (each run uses a throwaway Postgres schema)
+- `frontend/`: phone web app (`config.js` sets the API URL; `serve.js` is a standalone dev server)
 
 ## Reset demo data
 
-Stop the server, delete `data/db.json` and `data/photos/`, then start again.
+```bash
+dropdb egg_hunt && createdb egg_hunt   # tables are recreated on the next start
+```
