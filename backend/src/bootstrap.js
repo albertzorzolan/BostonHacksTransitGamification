@@ -38,7 +38,7 @@ async function build({ frontendDir = null } = {}) {
     db,
     mbta: createMbta({ apiKey: env.MBTA_API_KEY, cacheFile: path.join(BACKEND, 'data', 'stations.json') }),
     geminiKey: env.GEMINI_API_KEY ?? '',
-    geminiModel: env.GEMINI_MODEL || 'gemini-2.5-flash',
+    geminiModel: env.GEMINI_MODEL || 'gemini-3.8-flash',
     frontendDir,
     corsOrigins: (env.CORS_ORIGINS || '*').split(',').map((s) => s.trim()).filter(Boolean),
   });

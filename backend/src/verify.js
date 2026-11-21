@@ -94,18 +94,35 @@ export async function verifyMatch({
   }
 }
 
-// Asks Google whether `model` exists and this key can use it. A metadata lookup:
-// it does not generate anything or use generation quota.
-export async function checkGemini({ apiKey, model, fetchImpl = fetch }) {
+// Sends a tiny real request to `model` with this key, so a retired model or a key that
+// can't use it shows up here (a model can still exist but refuse new keys). The result is
+// cached for 10 minutes per instance so the public health URL can't burn quota.
+const HEALTH_TTL_MS = 10 * 60_000;
+let lastHealth = null;
+
+export async function checkGemini({ apiKey, model, fetchImpl = fetch, now = Date.now(), fresh = false }) {
   if (!apiKey) return { gemini: 'off', model };
+  if (!fresh && lastHealth && lastHealth.model === model && now - lastHealth.at < HEALTH_TTL_MS) return lastHealth.result;
+  let result;
   try {
-    const res = await fetchImpl(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}`, {
-      headers: { 'x-goog-api-key': apiKey },
-      signal: AbortSignal.timeout(8000),
+    const res = await fetchImpl(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
+      body: JSON.stringify({ contents: [{ parts: [{ text: 'Reply with OK.' }] }], generationConfig: { maxOutputTokens: 5, temperature: 0 } }),
+      signal: AbortSignal.timeout(10_000),
     });
-    if (res.ok) return { gemini: 'ok', model };
-    return { gemini: 'error', model, status: res.status, detail: res.status === 404 ? 'model not found: set GEMINI_MODEL' : 'key rejected or quota problem' };
+    if (res.ok) result = { gemini: 'ok', model };
+    else {
+      const text = (await res.text()).slice(0, 300);
+      const detail = res.status === 404 ? 'model unavailable for this key: set GEMINI_MODEL'
+        : res.status === 429 ? 'quota or rate limit reached'
+        : res.status === 400 || res.status === 403 ? 'key rejected'
+        : 'Gemini error';
+      result = { gemini: 'error', model, status: res.status, detail, message: text.match(/"message":\s*"([^"]{0,200})/)?.[1] };
+    }
   } catch (err) {
-    return { gemini: 'error', model, detail: err.name === 'TimeoutError' ? 'timeout' : 'unreachable' };
+    result = { gemini: 'error', model, detail: err.name === 'TimeoutError' ? 'timeout' : 'unreachable' };
   }
+  lastHealth = { at: now, model, result };
+  return result;
 }

@@ -62,7 +62,7 @@ To host `frontend/` somewhere else, set `window.EGG_API_BASE` in `frontend/confi
 - `CORS_ORIGINS`: allowed browser origins, comma-separated, or `*`.
 - `SERVE_FRONTEND`: local server only. Set to `false` when the frontend is hosted elsewhere.
 - `GEMINI_API_KEY`: turns on the photo check. Without it, finds count on the honor system, and the result screen says so.
-- `GEMINI_MODEL`: defaults to `gemini-2.5-flash`. Change it if Google has retired that model.
+- `GEMINI_MODEL`: defaults to `gemini-3.8-flash`. Change it if Google has retired that model.
 - `MBTA_API_KEY`: a free key from api-v3.mbta.com that raises the rate limit. The app works without one.
 
 ### Phones

@@ -73,11 +73,23 @@ test('no key: honor system (local development)', async () => {
   assert.deepEqual([v.method, v.match], ['honor', true]);
 });
 
-test('health check for the Gemini model', async () => {
+test('health check sends a tiny real request and reports a retired model', async () => {
   assert.deepEqual(await checkGemini({ apiKey: '', model: 'm' }), { gemini: 'off', model: 'm' });
-  const ok = await checkGemini({ apiKey: 'k', model: 'm', fetchImpl: async () => new Response('{}', { status: 200 }) });
+  let sent = null;
+  const ok = await checkGemini({ apiKey: 'k', model: 'm', fresh: true, fetchImpl: async (url, init) => ((sent = { url, init }), new Response('{}', { status: 200 })) });
   assert.equal(ok.gemini, 'ok');
-  const missing = await checkGemini({ apiKey: 'k', model: 'old', fetchImpl: async () => new Response('', { status: 404 }) });
-  assert.deepEqual([missing.gemini, missing.status], ['error', 404]);
-  assert.match(missing.detail, /GEMINI_MODEL/);
+  assert.match(sent.url, /models\/m:generateContent$/, 'a real generate call, not just a metadata lookup');
+  const retired = await checkGemini({
+    apiKey: 'k', model: 'old', fresh: true,
+    fetchImpl: async () => new Response(JSON.stringify({ error: { code: 404, message: 'This model models/old is no longer available to new users.' } }), { status: 404 }),
+  });
+  assert.deepEqual([retired.gemini, retired.status], ['error', 404]);
+  assert.match(retired.detail, /GEMINI_MODEL/);
+  assert.match(retired.message, /no longer available/);
+  // Cached: a second call within 10 minutes doesn't hit Gemini again.
+  let calls = 0;
+  const count = async () => (calls++, new Response('{}', { status: 200 }));
+  await checkGemini({ apiKey: 'k', model: 'c', now: 1000, fresh: true, fetchImpl: count });
+  await checkGemini({ apiKey: 'k', model: 'c', now: 2000, fetchImpl: count });
+  assert.equal(calls, 1);
 });
