@@ -90,6 +90,15 @@ To host `frontend/` somewhere else, set `window.EGG_API_BASE` in `frontend/confi
   - An egg is retired after 3 reports, or after 7 days live with no finds.
 - **Leaderboard:** this month (Boston time) for everyone, by station, or by line (Red / Orange / Blue / Green).
 
+## Progress
+
+- **Rider level:** grows with all-time points.
+- **Daily challenge:** one per day, the same for everyone (Transfer, Beat the train, Go hard, Hat trick).
+- **Stamps:** 9 of them, for things like a first find, beating the train, finding an egg in 30 seconds, finding on all 4 lines, or hiding 5 eggs.
+- **Station cards:** one per station you've found eggs at.
+
+All of it is computed from your finds, so nothing extra is stored. It's shown on the Tickets tab and on each station.
+
 ## Friend groups
 
 - Any player can create a named group. The creator owns it and is the only one who can rename it.

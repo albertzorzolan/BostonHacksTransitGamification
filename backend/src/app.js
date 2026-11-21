@@ -478,6 +478,7 @@ export async function createApp({
       const score = game.scoreFind(egg.level, secondsTaken, attempt.limitSeconds);
       const findId = crypto.randomUUID();
       const t = now();
+      let firstFind = false;
       await tx(async (session) => {
         await slots.lockSlot(col, session, egg.stationId, egg.level);
         // Closing the round atomically means a round submitted twice (two tabs) scores once.
@@ -515,6 +516,7 @@ export async function createApp({
         const fresh = await col.eggs.findOne({ _id: egg._id }, { session });
         const avg = Math.round(((fresh.avgFindSeconds ?? 0) * fresh.timesFound + Math.round(secondsTaken)) / (fresh.timesFound + 1));
         await col.eggs.updateOne({ _id: egg._id }, { $set: { avgFindSeconds: avg }, $inc: { timesFound: 1 } }, { session });
+        firstFind = fresh.timesFound === 0; // read under the slot lock, before this find was counted
         if (fresh.status === 'active') await slots.rotateAfterFind(col, session, fresh, user._id, t);
       });
       return {
@@ -525,6 +527,7 @@ export async function createApp({
         verification,
         stationId: egg.stationId,
         level: egg.level,
+        firstFind,
       };
     },
 
@@ -582,6 +585,88 @@ export async function createApp({
         if (retired) await slots.retireEgg(col, session, egg, t);
         return { reports: n, retired };
       });
+    },
+
+    // Rider level, today's challenge, stamps, and the stations and lines you've found eggs on.
+    // All derived from finds, attempts and eggs: nothing extra is stored.
+    async progress(ctx) {
+      const user = requireUser(ctx);
+      await ensureStations();
+      const today = game.dayKey(now());
+      const finds = await col.finds.find({ userId: user._id }).sort({ foundAt: 1, _id: 1 }).toArray();
+      const eggIds = [...new Set(finds.map((f) => f.eggId))];
+      // Whether each find was the first ever on its egg (earliest foundAt, then _id).
+      const firstByEgg = new Map(
+        (await col.finds
+          .aggregate([
+            { $match: { eggId: { $in: eggIds } } },
+            { $sort: { foundAt: 1, _id: 1 } },
+            { $group: { _id: '$eggId', first: { $first: '$_id' } } },
+          ])
+          .toArray()).map((r) => [r._id, r.first]),
+      );
+      // Finds made while racing a train.
+      const raced = new Set(
+        (await col.attempts
+          .find({ userId: user._id, status: 'found', limitSource: 'train' }, { projection: { eggId: 1 } })
+          .toArray()).map((a) => a.eggId),
+      );
+      const hidden = await col.eggs.countDocuments({ createdBy: user._id });
+      const isFirst = (f) => firstByEgg.get(f.eggId) === f._id;
+      const isRaced = (f) => raced.has(f.eggId);
+
+      const families = (stationId) => [...new Set((stationById.get(stationId)?.lines ?? []).map((l) => game.lineFamily(l.id)))];
+      const allLines = new Set();
+      const linesByDay = new Map();
+      const byStation = new Map();
+      let allTime = 0;
+      for (const f of finds) {
+        allTime += f.points;
+        const day = game.dayKey(f.foundAt);
+        const fams = families(f.stationId);
+        fams.forEach((x) => allLines.add(x));
+        if (!linesByDay.has(day)) linesByDay.set(day, new Set());
+        fams.forEach((x) => linesByDay.get(day).add(x));
+        const st = byStation.get(f.stationId) ?? { finds: 0, points: 0, firstFoundAt: f.foundAt };
+        st.finds += 1;
+        st.points += f.points;
+        byStation.set(f.stationId, st);
+      }
+      const todays = finds.filter((f) => game.dayKey(f.foundAt) === today);
+      const mostLinesInADay = Math.max(0, ...[...linesByDay.values()].map((x) => x.size));
+      const mainLinesFound = game.MAIN_LINES.filter((x) => allLines.has(x)).length;
+
+      const stamp = (id, name, description, target, n) => ({ id, name, description, target, progress: Math.min(target, n), earned: n >= target });
+      const stamps = [
+        stamp('first_find', 'First find', 'Find your first egg.', 1, finds.length),
+        stamp('transfer', 'Transfer', 'Find eggs on 2 lines in one day.', 2, mostLinesInADay),
+        stamp('beat_train', 'Beat the train', 'Find an egg while racing a train.', 1, finds.filter(isRaced).length),
+        stamp('first_to_find', 'First', 'Be the first to find an egg.', 1, finds.filter(isFirst).length),
+        stamp('speedy', '30 s', 'Find an egg in 30 seconds or less.', 1, finds.filter((f) => f.secondsTaken <= 30).length),
+        stamp('impossible', 'Impossible', 'Find a level 5 egg.', 1, finds.filter((f) => f.level === 5).length),
+        stamp('all_lines', '4 lines', 'Find eggs on the Red, Orange, Blue and Green lines.', 4, mainLinesFound),
+        stamp('hider', 'Hider', 'Hide 5 eggs.', 5, hidden),
+        stamp('ten_finds', '10 finds', 'Find 10 eggs.', 10, finds.length),
+      ];
+
+      const ch = game.challengeFor(today);
+      const todayLines = [...new Set(todays.flatMap((f) => families(f.stationId)))];
+      const measure = {
+        transfer: todayLines.length,
+        racer: todays.filter(isRaced).length,
+        climber: todays.filter((f) => f.level >= 3).length,
+        triple: todays.length,
+      }[ch.id];
+
+      return {
+        level: game.riderLevel(allTime),
+        today: { day: today, ...ch, progress: Math.min(ch.target, measure), done: measure >= ch.target, lines: todayLines },
+        stamps,
+        stations: [...byStation]
+          .map(([id, st]) => ({ stationId: id, name: stationName(id), lines: families(id), finds: st.finds, points: st.points, firstFoundAt: st.firstFoundAt }))
+          .sort((a, b) => a.firstFoundAt - b.firstFoundAt),
+        lines: game.MAIN_LINES.map((line) => ({ line, stations: [...byStation.keys()].filter((id) => families(id).includes(line)).length })),
+      };
     },
 
     // ----- friend groups -----
@@ -777,6 +862,7 @@ export async function createApp({
     ['POST', /^\/api\/attempts\/([^/]+)\/find$/, api.submitFind, 'optional'],
     ['POST', /^\/api\/eggs$/, api.createEgg, 'optional'],
     ['POST', /^\/api\/eggs\/([^/]+)\/report$/, api.reportEgg, 'optional'],
+    ['GET', /^\/api\/me\/progress$/, api.progress, 'optional'],
     ['GET', /^\/api\/leaderboard$/, api.leaderboard, 'none'],
     ['GET', /^\/api\/groups$/, api.groups, 'optional'],
     ['POST', /^\/api\/groups$/, api.createGroup, 'optional'],
