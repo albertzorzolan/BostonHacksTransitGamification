@@ -1,15 +1,21 @@
-// Station Egg Hunt: single-page app, hash routing, no build step.
+// Lookout (Station Egg Hunt): single-page app, hash routing, no build step.
 // Talks to the backend at window.EGG_API_BASE (set in config.js; empty = same origin).
+//
+// Look: every egg is a ticket. The app takes the colour of the line you're at
+// (html[data-line]), found eggs get punched, and the game marks tickets with purple stamps.
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const app = $('#app');
 
-const LEVEL_COLORS = ['', 'var(--l1)', 'var(--l2)', 'var(--l3)', 'var(--l4)', 'var(--l5)'];
 const REPORT_REASONS = [
   ['cant_find', "Can't be found"],
   ['unsafe', 'Unsafe spot'],
   ['person', 'Shows a person'],
 ];
+const MAIN_LINES = ['Red', 'Orange', 'Blue', 'Green'];
+const RANGE_METERS = 400; // closer than this to a station counts as "at" it
+const ACCURACY_CAP = 150; // forgive up to this much GPS error
+const PUNCH_HOLES = 18; // the play clock is a row of holes, punched as time runs out
 
 const API_BASE = String(window.EGG_API_BASE ?? '').replace(/\/$/, '');
 const apiUrl = (path) => API_BASE + path;
@@ -23,9 +29,12 @@ const state = {
   stations: null,
   lastStationId: readStored('egg-last-station'),
   raceTrain: readStored('egg-race-train') ?? false,
+  line: readStored('egg-line'), // colour family the app is wearing: Red | Orange | Blue | Green | null
   play: null, // current round
-  pendingHide: null, // { stationId, level, findId }
-  board: { mode: 'all', stationId: null }, // leaderboard tab, kept when you open a player and come back
+  pendingHide: null, // { stationId, stationName, level, findId }
+  board: { mode: 'all', stationId: null },
+  hud: null, // { rank, points, rival, gap, rows, lines, at }
+  progress: null, // /api/me/progress
   timers: [],
   map: null,
 };
@@ -81,17 +90,23 @@ function every(ms, fn) {
   const id = setInterval(fn, ms);
   state.timers.push(() => clearInterval(id));
 }
+function onCleanup(fn) {
+  state.timers.push(fn);
+}
 function clearTimers() {
   state.timers.forEach((stop) => stop());
   state.timers = [];
 }
+const reducedMotion = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 
 const fmtClock = (s) => `${Math.floor(Math.max(0, s) / 60)}:${String(Math.max(0, Math.floor(s)) % 60).padStart(2, '0')}`;
-const fmtMins = (s) => (s < 60 ? 'Now' : `${Math.round(s / 60)} min`);
-const lineDots = (lines) =>
-  `<span class="dots">${[...new Map(lines.map((l) => [l.color, l])).values()]
-    .map((l) => `<span class="dot" style="background:${l.color}" title="${esc(l.name)}"></span>`)
-    .join('')}</span>`;
+const fmtDist = (m) => (m < 1000 ? `${Math.round(m / 10) * 10} m` : `${(m / 1000).toFixed(1)} km`);
+const ordinal = (n) => {
+  const s = ['th', 'st', 'nd', 'rd'];
+  const v = n % 100;
+  return `${n}${s[(v - 20) % 10] || s[v] || s[0]}`;
+};
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
 // The server refreshes a session's last-seen time at most once an hour, so don't claim more precision than that.
 const relTime = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
@@ -102,7 +117,7 @@ function fmtLastSeen(iso) {
   return relTime.format(-Math.floor(hours / 24), 'day');
 }
 
-// Sessions store the raw user-agent. Turn it into something like "iPhone · Safari".
+// Sessions store the raw user-agent. Turn it into something like "Safari on iPhone".
 function describeDevice(ua = '') {
   const os = /iPhone/.test(ua) ? 'iPhone'
     : /iPad/.test(ua) ? 'iPad'
@@ -119,11 +134,12 @@ function describeDevice(ua = '') {
     : /Chrome|CriOS/.test(ua) ? 'Chrome'
     : /Safari/.test(ua) ? 'Safari'
     : '';
-  return [os, browser].filter(Boolean).join(' · ') || 'Unknown device';
+  if (os && browser) return `${browser} on ${os}`;
+  return os || browser || 'Unknown device';
 }
 
-function distanceKm(a, b) {
-  const R = 6371;
+function distanceM(a, b) {
+  const R = 6371000;
   const toRad = (d) => (d * Math.PI) / 180;
   const dLat = toRad(b.lat - a.lat);
   const dLng = toRad(b.lng - a.lng);
@@ -144,12 +160,10 @@ async function photoToJpeg(file, max = 1280) {
       img.src = URL.createObjectURL(file);
     });
   }
-  const w = source.width;
-  const h = source.height;
-  const scale = Math.min(1, max / Math.max(w, h));
+  const scale = Math.min(1, max / Math.max(source.width, source.height));
   const canvas = document.createElement('canvas');
-  canvas.width = Math.round(w * scale);
-  canvas.height = Math.round(h * scale);
+  canvas.width = Math.round(source.width * scale);
+  canvas.height = Math.round(source.height * scale);
   canvas.getContext('2d').drawImage(source, 0, 0, canvas.width, canvas.height);
   return canvas.toDataURL('image/jpeg', 0.82);
 }
@@ -159,20 +173,170 @@ async function getStations() {
   return state.stations;
 }
 
-function loading(text = 'Loading…') {
-  app.innerHTML = `<div class="empty"><div class="row" style="justify-content:center"><div class="spin"></div>${esc(text)}</div></div>`;
+// Station names as a big head: break after "/" and step down the size for long names.
+const stationHead = (name) =>
+  `<h1 class="station ${name.length > 13 ? 'station-long' : ''}">${esc(name).replace(/\//g, '/<wbr>')}</h1>`;
+// Live times can fail (rate limits, the MBTA API being down): say so plainly.
+const trainsUnavailable = (msg) => (/429|rate/i.test(msg || '') ? 'Live train times are busy right now. Try again in a minute.' : msg || 'No live predictions right now');
+
+function loading(text = 'Loading') {
+  app.innerHTML = `<div class="empty"><div class="spin" aria-hidden="true"></div><p>${esc(text)}</p></div>`;
+}
+
+// ---------- line colour ----------
+// Green-B/C/D/E roll up to Green and Mattapan to Red, the same way the leaderboard counts lines.
+const family = (routeId) => (routeId.startsWith('Green') ? 'Green' : routeId === 'Mattapan' ? 'Red' : routeId);
+const familiesOf = (lines = []) => [...new Set(lines.map((l) => family(l.id)))];
+const branchesOf = (lines = []) => lines.filter((l) => /^Green-[A-E]$/.test(l.id)).map((l) => l.id.slice(-1));
+const LINE_VAR = { Red: 'var(--line-red)', Orange: 'var(--line-orange)', Blue: 'var(--line-blue)', Green: 'var(--line-green)' };
+
+// The whole app takes the colour of this line: buttons, bands, points, the timer.
+function setLine(fam) {
+  state.line = MAIN_LINES.includes(fam) ? fam : null;
+  document.documentElement.dataset.line = state.line ?? '';
+  store('egg-line', state.line);
+  const meta = document.querySelector('meta[name="theme-color"]');
+  const color = getComputedStyle(document.documentElement).getPropertyValue('--here').trim();
+  if (meta && color) meta.content = color;
+}
+
+function lineBand(station, right = '') {
+  const fams = familiesOf(station.lines);
+  const branches = branchesOf(station.lines);
+  const others = fams
+    .slice(1)
+    .map((f) => `<span class="band-chip" style="--ln:${LINE_VAR[f] ?? 'var(--muted)'}">${esc(f)}</span>`)
+    .join('');
+  return `<div class="band">
+    <p class="band-name">${esc(fams[0] ? `${fams[0]} Line` : 'Station')}</p>
+    ${others}
+    ${branches.length ? `<ul class="branches" aria-label="Branches">${branches.map((b) => `<li>${b}</li>`).join('')}</ul>` : ''}
+    ${right ? `<p class="band-right">${right}</p>` : ''}
+  </div>`;
+}
+
+// ---------- location: detected automatically ----------
+// status: idle | locating | ok | denied | unavailable | insecure
+const loc = { status: 'idle', pos: null, watchId: null, subs: new Set() };
+
+function startLocation() {
+  if (!window.isSecureContext || !navigator.geolocation) {
+    loc.status = 'insecure';
+    return notifyLoc();
+  }
+  if (loc.watchId != null) return;
+  if (!loc.pos) loc.status = 'locating';
+  notifyLoc();
+  loc.watchId = navigator.geolocation.watchPosition(
+    (p) => {
+      loc.pos = { lat: p.coords.latitude, lng: p.coords.longitude, accuracy: p.coords.accuracy };
+      loc.status = 'ok';
+      notifyLoc();
+    },
+    (err) => {
+      if (err.code === 1) {
+        loc.status = 'denied';
+        navigator.geolocation.clearWatch(loc.watchId);
+        loc.watchId = null;
+      } else if (!loc.pos) loc.status = 'unavailable';
+      notifyLoc();
+    },
+    { enableHighAccuracy: true, timeout: 12000, maximumAge: 120000 },
+  );
+}
+function retryLocation() {
+  if (loc.watchId != null) navigator.geolocation.clearWatch(loc.watchId);
+  loc.watchId = null;
+  startLocation();
+}
+function notifyLoc() {
+  loc.subs.forEach((fn) => fn());
+}
+function onLoc(fn) {
+  loc.subs.add(fn);
+  onCleanup(() => loc.subs.delete(fn));
+}
+function nearestStation(stations) {
+  if (!loc.pos) return null;
+  let best = null;
+  for (const s of stations) {
+    const m = distanceM(loc.pos, s);
+    if (!best || m < best.m) best = { station: s, m };
+  }
+  return best;
+}
+const isInRange = (n) => Boolean(n && n.m <= RANGE_METERS + Math.min(loc.pos?.accuracy ?? 0, ACCURACY_CAP));
+
+// ---------- the HUD: rank, points and the rival just above you ----------
+async function refreshHud(force = false) {
+  if (!state.user) return;
+  if (!force && state.hud && Date.now() - state.hud.at < 30_000) return drawHud();
+  try {
+    const board = await api('/api/leaderboard');
+    const mine = board.rows.find((r) => r.userId === state.user.id);
+    const rival = mine ? board.rows.find((r) => r.rank === mine.rank - 1) : board.rows[board.rows.length - 1];
+    state.hud = {
+      at: Date.now(),
+      rank: mine?.rank ?? null,
+      points: mine?.points ?? 0,
+      rows: board.rows,
+      lines: board.lines,
+      rival: rival ?? null,
+      gap: rival ? rival.points - (mine?.points ?? 0) + 1 : 0,
+    };
+  } catch {
+    /* the HUD is extra: keep the last one */
+  }
+  drawHud();
+}
+
+function drawHud() {
+  const el = $('#hud');
+  if (!state.user) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  const h = state.hud;
+  const chip = h?.rank ? `<span class="rank-chip">${ordinal(h.rank)}</span>` : '';
+  let rival = '<span class="rival-txt">Find an egg to get on the board</span><span class="rival-bar" style="--p:0%"></span>';
+  if (h?.rival) {
+    const p = h.rival.points ? Math.max(4, Math.min(100, Math.round((h.points / h.rival.points) * 100))) : 0;
+    rival = `<span class="rival-txt"><b>${plural(h.gap, 'pt')}</b> to pass ${esc(h.rival.username)}</span><span class="rival-bar" style="--p:${p}%"></span>`;
+  } else if (h?.rank === 1) {
+    rival = '<span class="rival-txt"><b>1st this month.</b> Hold on to it.</span><span class="rival-bar" style="--p:100%"></span>';
+  }
+  el.innerHTML = `
+    <div class="hud-top">
+      <a href="#/" class="brand"><img src="icon.svg" alt="" width="28" height="28" />Lookout</a>
+      <a class="mypts" href="#/leaderboard">${chip}<b>${h?.points ?? 0}</b> pts</a>
+    </div>
+    <a class="rival" href="#/leaderboard">${rival}</a>`;
+}
+
+async function refreshProgress() {
+  try {
+    state.progress = await api('/api/me/progress');
+  } catch {
+    /* extra */
+  }
+  return state.progress;
 }
 
 // ---------- router ----------
 const routes = [
-  [/^#?\/?$/, viewStations],
-  [/^#\/station\/([^/]+)$/, viewStation],
+  [/^#?\/?$/, viewHere],
+  [/^#\/stations$/, viewStations],
+  [/^#\/station\/([^/]+)$/, (id) => viewStation(id)],
   [/^#\/play$/, viewPlay],
   [/^#\/hide$/, viewHide],
   [/^#\/leaderboard$/, viewLeaderboard],
   [/^#\/profile$/, viewProfile],
   [/^#\/user\/([^/]+)$/, viewPlayer],
   [/^#\/map$/, viewMap],
+  [/^#\/groups$/, viewGroups],
+  [/^#\/group\/([^/]+)$/, viewGroup],
+  [/^#\/join\/([^/]+)$/, viewJoin],
 ];
 
 async function render() {
@@ -182,18 +346,29 @@ async function render() {
     state.map = null;
   }
   window.scrollTo(0, 0);
-  $('#me').textContent = state.user ? state.user.username : '';
-  if (!state.user) return viewSignup();
-
+  if (!state.user) {
+    $('#tabs').hidden = true;
+    drawHud();
+    return viewSignup();
+  }
   const hash = location.hash || '#/';
+  const playing = hash.startsWith('#/play') || hash.startsWith('#/hide');
+  $('#hud').classList.toggle('hud-quiet', playing);
+  $('#tabs').hidden = playing;
   const tab = hash.startsWith('#/map')
     ? 'map'
     : hash.startsWith('#/leaderboard') || hash.startsWith('#/user/')
       ? 'leaderboard'
       : hash.startsWith('#/profile')
         ? 'profile'
-        : 'stations';
-  document.querySelectorAll('#tabs a').forEach((a) => a.classList.toggle('active', a.dataset.tab === tab));
+        : /^#\/(groups|group\/|join\/)/.test(hash)
+          ? 'groups'
+          : 'here';
+  document.querySelectorAll('#tabs a').forEach((a) => {
+    if (a.dataset.tab === tab) a.setAttribute('aria-current', 'page');
+    else a.removeAttribute('aria-current');
+  });
+  refreshHud();
 
   for (const [re, view] of routes) {
     const m = re.exec(hash);
@@ -202,7 +377,7 @@ async function render() {
       await view(...m.slice(1).map(decodeURIComponent));
     } catch (err) {
       if (err.status === 401) return signOut();
-      app.innerHTML = `<div class="notice bad">${esc(err.message)}</div><p><a class="btn" href="#/">Back to stations</a></p>`;
+      app.innerHTML = `<div class="notice bad">${esc(err.message)}</div><p><a class="btn btn-ghost" href="#/">Back</a></p>`;
     }
     return;
   }
@@ -225,34 +400,59 @@ async function signOut({ remote = false, everywhere = false } = {}) {
     }
   }
   setSession(null);
+  state.hud = null;
+  state.progress = null;
   render();
+}
+
+// ---------- line war (public) ----------
+function lineWar(lines, { title = 'Line war', sub = "Points at each line's stations this month" } = {}) {
+  const totals = MAIN_LINES.map((l) => ({ line: l, points: lines?.find((x) => x.line === l)?.points ?? 0 })).sort(
+    (a, b) => b.points - a.points,
+  );
+  const max = Math.max(1, totals[0].points);
+  return `<section class="tk war" aria-label="${esc(title)}">
+    <div class="war-head"><h3 class="war-title">${esc(title)}</h3><p class="war-sub">${esc(sub)}</p></div>
+    <ol class="war-bars">${totals
+      .map(
+        (t) => `<li style="--ln:${LINE_VAR[t.line]};--w:${Math.round((t.points / max) * 100)}%"><span class="war-name">${t.line}</span><span class="war-bar" aria-hidden="true"></span><b>${t.points.toLocaleString()}</b></li>`,
+      )
+      .join('')}</ol>
+  </section>`;
 }
 
 // ---------- sign in / create account ----------
 function viewSignup(mode = 'register') {
-  $('#tabs').hidden = true;
+  setLine(state.line);
   const registering = mode === 'register';
   const min = state.config?.passwordMin ?? 8;
   app.innerHTML = `
-    <h1>Find what's hiding in your station.</h1>
-    <p class="sub">Riders photograph small things in MBTA stations. You get a photo and a timer, and you look around until you spot it. Find it, snap it, score points, then hide the next one.</p>
-    <div class="seg" role="tablist" style="margin-bottom:12px">
-      <button type="button" data-mode="register" class="${registering ? 'on' : ''}">Create account</button>
-      <button type="button" data-mode="login" class="${registering ? '' : 'on'}">Sign in</button>
-    </div>
-    <form id="auth" class="card stack">
-      <label for="username"><strong>Username</strong></label>
-      <input id="username" class="input" maxlength="20" autocomplete="username" autocapitalize="none" placeholder="e.g. kenmore_kid" required />
-      <label for="password"><strong>Password</strong>${registering ? ` <span class="small">(at least ${min} characters)</span>` : ''}</label>
-      <input id="password" class="input" type="password" maxlength="200" ${registering ? `minlength="${min}"` : ''} autocomplete="${registering ? 'new-password' : 'current-password'}" required />
-      <button class="btn primary block">${registering ? 'Create account' : 'Sign in'}</button>
-      <p class="small">${registering ? 'Your account works on any phone or laptop. Sign in with the same username and password.' : 'Signing in here keeps you signed in on your other devices too.'}</p>
-      <div id="err"></div>
-    </form>`;
+    <form id="auth" class="tk welcome">
+      <div class="band band-lines" aria-hidden="true"><i style="--ln:var(--line-red)"></i><i style="--ln:var(--line-orange)"></i><i style="--ln:var(--line-blue)"></i><i style="--ln:var(--line-green)"></i></div>
+      <div class="tk-top">
+        <span class="brand brand-l"><img src="icon.svg" alt="" width="36" height="36" />Lookout</span>
+        <h1 class="welcome-h">Find what's hiding in your station.</h1>
+        <p class="welcome-p">Riders photograph small things in MBTA stations. You get the photo and a timer. Find it, take a photo, and score for your line.</p>
+      </div>
+      <div class="tk-perf" aria-hidden="true"></div>
+      <div class="tk-bottom stack">
+        <div class="seg" role="tablist">
+          <button type="button" role="tab" data-mode="register" aria-selected="${registering}">Create account</button>
+          <button type="button" role="tab" data-mode="login" aria-selected="${!registering}">Sign in</button>
+        </div>
+        <label class="field-label" for="username">Username</label>
+        <input id="username" class="input" maxlength="20" autocomplete="username" autocapitalize="none" placeholder="e.g. kenmore_kid" required />
+        <label class="field-label" for="password">Password ${registering ? `<span class="opt">(at least ${min} characters)</span>` : ''}</label>
+        <input id="password" class="input" type="password" maxlength="200" ${registering ? `minlength="${min}"` : ''} autocomplete="${registering ? 'new-password' : 'current-password'}" required />
+        <button class="btn btn-ink btn-block btn-l">${registering ? 'Start playing' : 'Sign in'}</button>
+        <div id="err"></div>
+      </div>
+    </form>
+    <div id="teaser"></div>`;
   app.querySelectorAll('.seg button').forEach((b) => b.addEventListener('click', () => viewSignup(b.dataset.mode)));
   $('#auth').addEventListener('submit', async (e) => {
     e.preventDefault();
-    const btn = $('#auth button.primary');
+    const btn = $('#auth .btn-ink');
     btn.disabled = true;
     try {
       const data = await api(registering ? '/api/auth/register' : '/api/auth/login', {
@@ -260,112 +460,212 @@ function viewSignup(mode = 'register') {
         password: $('#password').value,
       });
       setSession(data);
-      $('#tabs').hidden = false;
-      render();
+      startLocation();
+      if (location.hash && location.hash !== '#/' && !location.hash.startsWith('#/join/')) location.hash = '#/';
+      else render();
     } catch (err) {
       $('#err').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
       btn.disabled = false;
     }
   });
+  api('/api/leaderboard')
+    .then((b) => {
+      const t = $('#teaser');
+      if (t && b.lines.length) t.innerHTML = lineWar(b.lines, { title: 'Line war this month', sub: 'Every find scores for its line' });
+    })
+    .catch(() => {});
 }
 
-// ---------- stations ----------
-async function viewStations() {
-  loading('Loading stations…');
+// ---------- Here: the station you're standing in ----------
+async function viewHere() {
+  loading('Finding your station');
   const stations = await getStations();
-  let origin = null;
+  let lastKey = null;
+  const keyNow = () => {
+    const n = nearestStation(stations);
+    return { n, key: `${loc.status}|${n?.station.id ?? ''}|${isInRange(n)}` };
+  };
+  onLoc(() => {
+    const { n, key } = keyNow();
+    if (key !== lastKey) return render();
+    const d = $('#dist');
+    if (d && n) d.textContent = fmtDist(n.m);
+  });
+  if (loc.status === 'idle') startLocation();
+  const { n, key } = keyNow();
+  lastKey = key;
+  if (isInRange(n)) return showStation(n.station.id, { here: true, distance: n.m });
+  if (n) {
+    setLine(familiesOf(n.station.lines)[0]);
+    return showNearby(stations, n);
+  }
+  return showLocating(stations);
+}
 
+const BAND_LINES = '<div class="band band-lines" aria-hidden="true"><i style="--ln:var(--line-red)"></i><i style="--ln:var(--line-orange)"></i><i style="--ln:var(--line-blue)"></i><i style="--ln:var(--line-green)"></i></div>';
+
+function showLocating(stations) {
+  const msg = {
+    idle: ['Finding your station', 'Lookout uses your location to open the station you are in.'],
+    locating: ['Finding your station', "Underground? A fix from the last couple of minutes works, so it's fine if you got one on the way in."],
+    denied: ['Location is off for Lookout', 'Allow location for this site in your browser settings, then try again. Or pick your station below.'],
+    unavailable: ['No location fix yet', 'Step closer to the entrance or above ground, then try again. Or pick your station below.'],
+    insecure: ['Pick your station', 'Phones only share location with https:// pages. Open the https link to detect your station automatically.'],
+  }[loc.status] ?? ['Pick your station', ''];
+  const canRetry = loc.status === 'denied' || loc.status === 'unavailable';
   app.innerHTML = `
-    <h1>Where are you?</h1>
-    <p class="sub">Pick your station to see its five eggs.</p>
-    <div class="row">
-      <input id="q" class="input" type="search" placeholder="Search stations" aria-label="Search stations" />
-      <button id="locate" class="btn" type="button" aria-label="Use my location">
-        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/><circle cx="12" cy="12" r="7"/></svg>
-        Near me
-      </button>
-    </div>
-    <div id="locmsg" class="small" style="margin:8px 2px"></div>
-    <ul id="list" class="list"></ul>`;
+    <section class="tk locate">
+      ${BAND_LINES}
+      <div class="tk-top">
+        ${loc.status === 'locating' ? '<div class="spin" aria-hidden="true"></div>' : ''}
+        <h1 class="locate-h">${esc(msg[0])}</h1>
+        <p class="locate-p">${esc(msg[1])}</p>
+        ${canRetry ? '<button id="retry" class="btn btn-ink btn-block" type="button">Try again</button>' : ''}
+      </div>
+    </section>
+    <h2 class="sec-h">Stations</h2>
+    ${stationSearch()}`;
+  $('#retry')?.addEventListener('click', retryLocation);
+  wireStationSearch(stations);
+}
 
+function showNearby(stations, n) {
+  app.innerHTML = `
+    <section class="tk locate">
+      ${lineBand(n.station)}
+      <div class="tk-top">
+        <p class="here">Nearest station</p>
+        ${stationHead(n.station.name)}
+        <p class="far"><b id="dist">${fmtDist(n.m)}</b> away. Get within ${RANGE_METERS} m and it opens here.</p>
+      </div>
+      <div class="tk-perf" aria-hidden="true"></div>
+      <div class="tk-bottom stack">
+        <a class="btn btn-primary btn-block" href="#/station/${encodeURIComponent(n.station.id)}">See ${esc(n.station.name)}</a>
+        <a class="btn btn-ghost btn-block" href="#/map">Open the map</a>
+      </div>
+    </section>
+    <h2 class="sec-h">Stations near you</h2>
+    ${stationSearch()}`;
+  wireStationSearch(stations);
+}
+
+function stationSearch() {
+  return `<input id="q" class="input" type="search" placeholder="Search stations" aria-label="Search stations" />
+    <ul id="list" class="st-list"></ul>`;
+}
+function wireStationSearch(stations) {
   const draw = () => {
     const q = $('#q').value.trim().toLowerCase();
     let rows = stations.filter((s) => s.name.toLowerCase().includes(q));
-    if (origin) rows = rows.map((s) => ({ ...s, km: distanceKm(origin, s) })).sort((a, b) => a.km - b.km);
-    else rows = [...rows].sort((a, b) => b.activeEggs - a.activeEggs || a.name.localeCompare(b.name));
+    rows = loc.pos
+      ? rows.map((s) => ({ ...s, m: distanceM(loc.pos, s) })).sort((a, b) => a.m - b.m)
+      : [...rows].sort((a, b) => b.activeEggs - a.activeEggs || a.name.localeCompare(b.name));
     $('#list').innerHTML = rows.length
       ? rows
+          .slice(0, 40)
           .map(
             (s) => `<li><a href="#/station/${encodeURIComponent(s.id)}">
-              ${lineDots(s.lines)}
-              <span><span class="name">${esc(s.name)}</span><br/>
-              <span class="meta">${s.km != null ? `${s.km < 1 ? Math.round(s.km * 1000) + ' m' : s.km.toFixed(1) + ' km'} · ` : ''}${s.activeEggs ? `${s.activeEggs} egg${s.activeEggs > 1 ? 's' : ''} hidden` : 'No eggs yet'}</span></span>
-              <span class="spacer"></span>${s.activeEggs ? `<span class="pill accent">${s.activeEggs}/5</span>` : ''}
+              <span class="st-lines">${familiesOf(s.lines).map((f) => `<i style="--ln:${LINE_VAR[f] ?? 'var(--muted)'}"></i>`).join('')}</span>
+              <span class="st-txt"><b>${esc(s.name)}</b><small>${s.m != null ? `${fmtDist(s.m)} away, ` : ''}${s.activeEggs ? `${plural(s.activeEggs, 'egg')} hidden` : 'no eggs yet'}</small></span>
+              ${s.activeEggs ? `<span class="st-count">${s.activeEggs}/5</span>` : ''}
             </a></li>`,
           )
           .join('')
-      : `<li class="empty">No station matches “${esc(q)}”.</li>`;
+      : `<li class="empty"><p>No station called “${esc(q)}”.</p></li>`;
   };
   $('#q').addEventListener('input', draw);
-  $('#locate').addEventListener('click', () => {
-    const msg = $('#locmsg');
-    if (!window.isSecureContext || !navigator.geolocation) {
-      msg.textContent = 'Location needs an HTTPS link. Pick your station from the list instead.';
-      return;
-    }
-    msg.textContent = 'Finding you… (GPS is weak underground)';
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        origin = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-        draw();
-        const nearest = [...stations].sort((a, b) => distanceKm(origin, a) - distanceKm(origin, b))[0];
-        msg.innerHTML = `Nearest: <a href="#/station/${encodeURIComponent(nearest.id)}"><strong>${esc(nearest.name)}</strong></a>`;
-      },
-      () => (msg.textContent = "Couldn't get your location. Pick your station from the list."),
-      { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 },
-    );
-  });
   draw();
+}
+
+async function viewStations() {
+  loading();
+  const stations = await getStations();
+  app.innerHTML = `<h1 class="page-h">Stations</h1><p class="page-sub">Any station on the T. Play opens wherever you are.</p>${stationSearch()}`;
+  wireStationSearch(stations);
 }
 
 // ---------- one station ----------
 async function viewStation(id) {
   loading();
-  const { station, slots } = await api(`/api/stations/${encodeURIComponent(id)}`);
+  const stations = await getStations();
+  const n = nearestStation(stations);
+  const here = isInRange(n) && n.station.id === id;
+  const st = stations.find((s) => s.id === id);
+  await showStation(id, { here, distance: st && loc.pos ? distanceM(loc.pos, st) : null });
+}
+
+// Which eggs here you can still score, and how many you've found.
+function stationCard(slots) {
+  const playable = slots.filter((s) => s.egg && !s.egg.mine);
+  const found = playable.filter((s) => s.egg.foundByMe).length;
+  return { playable: playable.length, found, cleared: playable.length > 0 && found === playable.length };
+}
+
+async function showStation(id, { here = false, distance = null } = {}) {
+  const [{ station, slots }] = await Promise.all([
+    api(`/api/stations/${encodeURIComponent(id)}`),
+    state.progress ? null : refreshProgress(),
+  ]);
   state.lastStationId = id;
   store('egg-last-station', id);
+  setLine(familiesOf(station.lines)[0]);
+  const card = stationCard(slots);
+  const stamp = here
+    ? '<p class="stamp stamp-corner">In range</p>'
+    : distance != null
+      ? `<p class="stamp stamp-corner stamp-quiet">${fmtDist(distance)} away</p>`
+      : '';
+  const raceNote = (on) => (on ? 'On. Your timer is the time until the next train (1.5 to 15 min).' : 'Off. Each level has its own timer.');
 
   app.innerHTML = `
-    <a href="#/" class="small">← All stations</a>
-    <h1>${esc(station.name)}</h1>
-    <div class="row" style="margin-bottom:6px">${lineDots(station.lines)}<span class="small">${esc([...new Set(station.lines.map((l) => l.name))].join(' · '))}</span></div>
-
-    <h2>Next trains</h2>
-    <div id="trains" class="card"><div class="small">Loading live times…</div></div>
-
-    <div class="row" style="justify-content:space-between; margin-top:22px">
-      <h2 style="margin:0">Eggs here</h2>
-      <label class="toggle"><input id="race" type="checkbox" ${state.raceTrain ? 'checked' : ''}/> Race the next train</label>
+    ${here ? '' : '<a class="back" href="#/stations"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>All stations</a>'}
+    <section class="tk station-tk">
+      ${lineBand(station)}
+      <div class="tk-top">
+        <p class="here">${here ? "You're at" : 'Station'}</p>
+        ${stationHead(station.name)}
+        ${stamp}
+      </div>
+      <div class="tk-perf" aria-hidden="true"></div>
+      <div class="tk-bottom">
+        <div id="next" class="next-row"><span class="route" aria-hidden="true"></span><div><p class="next-label">Next train</p><p class="next-to next-none">Loading live times</p></div></div>
+        <label class="race">
+          <span class="race-text"><b>Race the next train</b><small id="raceNote">${raceNote(state.raceTrain)}</small></span>
+          <input id="race" type="checkbox" role="switch" class="race-input" ${state.raceTrain ? 'checked' : ''} />
+        </label>
+      </div>
+    </section>
+    ${challengeTicket(state.progress?.today)}
+    <div class="eggs-head">
+      <h2 class="sec-h">Eggs here</h2>
+      ${card.playable ? `<div class="clear">
+        <ol class="clear-slots" aria-label="Your ${esc(station.name)} card: ${card.found} of ${card.playable} found">${slots
+          .map((s) => `<li class="slot ${!s.egg ? 'is-empty' : s.egg.mine ? 'is-mine' : s.egg.foundByMe ? 'is-found' : 'is-open'}"><span>${s.level}</span></li>`)
+          .join('')}</ol>
+        <p class="clear-note">${card.cleared ? '<b>Cleared.</b> Every egg here is punched.' : `<b>${card.found} of ${card.playable}</b> found here`}</p>
+      </div>` : ''}
     </div>
-    <p class="small" style="margin:6px 0 12px">${state.raceTrain ? 'Your timer is the time until the next train (1.5–15 min). Otherwise the level timer is used.' : 'Each level has its own timer. Turn on “Race the next train” to beat the train instead.'}</p>
-    <div class="levels">${slots.map(slotCard).join('')}</div>`;
+    <ol class="stubs">${slots.map((s) => stubRow(s)).join('')}</ol>`;
 
   $('#race').addEventListener('change', (e) => {
     state.raceTrain = e.target.checked;
     store('egg-race-train', state.raceTrain);
-    render();
+    $('#raceNote').textContent = raceNote(state.raceTrain);
   });
 
   app.querySelectorAll('[data-play]').forEach((btn) =>
     btn.addEventListener('click', async () => {
-      btn.disabled = true;
+      if (btn.getAttribute('aria-disabled') === 'true') return;
+      btn.setAttribute('aria-disabled', 'true');
+      const slot = slots.find((s) => s.egg?.id === btn.dataset.play);
+      const before = { hud: state.hud, progress: state.progress, card };
       try {
         const round = await api('/api/attempts', { eggId: btn.dataset.play, mode: state.raceTrain ? 'train' : 'fixed' });
-        state.play = { ...round, receivedAt: performance.now(), result: null };
+        state.play = { ...round, station, receivedAt: performance.now(), result: null, firstChance: slot?.egg?.timesFound === 0, before };
         location.hash = '#/play';
       } catch (err) {
         toast(err.message);
-        btn.disabled = false;
+        btn.removeAttribute('aria-disabled');
       }
     }),
   );
@@ -377,46 +677,72 @@ async function viewStation(id) {
   );
 
   const loadTrains = async () => {
-    const box = $('#trains');
+    const box = $('#next');
     if (!box) return;
     try {
       const { trains, error } = await api(`/api/stations/${encodeURIComponent(id)}/predictions`);
-      box.innerHTML = trains.length
-        ? `<div class="trains">${trains
-            .slice(0, 6)
-            .map((t) => `<div class="train"><span class="bar" style="background:${t.color}"></span><span><strong>${esc(t.headsign || t.line)}</strong><br/><span class="small">${esc(t.line)}${t.status ? ' · ' + esc(t.status) : ''}</span></span><span class="mins">${fmtMins(t.seconds)}</span></div>`)
-            .join('')}</div>`
-        : `<div class="small">${esc(error || 'No live predictions right now.')}</div>`;
+      const t = trains.find((x) => x.seconds > -20);
+      box.innerHTML = t
+        ? `<span class="route" style="--ln:${esc(t.color)}" aria-hidden="true"></span>
+           <div><p class="next-label">Next train${t.line ? `, ${esc(t.line)}` : ''}</p><p class="next-to">${esc(t.headsign || t.line)}</p></div>
+           <p class="next-min">${t.seconds < 60 ? '<span class="now">Now</span>' : `${Math.round(t.seconds / 60)}<small>min</small>`}</p>`
+        : `<span class="route" aria-hidden="true"></span><div><p class="next-label">Next train</p><p class="next-to next-none">${esc(trainsUnavailable(error))}</p></div>`;
     } catch (err) {
-      box.innerHTML = `<div class="small">${esc(err.message)}</div>`;
+      box.innerHTML = `<span class="route" aria-hidden="true"></span><div><p class="next-label">Next train</p><p class="next-to next-none">${esc(trainsUnavailable(err.message))}</p></div>`;
     }
   };
   loadTrains();
   every(30_000, loadTrains);
 }
 
-function slotCard(slot) {
+function stubRow(slot) {
   const { egg } = slot;
-  let desc;
-  let action;
+  const pips = `<span class="pips" aria-label="Difficulty ${slot.level} of 5">${[1, 2, 3, 4, 5].map((i) => `<i class="${i <= slot.level ? 'on' : ''}"></i>`).join('')}</span>`;
+  const mins = `${Math.round(slot.seconds / 60)} min`;
   if (!egg) {
-    desc = 'Empty. Be the first to hide one.';
-    action = `<button class="btn small" data-hide="${slot.level}">Hide one</button>`;
-  } else if (egg.mine) {
-    desc = `Your egg · found ${egg.timesFound}×`;
-    action = `<span class="pill">Yours</span>`;
-  } else if (egg.foundByMe) {
-    desc = `Hidden by ${esc(egg.createdBy)} · found ${egg.timesFound}×`;
-    action = `<span class="pill">Found ✓</span>`;
-  } else {
-    desc = `Hidden by ${esc(egg.createdBy)} · ${Math.round(slot.seconds / 60)} min timer`;
-    action = `<button class="btn small primary" data-play="${egg.id}">Play</button>`;
+    return `<li class="stub is-empty">
+      <span class="punch" aria-hidden="true">${slot.level}</span>
+      <div class="stub-body"><p class="stub-name">${esc(slot.name)}</p>${pips}<p class="stub-meta">Empty. Hide the first one, worth ${slot.points}.</p></div>
+      <button class="stub-act" type="button" data-hide="${slot.level}"><b aria-hidden="true">+</b><span>Hide</span></button>
+    </li>`;
   }
-  return `<div class="level" data-level="${slot.level}" style="--lc:${LEVEL_COLORS[slot.level]}">
-    <div class="num">${slot.level}</div>
-    <div><div class="title">${esc(slot.name)} <span class="small">· ${slot.points} pts</span></div><div class="desc">${desc}</div></div>
-    ${action}
-  </div>`;
+  if (egg.mine) {
+    return `<li class="stub is-mine">
+      <span class="punch" aria-hidden="true">${slot.level}</span>
+      <div class="stub-body"><p class="stub-name">${esc(slot.name)}</p><p class="stub-meta">Your egg, ${egg.timesFound === 0 ? 'nobody has found it yet' : `found ${plural(egg.timesFound, 'time')}`}</p></div>
+      <div class="stub-act"><p class="stamp stamp-s">Yours</p></div>
+    </li>`;
+  }
+  if (egg.foundByMe) {
+    return `<li class="stub is-found">
+      <span class="punch" aria-hidden="true">${slot.level}</span>
+      <div class="stub-body"><p class="stub-name">${esc(slot.name)}</p><p class="stub-meta">You found it. Hidden by ${esc(egg.createdBy)}.</p></div>
+      <div class="stub-act"><p class="stamp stamp-s">Found</p></div>
+    </li>`;
+  }
+  const hot = egg.timesFound === 0;
+  return `<li class="stub is-open ${hot ? 'is-hot' : ''}">
+    <span class="punch" aria-hidden="true">${slot.level}</span>
+    <div class="stub-body"><p class="stub-name">${esc(slot.name)}</p>${pips}<p class="stub-meta">${hot ? `${mins}. Nobody's found it yet.` : `${mins}, found ${plural(egg.timesFound, 'time')}`}</p></div>
+    <button class="stub-act" type="button" data-play="${egg.id}"><b>${slot.points}</b><span>Play</span></button>
+  </li>`;
+}
+
+function challengeTicket(today) {
+  if (!today) return '';
+  const steps = today.id === 'transfer'
+    ? MAIN_LINES.filter((l) => today.lines?.includes(l)).map((l) => `<li class="done" style="--ln:${LINE_VAR[l]}">${l[0]}</li>`).join('') +
+      Array.from({ length: Math.max(0, today.target - (today.lines?.length ?? 0)) }, () => '<li></li>').join('')
+    : Array.from({ length: today.target }, (_, i) => `<li class="${i < today.progress ? 'done' : ''}"></li>`).join('');
+  return `<section class="challenge ${today.done ? 'is-done' : ''}" aria-label="Today's challenge">
+    <span class="seal-mini" aria-hidden="true"><svg viewBox="0 0 40 40"><circle cx="20" cy="20" r="17" fill="none" stroke="currentColor" stroke-width="2.5" ${today.done ? '' : 'stroke-dasharray="3 2.4"'}/><path d="M12 22h16M24 17l4 5-4 5" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+    <div class="ch-body">
+      <p class="ch-title">Today: ${esc(today.title)}</p>
+      <p class="ch-desc">${today.done ? 'Done. Stamp earned.' : esc(today.description)}</p>
+      <ol class="ch-steps" aria-label="${today.progress} of ${today.target}">${steps}</ol>
+    </div>
+    <p class="ch-reward">${today.done ? 'Stamped' : 'Earns a stamp'}</p>
+  </section>`;
 }
 
 // ---------- play a round ----------
@@ -427,44 +753,59 @@ function viewPlay() {
     return;
   }
   if (play.result) return renderResult();
+  if (play.station) setLine(familiesOf(play.station.lines)[0]);
 
   const { attempt, egg } = play;
   const secondsLeft = () => attempt.secondsLeft - (performance.now() - play.receivedAt) / 1000;
   const graceLeft = () => secondsLeft() + (state.config?.graceSeconds ?? 15);
+  const maxBonus = state.config?.maxTimeBonus ?? 0.5;
+  const perHole = attempt.limitSeconds / PUNCH_HOLES;
 
   app.innerHTML = `
-    <div class="row" style="justify-content:space-between">
-      <span class="pill" style="background:${LEVEL_COLORS[egg.level]};color:#fff">${egg.level} · ${esc(egg.levelName)} · ${egg.points} pts</span>
-      <span class="small">${esc(egg.stationName)}</span>
+    <div class="play-bar">
+      <a class="icon-btn" href="#/station/${encodeURIComponent(egg.stationId)}" id="quitX" aria-label="Give up and go back"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></a>
+      <p class="play-title"><b>${esc(egg.levelName)}</b> at ${esc(egg.stationName)}</p>
+      <p class="mypts mypts-here"><b>${egg.points}</b> pts</p>
     </div>
-    <div class="row" style="margin:14px 0 8px; align-items:flex-end">
-      <div id="clock" class="timer">${fmtClock(secondsLeft())}</div>
-      <span class="spacer"></span>
-      <span class="small" style="text-align:right">${attempt.limitSource === 'train' ? `Beat the ${esc(attempt.train?.headsign || 'next')} train` : 'Level timer'}</span>
-    </div>
-    <div class="timerbar"><div id="bar" style="width:100%"></div></div>
-    <div class="play-photo" style="margin-top:12px"><img src="${apiUrl(egg.imageUrl)}" alt="The egg to find: a photo of something in this station" /></div>
-    ${egg.hint ? `<p class="notice" style="margin-top:10px"><strong>Hint:</strong> ${esc(egg.hint)}</p>` : ''}
-    <div id="status" style="margin-top:12px"></div>
-    <label class="btn primary block" id="snap" style="margin-top:12px">
-      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
-      I found it, take a photo
+    <section class="tk play-tk">
+      <div class="tk-top">
+        <div class="egg-photo">
+          <img src="${apiUrl(egg.imageUrl)}" alt="The egg to find: a photo of something in this station" />
+          ${play.firstChance ? '<p class="first-tag">Nobody has found this yet</p>' : ''}
+        </div>
+        ${egg.hint ? `<p class="hint"><b>Hint</b> ${esc(egg.hint)}</p>` : ''}
+      </div>
+      <div class="tk-perf" aria-hidden="true"></div>
+      <div class="tk-bottom">
+        <div class="clock-row">
+          <p id="clock" class="clock">${fmtClock(secondsLeft())}</p>
+          <div class="bonus"><p class="bonus-label">Bonus right now</p><p class="bonus-val">+<span id="bonus">0</span></p></div>
+        </div>
+        <ol id="holes" class="punchclock" aria-hidden="true">${'<li></li>'.repeat(PUNCH_HOLES)}</ol>
+        <p class="clock-ctx">${attempt.limitSource === 'train' ? `Racing the ${esc(attempt.train?.headsign || 'next')} train. ` : ''}Each hole is ${Math.round(perHole)} seconds. The bonus drains as they go.</p>
+      </div>
+    </section>
+    <div id="status"></div>
+    <label class="btn btn-ink btn-block btn-l" id="snap">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
+      Found it, take a photo
       <input id="cam" class="file-hidden" type="file" accept="image/*" capture="environment" />
     </label>
-    <div class="row" style="margin-top:14px; flex-wrap:wrap">
-      <span class="small">Report:</span>
-      ${REPORT_REASONS.map(([k, label]) => `<button class="linkbtn" data-report="${k}">${label}</button>`).join('')}
-      <span class="spacer"></span>
-      <button class="linkbtn" id="quit">Give up</button>
+    <div class="play-foot">
+      <span class="report">Report: ${REPORT_REASONS.map(([k, label]) => `<button class="link" type="button" data-report="${k}">${label}</button>`).join('')}</span>
+      <button class="link" type="button" id="quit">Give up</button>
     </div>`;
 
+  const holes = [...app.querySelectorAll('#holes li')];
   const tick = () => {
     const s = secondsLeft();
     const clock = $('#clock');
     if (!clock) return;
     clock.textContent = fmtClock(s);
-    clock.classList.toggle('low', s <= 20);
-    $('#bar').style.width = `${Math.max(0, (s / attempt.limitSeconds) * 100)}%`;
+    clock.classList.toggle('is-low', s <= 20);
+    $('#bonus').textContent = Math.round(egg.points * maxBonus * Math.max(0, Math.min(1, s / attempt.limitSeconds)));
+    const punched = Math.floor((attempt.limitSeconds - Math.max(0, s)) / perHole);
+    holes.forEach((h, i) => h.classList.toggle('p', i < punched));
     if (graceLeft() <= 0) {
       play.result = { status: 'expired' };
       renderResult();
@@ -477,22 +818,23 @@ function viewPlay() {
     const file = e.target.files?.[0];
     if (!file) return;
     const status = $('#status');
-    $('#snap').style.display = 'none';
-    status.innerHTML = `<div class="notice row"><div class="spin"></div>${state.config?.gemini ? 'Checking your photo against the egg…' : 'Saving your find…'}</div>`;
+    $('#snap').hidden = true;
+    status.innerHTML = `<div class="notice row"><div class="spin" aria-hidden="true"></div>${state.config?.gemini ? 'Checking your photo against the egg' : 'Saving your find'}</div>`;
     try {
       const image = await photoToJpeg(file);
       const result = await api(`/api/attempts/${attempt.id}/find`, { image });
       if (result.status === 'no_match') {
-        status.innerHTML = `<div class="notice bad"><strong>Not a match.</strong> ${esc(result.reason)} Keep looking.</div>`;
-        $('#snap').style.display = '';
+        status.innerHTML = `<div class="notice bad"><b>Not a match.</b> ${esc(result.reason)} Keep looking.</div>`;
+        $('#snap').hidden = false;
         e.target.value = '';
         return;
       }
       play.result = result;
+      play.myPhoto = image;
       renderResult();
     } catch (err) {
       status.innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
-      $('#snap').style.display = '';
+      $('#snap').hidden = false;
       e.target.value = '';
     }
   });
@@ -508,47 +850,156 @@ function viewPlay() {
       }
     }),
   );
+  const quit = () => (state.play = null);
   $('#quit').addEventListener('click', () => {
-    state.play = null;
+    quit();
     location.hash = `#/station/${encodeURIComponent(egg.stationId)}`;
   });
+  $('#quitX').addEventListener('click', quit);
 }
 
-function renderResult() {
+// The round stamp shown when a station is cleared.
+function stationSeal(name, sub) {
+  const id = `ring-${Math.random().toString(36).slice(2, 8)}`;
+  return `<svg class="seal-svg" viewBox="0 0 160 160" role="img" aria-label="${esc(name)} cleared">
+    <defs><path id="${id}" d="M80,80 m-58,0 a58,58 0 1,1 116,0 a58,58 0 1,1 -116,0"/></defs>
+    <circle cx="80" cy="80" r="74" fill="none" stroke="currentColor" stroke-width="5"/>
+    <circle cx="80" cy="80" r="44" fill="none" stroke="currentColor" stroke-width="2.5"/>
+    <text class="seal-ring"><textPath href="#${id}" startOffset="2%">${esc(sub)}</textPath></text>
+    <text class="seal-mid" x="80" y="88" text-anchor="middle">Cleared</text>
+  </svg>`;
+}
+
+async function renderResult() {
   clearTimers();
-  const { result, egg } = state.play;
+  const play = state.play;
+  const { result, egg } = play;
   const back = `#/station/${encodeURIComponent(egg.stationId)}`;
 
   if (result.status === 'expired') {
     app.innerHTML = `
-      <h1>Time's up</h1>
-      <p class="sub">The ${esc(egg.levelName)} egg at ${esc(egg.stationName)} stays hidden for now.</p>
-      <a class="btn primary block" href="${back}">Try another level</a>`;
+      <section class="tk win">
+        ${play.station ? lineBand(play.station, esc(egg.levelName)) : ''}
+        <div class="tk-top">
+          <h1 class="win-head">Time's up</h1>
+          <p class="win-sub">The ${esc(egg.levelName)} egg at ${esc(egg.stationName)} stays hidden for now. Every hole is punched.</p>
+        </div>
+      </section>
+      <a class="btn btn-ink btn-block btn-l" href="${back}">Try another level</a>`;
     state.play = null;
     return;
   }
 
   const { points, verification } = result;
+  const chads = [[-46, -30, 120], [38, -42, -80], [52, 10, 200], [-30, 36, 60], [14, 48, -140], [-56, 4, 30]]
+    .map(([x, y, r]) => `<i class="chad" style="--x:${x}px;--y:${y}px;--r:${r}deg"></i>`)
+    .join('');
   app.innerHTML = `
-    <p class="small">${esc(egg.stationName)} · ${esc(egg.levelName)}</p>
-    <h1>Found it!</h1>
-    <div class="card" style="margin:12px 0">
-      <div class="big-points">+${points.total}</div>
-      <div class="small" style="margin-top:6px">${points.base} for ${esc(egg.levelName)} + ${points.bonus} time bonus · ${fmtClock(result.secondsTaken)} taken</div>
-      <div class="small" style="margin-top:6px">${verification.method === 'gemini' ? `✓ Photo matched${verification.reason ? ': ' + esc(verification.reason) : ''}` : esc(verification.reason)}</div>
-    </div>
-    <h2>Hide the next one?</h2>
-    <p class="sub">Photograph something small in this station. It becomes the new ${esc(egg.levelName)} egg here.</p>
-    <button id="hide" class="btn primary block">Take a photo to hide an egg</button>
-    <a class="btn block" style="margin-top:8px" href="${back}">Skip</a>`;
+    <section class="tk win">
+      ${play.station ? lineBand(play.station, esc(egg.levelName)) : ''}
+      <div class="tk-top">
+        <h1 class="win-head">${result.firstFind ? 'Found it first' : 'Found it'}</h1>
+        <p class="win-pts">+<span id="count">${points.total}</span></p>
+        <span class="hole hole-big" aria-hidden="true">${chads}</span>
+        <p class="stamp stamp-big">Found ${fmtClock(result.secondsTaken)}</p>
+      </div>
+      <div class="tk-perf" aria-hidden="true"></div>
+      <dl class="tk-bottom win-math">
+        <div><dt>${esc(egg.levelName)}</dt><dd>${points.base}</dd></div>
+        <div><dt>Time bonus</dt><dd>+${points.bonus}</dd></div>
+        <div><dt>Took</dt><dd>${fmtClock(result.secondsTaken)}</dd></div>
+      </dl>
+    </section>
+    <section class="match" aria-label="Photo check">
+      <div class="match-pair">
+        <figure class="m"><img src="${apiUrl(egg.imageUrl)}" alt="The egg photo" /><figcaption>The egg</figcaption></figure>
+        ${play.myPhoto ? `<figure class="m"><img src="${play.myPhoto}" alt="Your photo" /><figcaption>Your photo</figcaption></figure>` : ''}
+      </div>
+      <p class="match-verdict ${verification.method === 'gemini' ? 'is-ok' : ''}">${verification.method === 'gemini' ? `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>Photos match${verification.reason ? `: ${esc(verification.reason)}` : ''}` : esc(verification.reason)}</p>
+    </section>
+    <ul id="gains" class="gains" aria-live="polite"></ul>
+    <section class="next-egg">
+      <h2 class="sec-h">Hide the next one</h2>
+      <p class="next-egg-copy">Your photo becomes the new ${esc(egg.levelName)} egg at ${esc(egg.stationName)}.</p>
+      <button id="hide" class="btn btn-primary btn-block btn-l" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>Hide the next ${esc(egg.levelName)} egg</button>
+      <a id="skip" class="btn btn-ghost btn-block" href="${back}">Skip</a>
+    </section>`;
+
+  // Count the points up once (unless the viewer asked for less motion).
+  if (!reducedMotion()) {
+    const el = $('#count');
+    const t0 = performance.now() + 450;
+    const step = (now) => {
+      if (!el.isConnected) return;
+      const k = Math.min(1, Math.max(0, (now - t0) / 700));
+      el.textContent = Math.round(points.total * (1 - (1 - k) ** 3));
+      if (k < 1) requestAnimationFrame(step);
+    };
+    el.textContent = '0';
+    requestAnimationFrame(step);
+  }
 
   $('#hide').addEventListener('click', () => {
     state.pendingHide = { stationId: egg.stationId, stationName: egg.stationName, level: egg.level, findId: result.findId };
     state.play = null;
     location.hash = '#/hide';
   });
-  // Leaving via Skip clears the round.
-  app.querySelector(`a[href="${back}"]`).addEventListener('click', () => (state.play = null));
+  $('#skip').addEventListener('click', () => (state.play = null));
+
+  // What this find changed: rank, rival, line war, challenge, stamps, the station card.
+  const before = play.before ?? {};
+  const [, progress, stationNow] = await Promise.all([
+    refreshHud(true),
+    refreshProgress(),
+    api(`/api/stations/${encodeURIComponent(egg.stationId)}`).catch(() => null),
+  ]);
+  const gains = [];
+  const h = state.hud;
+  if (h?.rank) {
+    const was = before.hud?.rank ?? null;
+    if (!was) gains.push(['up', `<b>You're on the board at ${ordinal(h.rank)}.</b>`]);
+    else if (h.rank < was) {
+      const passed = h.rows.filter((r) => r.rank > h.rank && r.rank <= was).map((r) => r.username);
+      gains.push(['up', `<b>Up to ${ordinal(h.rank)}.</b> You passed ${esc(passed[0] ?? 'someone')}${passed.length > 1 ? ` and ${passed.length - 1} more` : ''}.`]);
+    }
+    if (h.rival) gains.push(['rival', `<b>Next: ${esc(h.rival.username)}.</b> ${plural(h.gap, 'point')} to pass.`]);
+  }
+  const fam = play.station ? familiesOf(play.station.lines)[0] : null;
+  if (MAIN_LINES.includes(fam) && h?.lines?.length) {
+    const sorted = MAIN_LINES.map((l) => ({ line: l, points: h.lines.find((x) => x.line === l)?.points ?? 0 })).sort((a, b) => b.points - a.points);
+    const i = sorted.findIndex((x) => x.line === fam);
+    const line = sorted[i];
+    const note = i === 0
+      ? `${fam} leads ${sorted[1].line} by ${(line.points - sorted[1].points).toLocaleString()}.`
+      : `${fam} is ${ordinal(i + 1)}, ${(sorted[i - 1].points - line.points).toLocaleString()} behind ${sorted[i - 1].line}.`;
+    gains.push(['line', `<b>+${points.total} for the ${fam} Line.</b> ${note}`, fam]);
+  }
+  if (progress?.today?.done && before.progress && !before.progress.today?.done) {
+    gains.push(['stamp', `<b>Challenge done: ${esc(progress.today.title)}.</b> Stamp earned.`]);
+  }
+  const had = new Set((before.progress?.stamps ?? []).filter((s) => s.earned).map((s) => s.id));
+  if (before.progress) {
+    for (const s of progress?.stamps ?? []) if (s.earned && !had.has(s.id)) gains.push(['stamp', `<b>Stamp earned: ${esc(s.name)}.</b> ${esc(s.description)}`]);
+  }
+
+  const box = $('#gains');
+  if (!box) return;
+  const card = stationNow ? stationCard(stationNow.slots) : null;
+  const month = new Date().toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'America/New_York' });
+  const sealHtml = card?.cleared && !before.card?.cleared
+    ? `<li class="gain gain-seal">${stationSeal(egg.stationName, `${egg.stationName}, ${fam ? `${fam} Line, ` : ''}${month}`)}<p><b>${esc(egg.stationName)} cleared.</b> Every egg you can play here is punched.</p></li>`
+    : card && card.playable
+      ? `<li class="gain"><span class="gain-ico gain-card" aria-hidden="true">${card.found}/${card.playable}</span><p><b>${esc(egg.stationName)} card: ${card.found} of ${card.playable}.</b> ${card.playable - card.found === 1 ? 'One egg left to clear it.' : `${card.playable - card.found} eggs left to clear it.`}</p></li>`
+      : '';
+  const icon = (kind, f) =>
+    kind === 'line'
+      ? `<span class="gain-ico gain-line" style="--ln:${LINE_VAR[f]}" aria-hidden="true">${f[0]}</span>`
+      : kind === 'stamp'
+        ? '<span class="gain-ico gain-stamp-ico" aria-hidden="true"><svg viewBox="0 0 40 40"><circle cx="20" cy="20" r="16"/><path d="m13 20.5 5 5 9-10"/></svg></span>'
+        : kind === 'rival'
+          ? '<span class="gain-ico gain-rival" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/></svg></span>'
+          : '<span class="gain-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m6 15 6-6 6 6"/></svg></span>';
+  box.innerHTML = sealHtml + gains.map(([k, html, f]) => `<li class="gain ${k === 'stamp' ? 'gain-stamp' : ''}">${icon(k, f)}<p>${html}</p></li>`).join('');
 }
 
 // ---------- hide an egg ----------
@@ -562,25 +1013,36 @@ function viewHide() {
   let image = null;
 
   app.innerHTML = `
-    <a href="#/station/${encodeURIComponent(hide.stationId)}" class="small">← ${esc(hide.stationName)}</a>
-    <h1>Hide a ${esc(level.name)} egg</h1>
-    <p class="sub">Worth ${level.points} points to whoever finds it. Pick something that fits the level: Easy should be findable in a minute, Impossible should take real searching.</p>
+    <div class="play-bar">
+      <a class="icon-btn" href="#/station/${encodeURIComponent(hide.stationId)}" aria-label="Back to ${esc(hide.stationName)}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg></a>
+      <p class="play-title">Hide a <b>${esc(level.name)}</b> egg</p>
+      <p class="mypts mypts-here"><b>${level.points}</b> pts</p>
+    </div>
+    <section class="tk hide-tk">
+      <div class="tk-top">
+        <div id="preview" class="egg-photo egg-photo-empty">
+          <p class="photo-empty">Photograph something small in ${esc(hide.stationName)}. Easy should take a minute to find. Impossible should take real searching.</p>
+        </div>
+        <label class="btn btn-ghost btn-block" id="pick">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
+          <span id="pickText">Take the photo</span>
+          <input id="cam" class="file-hidden" type="file" accept="image/*" capture="environment" />
+        </label>
+      </div>
+      <div class="tk-perf" aria-hidden="true"></div>
+      <div class="tk-bottom">
+        <label class="field-label" for="hint">Hint <span class="opt">(optional, one line)</span></label>
+        <input id="hint" class="input" maxlength="80" placeholder="e.g. near the stairs to outbound" />
+      </div>
+    </section>
     <ul class="rules">
       <li>Only things you can see from public areas. No tracks or staff-only spots.</li>
       <li>No other riders' faces.</li>
       <li>Photograph something that's already there. Don't put up stickers or objects.</li>
       <li>Stay behind the yellow line.</li>
     </ul>
-    <div id="preview" class="preview" style="margin-top:14px" hidden></div>
-    <label class="btn block" id="pick" style="margin-top:14px">
-      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
-      <span id="pickText">Take the photo</span>
-      <input id="cam" class="file-hidden" type="file" accept="image/*" capture="environment" />
-    </label>
-    <label for="hint" style="display:block; margin-top:14px"><strong>Hint</strong> <span class="small">(optional, one line)</span></label>
-    <input id="hint" class="input" maxlength="80" placeholder="e.g. near the stairs to outbound" style="margin-top:6px" />
-    <button id="submit" class="btn primary block" style="margin-top:14px" disabled>Hide this egg</button>
-    <div id="err" style="margin-top:10px"></div>`;
+    <button id="submit" class="btn btn-primary btn-block btn-l" type="button" disabled>Hide this egg</button>
+    <div id="err"></div>`;
 
   $('#cam').addEventListener('change', async (e) => {
     const file = e.target.files?.[0];
@@ -588,7 +1050,7 @@ function viewHide() {
     try {
       image = await photoToJpeg(file);
       const pv = $('#preview');
-      pv.hidden = false;
+      pv.classList.remove('egg-photo-empty');
       pv.innerHTML = `<img src="${image}" alt="Your egg photo" />`;
       $('#pickText').textContent = 'Retake photo';
       $('#submit').disabled = false;
@@ -598,80 +1060,94 @@ function viewHide() {
   });
 
   $('#submit').addEventListener('click', async () => {
-    $('#submit').disabled = true;
-    $('#submit').textContent = 'Hiding…';
+    const btn = $('#submit');
+    btn.disabled = true;
+    btn.textContent = 'Hiding';
     try {
-      await api('/api/eggs', {
-        stationId: hide.stationId,
-        level: hide.level,
-        findId: hide.findId,
-        hint: $('#hint').value,
-        image,
-      });
+      await api('/api/eggs', { stationId: hide.stationId, level: hide.level, findId: hide.findId, hint: $('#hint').value, image });
       state.pendingHide = null;
       state.stations = null; // egg counts changed
       toast('Egg hidden. Now someone else has to find it.');
       location.hash = `#/station/${encodeURIComponent(hide.stationId)}`;
     } catch (err) {
       $('#err').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
-      $('#submit').disabled = false;
-      $('#submit').textContent = 'Hide this egg';
+      btn.disabled = false;
+      btn.textContent = 'Hide this egg';
     }
   });
 }
 
-// ---------- leaderboard ----------
+// ---------- ranks ----------
 async function viewLeaderboard() {
   loading();
   const stations = await getStations();
   let { mode } = state.board;
   let stationId = state.board.stationId || state.lastStationId || stations.find((s) => s.activeEggs)?.id || stations[0]?.id;
-  const monthLabel = new Date().toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'America/New_York' });
-  const segButton = (m, label) => `<button data-mode="${m}" class="${mode === m ? 'on' : ''}">${label}</button>`;
+  const monthLabel = new Date().toLocaleString('en-US', { month: 'long', timeZone: 'America/New_York' });
+  const nextMonth = new Date();
+  nextMonth.setMonth(nextMonth.getMonth() + 1, 1);
+  const resetLabel = nextMonth.toLocaleString('en-US', { month: 'long', day: 'numeric', timeZone: 'America/New_York' });
 
   app.innerHTML = `
-    <h1>Leaderboard</h1>
-    <p class="sub">${esc(monthLabel)}. Points reset at the start of each month. Tap a player to see their finds.</p>
-    <div class="seg" role="tablist">
-      ${segButton('all', 'Everyone')}
-      ${segButton('station', 'By station')}
-      ${segButton('lines', 'By line')}
+    <h1 class="page-h">${esc(monthLabel)}</h1>
+    <p class="page-sub">Everything resets on ${esc(resetLabel)}. Tap a player to see their tickets.</p>
+    <div id="versus"></div>
+    <div id="war"></div>
+    <div class="seg" role="tablist" aria-label="Players">
+      <button type="button" role="tab" data-mode="all" aria-selected="${mode === 'all'}">Everyone</button>
+      <button type="button" role="tab" data-mode="station" aria-selected="${mode === 'station'}">One station</button>
     </div>
-    <div id="stationPick" style="margin-top:10px" ${mode === 'station' ? '' : 'hidden'}>
+    <div id="stationPick" ${mode === 'station' ? '' : 'hidden'}>
       <select id="sel" class="input" aria-label="Station">${[...stations]
         .sort((a, b) => a.name.localeCompare(b.name))
         .map((s) => `<option value="${esc(s.id)}" ${s.id === stationId ? 'selected' : ''}>${esc(s.name)}</option>`)
         .join('')}</select>
     </div>
-    <div id="board" style="margin-top:12px"></div>`;
+    <div id="board"></div>`;
 
   const draw = async () => {
     const box = $('#board');
-    box.innerHTML = '<div class="empty"><div class="spin" style="margin:auto"></div></div>';
+    box.innerHTML = '<div class="empty"><div class="spin" aria-hidden="true"></div></div>';
     const q = mode === 'station' ? `?stationId=${encodeURIComponent(stationId)}` : '';
     const data = await api(`/api/leaderboard${q}`);
-    if (mode === 'lines') {
-      const colors = { Red: 'var(--red)', Orange: 'var(--orange)', Blue: 'var(--blue)', Green: 'var(--green)' };
-      box.innerHTML = data.lines.length
-        ? `<ol class="board">${data.lines.map((l, i) => `<li><span class="rank">${i + 1}</span><span class="row"><span class="dot" style="background:${colors[l.line] ?? '#888'}"></span><strong>${esc(l.line)} Line</strong></span><span class="pts">${l.points}</span></li>`).join('')}</ol>`
-        : '<div class="empty">No finds yet this month.</div>';
+    if (mode === 'all') {
+      $('#war').innerHTML = data.lines.length ? lineWar(data.lines) : '';
+      const mine = data.rows.find((r) => r.userId === state.user.id);
+      const rival = mine && data.rows.find((r) => r.rank === mine.rank - 1);
+      $('#versus').innerHTML = mine && rival
+        ? `<section class="tk versus" aria-label="You and the player just above you">
+            <div class="vs-side"><p class="vs-name">You</p><p class="vs-sc">${mine.points}</p><p class="vs-rk">${ordinal(mine.rank)}</p></div>
+            <div class="vs-mid"><p class="vs-gap">${rival.points - mine.points + 1}</p><p class="vs-gap-l">to pass</p></div>
+            <div class="vs-side vs-them"><p class="vs-name">${esc(rival.username)}</p><p class="vs-sc">${rival.points}</p><p class="vs-rk">${ordinal(rival.rank)}</p></div>
+            <div class="vs-bar" aria-hidden="true"><span style="--p:${Math.round((mine.points / Math.max(1, rival.points)) * 100)}%"></span></div>
+          </section>`
+        : mine?.rank === 1
+          ? `<section class="tk versus versus-top"><p class="vs-top"><b>You're 1st this month</b> with ${mine.points} points.</p></section>`
+          : '';
+    }
+    if (!data.rows.length) {
+      box.innerHTML = '<div class="empty"><p>No finds yet. The first one puts you at the top.</p></div>';
       return;
     }
-    box.innerHTML = data.rows.length
-      ? `<ol class="board">${data.rows
-          .map((r) => {
-            const mine = r.userId === state.user.id;
-            const href = mine ? '#/profile' : `#/user/${encodeURIComponent(r.userId)}`;
-            return `<li class="${mine ? 'me' : ''}"><span class="rank">${r.rank}</span><a class="player" href="${href}"><strong>${esc(r.username)}</strong><br/><span class="small">${r.finds} find${r.finds === 1 ? '' : 's'}</span></a><span class="pts">${r.points}</span></li>`;
-          })
+    const href = (r) => (r.userId === state.user.id ? '#/profile' : `#/user/${encodeURIComponent(r.userId)}`);
+    const top = data.rows.slice(0, 3);
+    const podium = top.length === 3
+      ? `<ol class="podium" aria-label="Top three">${[top[1], top[0], top[2]]
+          .map((r) => `<li class="pod pod-${r.rank} ${r.userId === state.user.id ? 'is-me' : ''}"><a href="${href(r)}"><span class="pod-name">${esc(r.username)}</span><span class="pod-sc">${r.points}</span><span class="pod-rk">${r.rank}</span></a></li>`)
           .join('')}</ol>`
-      : '<div class="empty">No finds yet. Be the first on the board.</div>';
+      : '';
+    const rest = top.length === 3 ? data.rows.slice(3) : data.rows;
+    box.innerHTML = `${podium}<ol class="ranks">${rest
+      .map(
+        (r) => `<li class="${r.userId === state.user.id ? 'is-me' : ''}"><a href="${href(r)}"><span class="rk">${r.rank}</span><span class="who"><b>${r.userId === state.user.id ? 'You' : esc(r.username)}</b><small>${plural(r.finds, 'find')}</small></span><span class="sc">${r.points}</span></a></li>`,
+      )
+      .join('')}</ol>`;
   };
 
   app.querySelectorAll('.seg button').forEach((b) =>
     b.addEventListener('click', () => {
       mode = state.board.mode = b.dataset.mode;
-      app.querySelectorAll('.seg button').forEach((x) => x.classList.toggle('on', x === b));
+      app.querySelectorAll('.seg button').forEach((x) => x.setAttribute('aria-selected', String(x === b)));
       $('#stationPick').hidden = mode !== 'station';
       draw();
     }),
@@ -683,30 +1159,24 @@ async function viewLeaderboard() {
   await draw();
 }
 
-// ---------- profiles ----------
-// Rank, stats, finds by level and recent finds. `mine` switches the wording between "you" and "they".
-function profileStats(p, mine) {
-  return `
-    <p class="sub">${p.monthRank ? `#${p.monthRank} this month` : 'Not on the board yet this month'}</p>
-    <div class="stats">
-      <div class="card stat"><div class="v">${p.monthPoints}</div><div class="k">Points this month</div></div>
-      <div class="card stat"><div class="v">${p.allTimePoints}</div><div class="k">Points all-time</div></div>
-      <div class="card stat"><div class="v">${p.eggsHidden}</div><div class="k">${mine ? 'Eggs you hid' : 'Eggs hidden'}</div></div>
-      <div class="card stat"><div class="v">${p.timesYourEggsWereFound}</div><div class="k">${mine ? 'Times others found yours' : 'Times others found theirs'}</div></div>
-    </div>
-    <h2>Finds by level</h2>
-    <div class="card">${Object.entries(p.findsByLevel)
-      .map(([name, n], i) => `<div class="row" style="padding:4px 0"><span class="dot" style="background:${LEVEL_COLORS[i + 1]}"></span>${esc(name)}<span class="spacer"></span><strong>${n}</strong></div>`)
-      .join('')}</div>
-    <h2>Recent finds</h2>
-    ${p.recentFinds.length
-      ? `<div class="finds">${p.recentFinds
-          .map((f) => `<figure><img src="${apiUrl(f.photoUrl)}" alt="Find at ${esc(f.stationName)}" loading="lazy"/><figcaption>${esc(f.stationName)} · ${esc(f.levelName)} · +${f.points}</figcaption></figure>`)
-          .join('')}</div>`
-      : `<div class="empty">${mine ? 'No finds yet. Pick a station and play a round.' : 'No finds yet.'}</div>`}`;
+// ---------- tickets (your profile) ----------
+function ticketsGrid(finds) {
+  return finds.length
+    ? `<ul class="book">${finds
+        .map((f) => {
+          const st = state.stations?.find((s) => s.name === f.stationName);
+          const fam = st ? familiesOf(st.lines)[0] : null;
+          return `<li class="mini" style="--ln:${LINE_VAR[fam] ?? 'var(--ink)'}">
+            <p class="mini-band ${fam === 'Orange' ? 'mini-band-dark' : ''}">${esc(f.stationName)}</p>
+            <div class="mini-pic"><img src="${apiUrl(f.photoUrl)}" alt="Find at ${esc(f.stationName)}" loading="lazy" /></div>
+            <p class="mini-lv">${esc(f.levelName)} <b>+${f.points}</b></p>
+            <span class="hole hole-s" aria-hidden="true"></span>
+          </li>`;
+        })
+        .join('')}</ul>`
+    : '<div class="empty"><p>No punched tickets yet. Find an egg and it lands here.</p></div>';
 }
 
-// Every device signed in to this account, from /api/auth/sessions. `sessions` is null if that request failed.
 function deviceList(sessions) {
   if (!sessions) return `<div class="notice">Couldn't load your devices right now.</div>`;
   const thisYear = new Date().getFullYear();
@@ -714,37 +1184,64 @@ function deviceList(sessions) {
     const d = new Date(iso);
     return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', ...(d.getFullYear() !== thisYear && { year: 'numeric' }) });
   };
-  return `
-    <ul class="list devices">${sessions
-      .map(
-        (s) => `<li><div class="item">
-          <span><span class="name">${esc(describeDevice(s.device))}</span>${s.current ? ' <span class="pill accent">This device</span>' : ''}<br/>
-          <span class="meta">${s.current ? 'Active now' : `Active ${fmtLastSeen(s.lastSeenAt)}`} · signed in ${fmtDay(s.createdAt)}</span></span>
-        </div></li>`,
-      )
-      .join('')}</ul>
-    ${sessions.length > 1 ? `<p class="small" style="margin:8px 2px 0">Don't recognize one, or lost a phone? Use “Sign out on all devices” below, then sign back in here.</p>` : ''}`;
+  return `<ul class="devices">${sessions
+    .map(
+      (s) => `<li><b>${esc(describeDevice(s.device))}</b>${s.current ? ' <span class="tag">This device</span>' : ''}<small>${s.current ? 'Active now' : `Active ${fmtLastSeen(s.lastSeenAt)}`}, signed in ${fmtDay(s.createdAt)}</small></li>`,
+    )
+    .join('')}</ul>`;
 }
 
 async function viewProfile() {
   loading();
-  const [p, sessions] = await Promise.all([
+  const [p, progress, sessions] = await Promise.all([
     api(`/api/users/${state.user.id}`),
-    // The devices list is extra: if it fails, still show the rest of the profile.
+    refreshProgress(),
     api('/api/auth/sessions').then((d) => d.sessions, () => null),
+    getStations(),
   ]);
+  const lv = progress?.level;
+  const xp = lv?.next ? Math.round(((lv.points - lv.floor) / (lv.next - lv.floor)) * 100) : 100;
+  const earned = progress?.stamps.filter((s) => s.earned).length ?? 0;
+
   app.innerHTML = `
-    <h1>${esc(p.user.username)}</h1>
-    ${profileStats(p, true)}
-    <h2>Signed-in devices</h2>
-    ${deviceList(sessions)}
-    <h2>Account</h2>
-    <div class="card stack">
-      <p class="small">Signed in as <strong>${esc(state.user.username)}</strong>. Use the same username and password to play on another device.</p>
-      <div class="row" style="flex-wrap:wrap">
-        <button id="out" class="btn small">Sign out</button>
-        <button id="outAll" class="linkbtn">Sign out on all devices</button>
+    <section class="tk level-tk">
+      <div class="tk-top level-top">
+        <div>
+          <h1 class="page-h">${esc(p.user.username)}</h1>
+          <p class="page-sub">${p.monthRank ? `${ordinal(p.monthRank)} this month. ` : ''}${lv ? `Rider level ${lv.level}${lv.next ? `, ${lv.next - lv.points} pts to level ${lv.level + 1}.` : '.'}` : ''}</p>
+        </div>
+        ${lv ? `<span class="level-badge" aria-hidden="true">${lv.level}</span>` : ''}
       </div>
+      <div class="tk-perf" aria-hidden="true"></div>
+      <div class="tk-bottom">
+        <div class="xp" aria-hidden="true"><span style="--p:${xp}%"></span></div>
+        <dl class="mini-stats">
+          <div><dt>This month</dt><dd>${p.monthPoints}</dd></div>
+          <div><dt>All time</dt><dd>${p.allTimePoints}</dd></div>
+          <div><dt>Eggs hidden</dt><dd>${p.eggsHidden}</dd></div>
+          <div><dt>Found by others</dt><dd>${p.timesYourEggsWereFound}</dd></div>
+        </dl>
+      </div>
+    </section>
+    ${challengeTicket(progress?.today)}
+    ${progress ? `
+    <div class="eggs-head"><h2 class="sec-h">Lines punched</h2><p class="eggs-count">${progress.lines.filter((l) => l.stations).length} of 4</p></div>
+    <ol class="line-badges">${progress.lines
+      .map((l) => `<li class="lb ${l.stations ? 'is-got' : ''}" style="--ln:${LINE_VAR[l.line]}"><span class="lb-dot">${l.line[0]}</span><span class="lb-n">${l.stations ? plural(l.stations, 'station') : 'Not yet'}</span></li>`)
+      .join('')}</ol>
+    <div class="eggs-head"><h2 class="sec-h">Stamps</h2><p class="eggs-count">${earned} of ${progress.stamps.length}</p></div>
+    <ul class="stamps">${progress.stamps
+      .map((s) => `<li class="st ${s.earned ? 'is-got' : ''}"><span class="st-seal">${esc(s.name)}</span><p>${s.earned || s.target === 1 ? esc(s.description) : `${esc(s.description)} ${s.progress} of ${s.target}.`}</p></li>`)
+      .join('')}${progress.stations
+      .map((s) => `<li class="st is-got"><span class="st-seal st-station" style="--ln:${LINE_VAR[s.lines[0]] ?? 'var(--stamp)'}">${esc(s.name)}</span><p>${plural(s.finds, 'find')} here</p></li>`)
+      .join('')}</ul>` : ''}
+    <div class="eggs-head"><h2 class="sec-h">Punched tickets</h2><p class="eggs-count">${plural(p.recentFinds.length, 'recent find')}</p></div>
+    ${ticketsGrid(p.recentFinds)}
+    <h2 class="sec-h">Signed-in devices</h2>
+    ${deviceList(sessions)}
+    <div class="account">
+      <button id="out" class="btn btn-ghost" type="button">Sign out</button>
+      <button id="outAll" class="link" type="button">Sign out on all devices</button>
     </div>`;
   $('#out').addEventListener('click', () => signOut({ remote: true }));
   $('#outAll').addEventListener('click', () => {
@@ -752,15 +1249,333 @@ async function viewProfile() {
   });
 }
 
-// Another player's public profile, opened from the leaderboard.
+// Another player's public profile, opened from the ranks.
 async function viewPlayer(id) {
   if (id === state.user.id) return location.replace('#/profile');
   loading();
-  const p = await api(`/api/users/${encodeURIComponent(id)}`);
+  const [p] = await Promise.all([api(`/api/users/${encodeURIComponent(id)}`), getStations()]);
   app.innerHTML = `
-    <a href="#/leaderboard" class="small">← Leaderboard</a>
-    <h1>${esc(p.user.username)}</h1>
-    ${profileStats(p, false)}`;
+    <a class="back" href="#/leaderboard"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>Ranks</a>
+    <section class="tk level-tk">
+      <div class="tk-top"><h1 class="page-h">${esc(p.user.username)}</h1><p class="page-sub">${p.monthRank ? `${ordinal(p.monthRank)} this month` : 'Not on the board yet this month'}</p></div>
+      <div class="tk-perf" aria-hidden="true"></div>
+      <dl class="tk-bottom mini-stats">
+        <div><dt>This month</dt><dd>${p.monthPoints}</dd></div>
+        <div><dt>All time</dt><dd>${p.allTimePoints}</dd></div>
+        <div><dt>Eggs hidden</dt><dd>${p.eggsHidden}</dd></div>
+        <div><dt>Found by others</dt><dd>${p.timesYourEggsWereFound}</dd></div>
+      </dl>
+    </section>
+    <div class="eggs-head"><h2 class="sec-h">Punched tickets</h2></div>
+    ${ticketsGrid(p.recentFinds)}`;
+}
+
+// ---------- friend groups ----------
+// Private leaderboards with friends, joined by invite code or link, plus a sticker-only chat.
+const CHAT_POLL_MS = 4000;
+const inviteLink = (code) => `${location.origin}${location.pathname}#/join/${code}`;
+const fmtTime = (iso) => new Date(iso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+
+async function shareInvite(group) {
+  const url = inviteLink(group.inviteCode);
+  const text = `Join my Lookout group "${group.name}" and see who finds the most eggs.`;
+  try {
+    if (navigator.share) return await navigator.share({ title: group.name, text, url });
+  } catch (err) {
+    if (err?.name === 'AbortError') return; // closed the share sheet
+  }
+  try {
+    await navigator.clipboard.writeText(url);
+    toast('Invite link copied.');
+  } catch {
+    prompt('Copy this invite link:', url);
+  }
+}
+
+async function viewGroups() {
+  loading();
+  const { groups, limits } = await api('/api/groups');
+  app.innerHTML = `
+    <h1 class="page-h">Groups</h1>
+    <p class="page-sub">Your own leaderboard with friends. Start a group, then send them the invite link.</p>
+    ${groups.length
+      ? `<ul class="st-list">${groups
+          .map((g) => `<li><a href="#/group/${encodeURIComponent(g.id)}">
+              <span class="st-lines"><i style="--ln:var(--stamp)"></i></span>
+              <span class="st-txt"><b>${esc(g.name)}</b><small>${plural(g.memberCount, 'member')}${g.isOwner ? ', you run it' : ''}</small></span>
+              <span class="st-count">${g.memberCount}</span>
+            </a></li>`)
+          .join('')}</ul>`
+      : '<div class="empty"><p>You\'re not in any groups yet.</p></div>'}
+    <section class="tk grp-forms">
+      ${BAND_LINES}
+      <form id="create" class="tk-top">
+        <h2 class="sec-h">Start a group</h2>
+        <label class="field-label" for="gname">Group name</label>
+        <input id="gname" class="input" maxlength="30" placeholder="e.g. Red Line Regulars" required />
+        <button class="btn btn-ink btn-block">Create group</button>
+        <div id="createErr"></div>
+      </form>
+      <div class="tk-perf" aria-hidden="true"></div>
+      <form id="join" class="tk-bottom">
+        <h2 class="sec-h">Join with a code</h2>
+        <label class="field-label" for="gcode">Invite code <span class="opt">(8 letters and numbers)</span></label>
+        <input id="gcode" class="input" maxlength="12" autocapitalize="characters" autocomplete="off" placeholder="e.g. K7PQ2MXR" required />
+        <button class="btn btn-ghost btn-block">Join group</button>
+        <div id="joinErr"></div>
+      </form>
+    </section>
+    <p class="page-sub">Up to ${limits.groups} groups each, ${limits.members} players per group.</p>`;
+
+  $('#create').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      const { group } = await api('/api/groups', { name: $('#gname').value });
+      location.hash = `#/group/${encodeURIComponent(group.id)}`;
+    } catch (err) {
+      $('#createErr').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+    }
+  });
+  $('#join').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      const { group } = await api('/api/groups/join', { code: $('#gcode').value });
+      toast(`You joined ${group.name}.`);
+      location.hash = `#/group/${encodeURIComponent(group.id)}`;
+    } catch (err) {
+      $('#joinErr').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+    }
+  });
+}
+
+async function viewGroup(id) {
+  loading();
+  const gid = encodeURIComponent(id);
+  let tab = 'board';
+  let period = 'month';
+  let data = await api(`/api/groups/${gid}`);
+  let chat = null; // { messages, lastSeq } once the chat has been opened
+  let stopPolling = null;
+  const monthLabel = new Date().toLocaleString('en-US', { month: 'long', timeZone: 'America/New_York' });
+
+  // Every sticker carries the sender's rank in this group: it's a competition.
+  const rankOf = (userId) => data.rows.find((r) => r.userId === userId)?.rank ?? null;
+  const stickerHtml = (m) => {
+    const mine = m.userId === state.user.id;
+    const r = rankOf(m.userId);
+    return `<div class="msg ${mine ? 'mine' : ''}">
+      <span class="msg-emoji" aria-hidden="true">${esc(m.emoji)}</span>
+      <p class="msg-cap">${esc(m.label)}</p>
+      <p class="msg-meta">${mine ? 'You' : esc(m.username)}${r ? `<span class="rank-chip">${r === 1 ? '👑 ' : ''}${ordinal(r)}</span>` : ''} · ${fmtTime(m.createdAt)}</p>
+    </div>`;
+  };
+
+  const boardHtml = () => {
+    const href = (r) => (r.userId === state.user.id ? '#/profile' : `#/user/${encodeURIComponent(r.userId)}`);
+    return `
+      <div class="seg" role="tablist" aria-label="Period">
+        <button type="button" role="tab" data-period="month" aria-selected="${period === 'month'}">${esc(monthLabel)}</button>
+        <button type="button" role="tab" data-period="all" aria-selected="${period === 'all'}">All time</button>
+      </div>
+      <ol class="ranks">${data.rows
+        .map((r) => `<li class="${r.userId === state.user.id ? 'is-me' : ''}"><a href="${href(r)}">
+            <span class="rk ${r.rank ? '' : 'rk-none'}">${r.rank ?? '–'}</span>
+            <span class="who"><b>${r.userId === state.user.id ? 'You' : esc(r.username)}${r.isOwner ? '<span class="tag">Owner</span>' : ''}</b><small>${r.finds ? plural(r.finds, 'find') : 'No finds yet'}</small></span>
+            <span class="sc">${r.points}</span>
+          </a></li>`)
+        .join('')}</ol>
+      ${data.rows.every((r) => !r.points) ? `<p class="page-sub">Nobody has scored ${period === 'month' ? 'this month' : 'yet'}. Find an egg to take the lead.</p>` : ''}`;
+  };
+
+  const chatHtml = () => `
+    <section class="tk"><div id="feed" class="feed" aria-live="polite">${chat.messages.length
+      ? chat.messages.map(stickerHtml).join('')
+      : '<div class="empty"><p>No stickers yet. Start the trash talk.</p></div>'}</div></section>
+    <p class="chat-hint">Tap a sticker to send it to the group</p>
+    <div class="stickers">${(state.config?.stickers ?? [])
+      .map((st) => `<button class="stk" type="button" data-sticker="${esc(st.id)}" aria-label="Send ${esc(st.label)}"><span aria-hidden="true">${esc(st.emoji)}</span><small>${esc(st.label)}</small></button>`)
+      .join('')}</div>`;
+
+  function scrollFeed(force) {
+    const feed = $('#feed');
+    if (!feed) return;
+    if (force || feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80) feed.scrollTop = feed.scrollHeight;
+  }
+
+  function appendMessages(messages) {
+    const fresh = messages.filter((m) => m.seq > chat.lastSeq);
+    if (!fresh.length) return;
+    chat.messages.push(...fresh);
+    chat.lastSeq = fresh.at(-1).seq;
+    const feed = $('#feed');
+    if (!feed) return;
+    feed.querySelector('.empty')?.remove();
+    feed.insertAdjacentHTML('beforeend', fresh.map(stickerHtml).join(''));
+    scrollFeed(fresh.some((m) => m.userId === state.user.id));
+  }
+
+  async function poll() {
+    if (document.visibilityState !== 'visible' || tab !== 'chat') return;
+    try {
+      appendMessages((await api(`/api/groups/${gid}/messages?after=${chat.lastSeq}`)).messages);
+    } catch {
+      /* try again next tick */
+    }
+  }
+
+  function startPolling() {
+    if (stopPolling) return;
+    const iv = setInterval(poll, CHAT_POLL_MS);
+    const onVisible = () => document.visibilityState === 'visible' && poll();
+    document.addEventListener('visibilitychange', onVisible);
+    stopPolling = () => {
+      clearInterval(iv);
+      document.removeEventListener('visibilitychange', onVisible);
+      stopPolling = null;
+    };
+    onCleanup(() => stopPolling?.()); // stops when leaving the page
+  }
+
+  const draw = () => {
+    const { group } = data;
+    app.innerHTML = `
+      <a class="back" href="#/groups"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>Groups</a>
+      <section class="tk">
+        ${BAND_LINES}
+        <div class="tk-top grp-head">
+          <div>
+            <p class="here">Group</p>
+            <h1 class="page-h">${esc(group.name)}</h1>
+            <p class="page-sub">${plural(group.memberCount, 'member')}${group.isOwner ? ', you run it' : ''}</p>
+          </div>
+          ${group.isOwner ? '<button id="rename" class="link" type="button">Rename</button>' : ''}
+        </div>
+        <div class="tk-perf" aria-hidden="true"></div>
+        <div class="tk-bottom invite-row">
+          <div><p class="next-label">Invite code</p><p class="invite-code">${esc(group.inviteCode)}</p></div>
+          <button id="share" class="btn btn-primary" type="button">Share invite</button>
+        </div>
+      </section>
+      <div class="seg" role="tablist" aria-label="Group">
+        <button type="button" role="tab" data-tab="board" aria-selected="${tab === 'board'}">Ranks</button>
+        <button type="button" role="tab" data-tab="chat" aria-selected="${tab === 'chat'}">Chat</button>
+      </div>
+      <div class="grp-pane">${tab === 'board' ? boardHtml() : chatHtml()}</div>
+      <div class="account"><button id="leave" class="link" type="button">Leave group</button></div>`;
+
+    $('#share').addEventListener('click', () => shareInvite(group));
+    app.querySelectorAll('[data-tab]').forEach((b) =>
+      b.addEventListener('click', async () => {
+        if (b.dataset.tab === tab) return;
+        tab = b.dataset.tab;
+        if (tab === 'chat' && !chat) {
+          try {
+            const { messages } = await api(`/api/groups/${gid}/messages`);
+            chat = { messages, lastSeq: messages.at(-1)?.seq ?? 0 };
+          } catch (err) {
+            tab = 'board';
+            return toast(err.message);
+          }
+        }
+        draw();
+        if (tab === 'chat') {
+          scrollFeed(true);
+          startPolling();
+          poll();
+        } else stopPolling?.();
+      }),
+    );
+    app.querySelectorAll('[data-period]').forEach((b) =>
+      b.addEventListener('click', async () => {
+        if (b.dataset.period === period) return;
+        period = b.dataset.period;
+        try {
+          data = await api(`/api/groups/${gid}${period === 'all' ? '?period=all' : ''}`);
+          draw();
+        } catch (err) {
+          toast(err.message);
+        }
+      }),
+    );
+    app.querySelectorAll('[data-sticker]').forEach((b) =>
+      b.addEventListener('click', async () => {
+        b.disabled = true;
+        try {
+          const { message } = await api(`/api/groups/${gid}/messages`, { sticker: b.dataset.sticker });
+          // Pick up anything others sent meanwhile, then ours, in order.
+          const { messages } = await api(`/api/groups/${gid}/messages?after=${chat.lastSeq}`);
+          appendMessages(messages.length ? messages : [message]);
+        } catch (err) {
+          toast(err.message);
+        } finally {
+          b.disabled = false;
+        }
+      }),
+    );
+    $('#rename')?.addEventListener('click', async () => {
+      const name = prompt('New group name', group.name);
+      if (!name || name.trim() === group.name) return;
+      try {
+        data.group = (await api(`/api/groups/${gid}/rename`, { name })).group;
+        draw();
+        toast('Group renamed.');
+      } catch (err) {
+        toast(err.message);
+      }
+    });
+    $('#leave').addEventListener('click', async () => {
+      const lastOne = group.memberCount === 1;
+      const msg = lastOne
+        ? `You're the only member. Leaving deletes "${group.name}" and its chat. Continue?`
+        : group.isOwner
+          ? `Leave "${group.name}"? The longest-standing member takes over.`
+          : `Leave "${group.name}"?`;
+      if (!confirm(msg)) return;
+      try {
+        await api(`/api/groups/${gid}/leave`, {});
+        toast(lastOne ? 'Group deleted.' : 'You left the group.');
+        location.hash = '#/groups';
+      } catch (err) {
+        toast(err.message);
+      }
+    });
+  };
+  draw();
+}
+
+// Opened from an invite link. Signing up first works too: the hash survives it.
+async function viewJoin(code) {
+  loading();
+  const { group, alreadyMember } = await api(`/api/groups/invite/${encodeURIComponent(code)}`);
+  if (alreadyMember) return location.replace(`#/group/${encodeURIComponent(group.id)}`);
+  app.innerHTML = `
+    <section class="tk">
+      ${BAND_LINES}
+      <div class="tk-top">
+        <p class="here">You're invited to a group</p>
+        <h1 class="page-h">${esc(group.name)}</h1>
+        <p class="page-sub">${plural(group.memberCount, 'member')}. Join to see the group's ranks and send stickers.</p>
+      </div>
+      <div class="tk-perf" aria-hidden="true"></div>
+      <div class="tk-bottom stack">
+        ${group.full
+          ? '<div class="notice bad">This group is full.</div><a class="btn btn-ghost btn-block" href="#/groups">Back to groups</a>'
+          : `<button id="joinBtn" class="btn btn-ink btn-block btn-l" type="button">Join ${esc(group.name)}</button>
+             <a class="btn btn-ghost btn-block" href="#/groups">Not now</a>
+             <div id="err"></div>`}
+      </div>
+    </section>`;
+  $('#joinBtn')?.addEventListener('click', async () => {
+    $('#joinBtn').disabled = true;
+    try {
+      const { group: joined } = await api('/api/groups/join', { code });
+      toast(`You joined ${joined.name}.`);
+      location.replace(`#/group/${encodeURIComponent(joined.id)}`);
+    } catch (err) {
+      $('#err').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+      $('#joinBtn').disabled = false;
+    }
+  });
 }
 
 // ---------- map ----------
@@ -780,33 +1595,39 @@ function loadLeaflet() {
 }
 
 async function viewMap() {
-  loading('Loading map…');
+  loading('Loading the map');
   const [stations] = await Promise.all([getStations(), loadLeaflet()]);
+  const css = getComputedStyle(document.documentElement);
+  const ink = css.getPropertyValue('--ink').trim();
+  const ticket = css.getPropertyValue('--ticket').trim();
+  const muted = css.getPropertyValue('--muted').trim();
   app.innerHTML = `
-    <h1>Station map</h1>
-    <p class="sub">Bigger dots have more eggs hidden. Tap a station to play.</p>
-    <div id="map"></div>`;
-  const map = L.map('map', { zoomControl: true }).setView([42.3555, -71.0805], 12);
+    <h1 class="page-h">Map</h1>
+    <p class="page-sub">Bigger dots have more eggs hidden. Tap a station to open it.</p>
+    <div id="map" class="map"></div>`;
+  const map = L.map('map', { zoomControl: true }).setView(loc.pos ? [loc.pos.lat, loc.pos.lng] : [42.3555, -71.0805], loc.pos ? 14 : 12);
   state.map = map;
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 18,
-    attribution: '&copy; OpenStreetMap contributors',
-  }).addTo(map);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18, attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
   for (const s of stations) {
     L.circleMarker([s.lat, s.lng], {
       radius: 5 + s.activeEggs * 1.6,
-      color: '#fff',
+      color: ticket,
       weight: 2,
-      fillColor: s.lines[0]?.color ?? '#555',
+      fillColor: s.lines[0]?.color ?? muted,
       fillOpacity: s.activeEggs ? 1 : 0.55,
     })
       .addTo(map)
-      .bindPopup(`<strong>${esc(s.name)}</strong><br/>${s.activeEggs}/5 eggs hidden<br/><a href="#/station/${encodeURIComponent(s.id)}">Open station →</a>`);
+      .bindPopup(`<strong>${esc(s.name)}</strong><br/>${s.activeEggs} of 5 eggs hidden<br/><a href="#/station/${encodeURIComponent(s.id)}">Open station</a>`);
+  }
+  if (loc.pos) {
+    L.circle([loc.pos.lat, loc.pos.lng], { radius: RANGE_METERS, color: ink, weight: 1, fillOpacity: 0.06 }).addTo(map);
+    L.circleMarker([loc.pos.lat, loc.pos.lng], { radius: 7, color: ticket, weight: 3, fillColor: ink, fillOpacity: 1 }).addTo(map).bindPopup('You are here');
   }
 }
 
 // ---------- boot ----------
 (async function boot() {
+  setLine(state.line);
   try {
     state.config = await api('/api/config');
   } catch {
@@ -822,7 +1643,8 @@ async function viewMap() {
       if (err.status === 401) setSession(null);
     }
   }
-  $('#tabs').hidden = !state.user;
+  // Detect the station automatically as soon as a player is signed in.
+  if (state.user) startLocation();
   window.addEventListener('hashchange', render);
   render();
 })();

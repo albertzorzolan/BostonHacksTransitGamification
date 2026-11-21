@@ -7,35 +7,46 @@ Riders photograph small things in MBTA stations (a sticker, a tile, a mark on a 
 ## Project layout
 
 ```
-backend/    Node API + Postgres (accounts, sessions, game state, photos)
 frontend/   Phone web app: static HTML/JS/CSS, no build step
+backend/    Node API + MongoDB (accounts, sessions, game state, photos)
+api/        Vercel serverless entry that runs the backend
 ```
 
-The backend keeps no state in memory between requests: users, sessions, eggs and photos all live in Postgres. You can run as many backend instances as you like behind a load balancer, and players can sign in to the same account on any number of devices.
+The backend keeps no state in memory between requests: users, sessions, eggs and photos all live in MongoDB. It runs as a Vercel serverless function (or as any number of plain Node servers), and players can sign in to the same account on any number of devices.
 
-## Run it
+## Run it locally
 
-Needs Node 22.9+ and Postgres 14+.
+Needs Node 22.9+.
 
 ```bash
-npm install                      # installs the backend's one dependency (pg)
-createdb egg_hunt                # the tables are created on first start
-createdb egg_hunt_test           # used by npm test
+npm install
 cp backend/.env.example backend/.env
-
 npm run dev                      # API + web app on http://localhost:3000
-npm test                         # API tests against Postgres
+npm test                         # API tests
 ```
 
-The first start downloads the station list from the MBTA API and caches it in `backend/data/stations.json`.
+With `MONGODB_URI` empty, `npm run dev` and `npm test` start a temporary in-memory MongoDB, so you don't need to install anything. Data from `npm run dev` is lost on restart. Point `MONGODB_URI` at Atlas to keep it.
+
+The station list comes from the MBTA API and is cached in `backend/data/stations.json`, which is committed.
+
+## Deploy (Vercel + MongoDB Atlas)
+
+One Vercel project serves everything. `frontend/` is served as static files, and `/api/*` and `/photos/*` are rewritten to the function in `api/index.js` (see `vercel.json`).
+
+1. In Atlas, create a database user for this app, and under Network Access allow `0.0.0.0/0` (Vercel has no fixed IPs).
+2. Set the environment variables, then deploy:
+   ```bash
+   npx vercel env add MONGODB_URI production     # mongodb+srv://USER:PASS@cluster.../?retryWrites=true&w=majority
+   npx vercel env add GEMINI_API_KEY production  # optional
+   npx vercel --prod
+   ```
+3. Check `https://<your-app>.vercel.app/api/health`, which returns `{"ok":true}`.
+
+Indexes are created automatically the first time the function starts.
 
 ### Running the frontend on its own
 
-By default the backend also serves `frontend/`, so phones need only one URL. To host the frontend separately (Vercel, Netlify, S3, any static host):
-
-- Set `window.EGG_API_BASE` in `frontend/config.js` to the API's URL.
-- Set `CORS_ORIGINS` on the backend to the frontend's origin, and `SERVE_FRONTEND=false`.
-- For local development: `npm run dev:frontend` serves it on http://localhost:5173 and points it at `http://localhost:3000`.
+To host `frontend/` somewhere else, set `window.EGG_API_BASE` in `frontend/config.js` to the API's URL, and add that site's origin to the backend's `CORS_ORIGINS`. For local development, `npm run dev:frontend` serves it on http://localhost:5173 and points it at `http://localhost:3000`.
 
 ### Accounts
 
@@ -43,12 +54,13 @@ By default the backend also serves `frontend/`, so phones need only one URL. To 
 - Each sign-in creates a session for that device, using a random bearer token. The database stores only a SHA-256 hash of the token.
 - A session expires after 30 days without use. Profile lists every device signed in to the account, and "Sign out on all devices" ends all of those sessions.
 
-### Environment (`backend/.env`)
+### Environment (`backend/.env`, or Vercel project settings)
 
-- `DATABASE_URL`: Postgres connection string. Any managed Postgres works (Neon, Supabase, RDS).
+- `MONGODB_URI`: MongoDB connection string. It must be a replica set, which Atlas always is. Required on Vercel.
+- `MONGODB_DB`: database name (default `egghunt`).
 - `DB_POOL_SIZE`: connections per instance (default 10).
 - `CORS_ORIGINS`: allowed browser origins, comma-separated, or `*`.
-- `SERVE_FRONTEND`: set to `false` when the frontend is hosted elsewhere.
+- `SERVE_FRONTEND`: local server only. Set to `false` when the frontend is hosted elsewhere.
 - `GEMINI_API_KEY`: turns on the photo check. Without it, finds count on the honor system, and the result screen says so.
 - `GEMINI_MODEL`: defaults to `gemini-2.5-flash`. Change it if Google has retired that model.
 - `MBTA_API_KEY`: a free key from api-v3.mbta.com that raises the rate limit. The app works without one.
@@ -78,22 +90,40 @@ By default the backend also serves `frontend/`, so phones need only one URL. To 
   - An egg is retired after 3 reports, or after 7 days live with no finds.
 - **Leaderboard:** this month (Boston time) for everyone, by station, or by line (Red / Orange / Blue / Green). Tap a player to see their stats and recent finds.
 
+## Progress
+
+- **Rider level:** grows with all-time points.
+- **Daily challenge:** one per day, the same for everyone (Transfer, Beat the train, Go hard, Hat trick).
+- **Stamps:** 9 of them, for things like a first find, beating the train, finding an egg in 30 seconds, finding on all 4 lines, or hiding 5 eggs.
+- **Station cards:** one per station you've found eggs at.
+
+All of it is computed from your finds, so nothing extra is stored. It's shown on the Tickets tab and on each station.
+
+## Friend groups
+
+- Any player can create a named group. The creator owns it and is the only one who can rename it.
+- Every group has an 8-character invite code and a link (`/#/join/CODE`) that any member can share. Opening the link signed out goes through sign-up first, then straight to the join screen.
+- Each group has its own leaderboard covering only its members, for this month or all time. Members with no points are listed unranked.
+- When the owner leaves, the longest-standing member becomes the owner. The last member to leave deletes the group.
+- Limits: 20 groups per player and 50 players per group. Both hold even when people join at the same moment.
+- **Sticker chat:** each group has a chat for trash talk, using stickers only (no typed messages). There are 20 competitive stickers such as 👑 "Who's the king now", 🐌 "Too slow" and ⚔️ "Bring it on". Each sticker shows the sender's current rank in the group. New stickers appear within about 4 seconds (the app checks for new ones while the chat is open). The limit is 8 stickers per 10 seconds per player, and stickers are deleted after 30 days.
+
 ## Code map
 
-- `backend/server.js`: entry point that reads env vars, runs migrations and starts the server
+- `api/index.js`: Vercel function entry
+- `vercel.json`: static frontend, rewrites to the function, included data files
+- `backend/server.js`: local / long-running server entry
+- `backend/src/bootstrap.js`: builds the app from env vars, once per process
 - `backend/src/app.js`: HTTP routes, auth middleware, CORS
 - `backend/src/auth.js`: password hashing and session tokens
-- `backend/src/db.js`: Postgres pool, transactions, migration runner
-- `backend/src/slots.js`: egg slot rotation and retiring, in SQL with per-slot locks
+- `backend/src/db.js`: MongoDB client, collections, indexes, transactions
+- `backend/src/slots.js`: egg slot rotation and retiring, in transactions with per-slot locks
 - `backend/src/game.js`: levels, scoring, timers (pure functions)
 - `backend/src/mbta.js`: MBTA V3 stations + predictions
 - `backend/src/verify.js`: Gemini photo match, with honor-system fallback
-- `backend/migrations/`: SQL schema, applied in order on startup
-- `backend/test/api.test.js`: end-to-end API tests (each run uses a throwaway Postgres schema)
+- `backend/test/api.test.js`: end-to-end API tests on an in-memory MongoDB
 - `frontend/`: phone web app (`config.js` sets the API URL; `serve.js` is a standalone dev server)
 
 ## Reset demo data
 
-```bash
-dropdb egg_hunt && createdb egg_hunt   # tables are recreated on the next start
-```
+Drop the `egghunt` database in Atlas (or restart `npm run dev` if you're using the in-memory database). Indexes are recreated on the next start.

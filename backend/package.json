@@ -2,7 +2,7 @@
   "name": "station-egg-hunt-backend",
   "version": "0.2.0",
   "private": true,
-  "description": "Station Egg Hunt API (Node + Postgres).",
+  "description": "Station Egg Hunt API (Node + MongoDB).",
   "type": "module",
   "scripts": {
     "start": "node --env-file-if-exists=.env server.js",
@@ -13,6 +13,9 @@
     "node": ">=22.9"
   },
   "dependencies": {
-    "pg": "^8.23.1"
+    "mongodb": "^6.22.0"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "^10.4.3"
   }
 }

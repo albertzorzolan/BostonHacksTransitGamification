@@ -1,22 +1,23 @@
-// End-to-end API tests against a real Postgres. Each run creates its own
-// throwaway schema in TEST_DATABASE_URL (default: local egg_hunt_test) and drops it after.
+// End-to-end API tests against a real MongoDB: a throwaway in-memory replica set
+// (mongodb-memory-server), or TEST_MONGODB_URI if set (a random database is used and dropped).
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import pg from 'pg';
 import { createApp } from '../src/app.js';
-import { createDb } from '../src/db.js';
+import { createDb, startMemoryMongo } from '../src/db.js';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const DB_URL = process.env.TEST_DATABASE_URL || 'postgres://localhost:5432/egg_hunt_test';
-const SCHEMA = `test_${crypto.randomBytes(4).toString('hex')}`;
+const DB_NAME = `egghunt_test_${crypto.randomBytes(4).toString('hex')}`;
 
 const STATIONS = [
   { id: 'place-kencl', name: 'Kenmore', lat: 42.3489, lng: -71.0952, lines: [{ id: 'Green-B', name: 'Green Line B', color: '#00843D' }] },
   { id: 'place-pktrm', name: 'Park Street', lat: 42.3564, lng: -71.0624, lines: [{ id: 'Red', name: 'Red Line', color: '#DA291C' }, { id: 'Green-B', name: 'Green Line B', color: '#00843D' }] },
+  // Same line layout as the two above, kept for the progress test so its slots are free.
+  { id: 'test-green', name: 'Test Green', lat: 42.35, lng: -71.09, lines: [{ id: 'Green-B', name: 'Green Line B', color: '#00843D' }] },
+  { id: 'test-redgreen', name: 'Test Red Green', lat: 42.355, lng: -71.06, lines: [{ id: 'Red', name: 'Red Line', color: '#DA291C' }, { id: 'Green-B', name: 'Green Line B', color: '#00843D' }] },
 ];
 const fakeMbta = {
   loadStations: async () => STATIONS,
@@ -30,14 +31,15 @@ let nextVerify = { method: 'gemini', match: true, confidence: 0.9, reason: 'Same
 let server;
 let base;
 let db;
+let memory;
 
 before(async () => {
-  const admin = new pg.Client({ connectionString: DB_URL });
-  await admin.connect();
-  await admin.query(`create schema ${SCHEMA}`);
-  await admin.end();
-  db = createDb({ connectionString: DB_URL, schema: SCHEMA, max: 5 });
-  await db.migrate(path.join(ROOT, 'migrations'));
+  let uri = process.env.TEST_MONGODB_URI;
+  if (!uri) {
+    memory = await startMemoryMongo();
+    uri = memory.uri;
+  }
+  db = await createDb({ uri, dbName: DB_NAME, maxPoolSize: 5 });
   const app = await createApp({
     db,
     mbta: fakeMbta,
@@ -53,8 +55,9 @@ before(async () => {
 });
 after(async () => {
   server?.close();
-  await db?.query(`drop schema ${SCHEMA} cascade`);
+  await db?.db.dropDatabase();
   await db?.close();
+  await memory?.stop();
 });
 
 // `as` is a session ({ token }) or null for an anonymous call.
@@ -182,8 +185,26 @@ test('the same round submitted twice at once scores once', async () => {
   const round = await ok('/api/attempts', { eggId }, ned);
   const results = await Promise.all([1, 2, 3].map(() => call(`/api/attempts/${round.attempt.id}/find`, { image: IMG }, ned)));
   assert.deepEqual(results.map((r) => r.status).sort(), [200, 409, 409]);
-  const { rows } = await db.query('select count(*)::int as n from finds where user_id = $1', [ned.id]);
-  assert.equal(rows[0].n, 1);
+  assert.equal(await db.col.finds.countDocuments({ userId: ned.id }), 1);
+});
+
+test('two players finding the same egg at once rotate the slot once', async () => {
+  const [ola, pat, quinn, ray] = [await user('ola'), await user('pat'), await user('quinn'), await user('ray')];
+  // Two eggs in the Park Street level-5 slot: ola's in the pool, pat's active.
+  await ok('/api/eggs', { stationId: 'place-pktrm', level: 5, image: IMG }, ola);
+  const r0 = await ok('/api/attempts', { eggId: (await ok('/api/stations/place-pktrm')).slots[4].egg.id }, pat);
+  const f0 = await ok(`/api/attempts/${r0.attempt.id}/find`, { image: IMG }, pat);
+  await ok('/api/eggs', { stationId: 'place-pktrm', level: 5, findId: f0.findId, image: IMG }, pat);
+  const eggId = (await ok('/api/stations/place-pktrm')).slots[4].egg.id;
+
+  const [a, b] = [await ok('/api/attempts', { eggId }, quinn), await ok('/api/attempts', { eggId }, ray)];
+  const results = await Promise.all([
+    call(`/api/attempts/${a.attempt.id}/find`, { image: IMG }, quinn),
+    call(`/api/attempts/${b.attempt.id}/find`, { image: IMG }, ray),
+  ]);
+  assert.deepEqual(results.map((r) => r.status), [200, 200], 'both finds count');
+  assert.equal(await db.col.eggs.countDocuments({ stationId: 'place-pktrm', level: 5, status: 'active' }), 1, 'still exactly one active egg');
+  assert.equal((await db.col.eggs.findOne({ _id: eggId })).timesFound, 2);
 });
 
 test('no match keeps the round open; time runs out', async () => {
@@ -239,6 +260,136 @@ test('unfound eggs retire after 7 days', async () => {
   assert.equal((await ok('/api/stations/place-kencl')).slots[4].egg, null);
 });
 
+test('friend groups: create, invite, join, group leaderboard', async () => {
+  const [gia, hugo, iris, outsider] = [await user('gia'), await user('hugo'), await user('iris'), await user('outsider')];
+  assert.equal((await call('/api/groups', { name: 'Red Line Crew' })).status, 401, 'must be signed in');
+  assert.equal((await call('/api/groups', { name: 'x' }, gia)).status, 400, 'name too short');
+  assert.equal((await call('/api/groups', { name: '<b>hi</b>' }, gia)).status, 400, 'no markup in names');
+
+  const { group } = await ok('/api/groups', { name: '  Red   Line Crew ' }, gia);
+  assert.equal(group.name, 'Red Line Crew', 'whitespace is tidied');
+  assert.equal(group.isOwner, true);
+  assert.match(group.inviteCode, /^[A-HJ-NP-Z2-9]{8}$/);
+
+  // Invite preview, then join (codes are case- and dash-insensitive).
+  const preview = await ok(`/api/groups/invite/${group.inviteCode.toLowerCase()}`, null, hugo);
+  assert.deepEqual([preview.group.name, preview.alreadyMember], ['Red Line Crew', false]);
+  const sloppy = `${group.inviteCode.slice(0, 4)}-${group.inviteCode.slice(4)}`.toLowerCase();
+  assert.equal((await ok('/api/groups/join', { code: sloppy }, hugo)).group.memberCount, 2);
+  assert.equal((await ok('/api/groups/join', { code: group.inviteCode }, hugo)).group.memberCount, 2, 'joining twice is a no-op');
+  clock += 1000; // iris joins after hugo, so hugo is the longest-standing member later
+  await ok('/api/groups/join', { code: group.inviteCode }, iris);
+  assert.equal((await call('/api/groups/join', { code: 'ZZZZZZZZ' }, iris)).status, 404);
+  assert.equal((await call(`/api/groups/invite/nope`, null, iris)).status, 404);
+
+  // Only members can see the board.
+  assert.equal((await call(`/api/groups/${group.id}`, null, outsider)).status, 403);
+  assert.equal((await call(`/api/groups/${group.id}`)).status, 401);
+
+  // hugo scores; the outsider scores more but isn't in the group.
+  await ok('/api/eggs', { stationId: 'place-kencl', level: 4, image: IMG }, gia);
+  const egg4 = (await ok('/api/stations/place-kencl')).slots[3].egg.id;
+  for (const who of [hugo, outsider]) {
+    const r = await ok('/api/attempts', { eggId: egg4 }, who);
+    await ok(`/api/attempts/${r.attempt.id}/find`, { image: IMG }, who);
+  }
+  const board = await ok(`/api/groups/${group.id}`, null, iris);
+  assert.equal(board.group.isOwner, false);
+  assert.deepEqual(board.rows.map((r) => [r.username, r.rank]), [['hugo', 1], ['gia', null], ['iris', null]], 'members only; zero-point members listed unranked');
+  assert.equal(board.rows[0].points, 60, 'level 4 = 40 base + 20 full time bonus');
+  assert.equal(board.rows.find((r) => r.username === 'gia').isOwner, true);
+  const allTime = await ok(`/api/groups/${group.id}?period=all`, null, iris);
+  assert.equal(allTime.period, 'all');
+  assert.equal(allTime.rows[0].points, 60);
+
+  const mine = await ok('/api/groups', null, hugo);
+  assert.deepEqual(mine.groups.map((g) => g.name), ['Red Line Crew']);
+
+  // Rename: owner only.
+  assert.equal((await call(`/api/groups/${group.id}/rename`, { name: 'Hacked' }, hugo)).status, 403);
+  assert.equal((await ok(`/api/groups/${group.id}/rename`, { name: 'Green Line Gang' }, gia)).group.name, 'Green Line Gang');
+
+  // Owner leaves: the longest-standing member (hugo) takes over.
+  assert.equal((await call(`/api/groups/${group.id}/leave`, {}, outsider)).status, 403);
+  await ok(`/api/groups/${group.id}/leave`, {}, gia);
+  const after = await ok(`/api/groups/${group.id}`, null, hugo);
+  assert.equal(after.group.isOwner, true, 'ownership passed to hugo');
+  assert.equal(after.group.memberCount, 2);
+  assert.equal((await call(`/api/groups/${group.id}`, null, gia)).status, 403, 'gia is out');
+
+  // Last one out deletes the group.
+  await ok(`/api/groups/${group.id}/leave`, {}, iris);
+  const last = await ok(`/api/groups/${group.id}/leave`, {}, hugo);
+  assert.equal(last.deleted, true);
+  assert.equal((await call(`/api/groups/join`, { code: group.inviteCode }, gia)).status, 404, 'invite dies with the group');
+});
+
+test('friend groups: size and per-player limits hold under concurrent joins', async () => {
+  const { MAX_GROUP_MEMBERS, MAX_GROUPS_PER_USER } = await import('../src/app.js');
+  const owner = await user('bigowner');
+  const { group } = await ok('/api/groups', { name: 'Huge Group' }, owner);
+  // Fill to one below the limit directly, then race 3 joiners for the last seat.
+  const filler = Array.from({ length: MAX_GROUP_MEMBERS - 2 }, (_, i) => ({ _id: crypto.randomUUID(), groupId: group.id, userId: crypto.randomUUID(), joinedAt: new Date(clock) }));
+  await db.col.groupMembers.insertMany(filler);
+  await db.col.groups.updateOne({ _id: group.id }, { $set: { memberCount: MAX_GROUP_MEMBERS - 1 } });
+  const racers = [await user('racer1'), await user('racer2'), await user('racer3')];
+  const results = await Promise.all(racers.map((r) => call('/api/groups/join', { code: group.inviteCode }, r)));
+  assert.deepEqual(results.map((r) => r.status).sort(), [200, 409, 409], 'exactly one gets the last seat');
+  assert.equal(await db.col.groupMembers.countDocuments({ groupId: group.id }), MAX_GROUP_MEMBERS);
+  assert.equal((await db.col.groups.findOne({ _id: group.id })).memberCount, MAX_GROUP_MEMBERS);
+
+  const busy = await user('busy');
+  await Promise.all(Array.from({ length: MAX_GROUPS_PER_USER }, (_, i) => ok('/api/groups', { name: `Group ${i}` }, busy)));
+  assert.equal((await call('/api/groups', { name: 'One too many' }, busy)).status, 409);
+  assert.equal(await db.col.groupMembers.countDocuments({ userId: busy.id }), MAX_GROUPS_PER_USER);
+});
+
+test('group sticker chat: members only, stickers only, polling, rate limit', async () => {
+  const [kai, lou, nosy] = [await user('kai'), await user('lou'), await user('nosy')];
+  const { group } = await ok('/api/groups', { name: 'Sticker Squad' }, kai);
+  await ok('/api/groups/join', { code: group.inviteCode }, lou);
+  const chat = `/api/groups/${group.id}/messages`;
+
+  const { stickers } = await ok('/api/config');
+  assert.ok(stickers.length >= 10 && stickers.every((s) => s.id && s.emoji && s.label));
+
+  assert.equal((await call(chat, { sticker: 'crown' }, nosy)).status, 403, 'non-members cannot send');
+  assert.equal((await call(chat, null, nosy)).status, 403, 'or read');
+  assert.equal((await call(chat, { text: 'hello' }, kai)).status, 400, 'no typed messages');
+  assert.equal((await call(chat, { sticker: '<img src=x>' }, kai)).status, 400, 'unknown sticker');
+
+  const first = await ok(chat, { sticker: 'crown' }, kai);
+  assert.deepEqual([first.message.emoji, first.message.label, first.message.username, first.message.seq], ['👑', "Who's the king now", 'kai', 1]);
+  await ok(chat, { sticker: 'snail' }, lou);
+
+  const all = await ok(chat, null, lou);
+  assert.deepEqual(all.messages.map((m) => [m.username, m.sticker]), [['kai', 'crown'], ['lou', 'snail']]);
+  assert.equal(all.messages.some((m) => 'text' in m), false);
+  // Polling returns only what's new.
+  assert.deepEqual((await ok(`${chat}?after=2`, null, kai)).messages, []);
+  await ok(chat, { sticker: 'fire' }, kai);
+  assert.deepEqual((await ok(`${chat}?after=2`, null, lou)).messages.map((m) => m.sticker), ['fire']);
+
+  // Concurrent sends get unique, gap-free sequence numbers.
+  clock += 60_000;
+  await Promise.all(['eyes', 'goat', 'skull', 'egg'].map((st, i) => ok(chat, { sticker: st }, i % 2 ? kai : lou)));
+  const seqs = (await ok(chat, null, kai)).messages.map((m) => m.seq);
+  assert.deepEqual(seqs, [1, 2, 3, 4, 5, 6, 7]);
+
+  // Rate limit: 8 per 10 seconds per player.
+  clock += 60_000;
+  for (let i = 0; i < 8; i++) await ok(chat, { sticker: 'laugh' }, lou);
+  assert.equal((await call(chat, { sticker: 'laugh' }, lou)).status, 429);
+  await ok(chat, { sticker: 'cry' }, kai); // others aren't affected
+  clock += 11_000;
+  await ok(chat, { sticker: 'wave' }, lou);
+
+  // Deleting the group (last one out) deletes its chat.
+  await ok(`/api/groups/${group.id}/leave`, {}, kai);
+  await ok(`/api/groups/${group.id}/leave`, {}, lou);
+  assert.equal(await db.col.groupMessages.countDocuments({ groupId: group.id }), 0);
+});
+
 test('bad input, CORS, health and static files', async () => {
   assert.equal((await call('/api/auth/register', { username: '<script>', password: PW })).status, 400);
   const lee = await user('lee');
@@ -265,4 +416,46 @@ test('bad input, CORS, health and static files', async () => {
   assert.equal((await fetch(`${base}/..%2fbackend%2fserver.js`)).status, 404);
   assert.equal((await fetch(`${base}/photos/..%2f..%2fserver.js`)).status, 404);
   assert.equal((await fetch(`${base}/photos/${crypto.randomUUID()}.jpg`)).status, 404);
+});
+
+test('progress: rider level, daily challenge, stamps, stations and lines', async () => {
+  const quin = await user('quin');
+  const rae = await user('rae');
+  // An empty account has level 1 and nothing earned.
+  const empty = await ok('/api/me/progress', null, rae);
+  assert.equal(empty.level.level, 1);
+  assert.equal(empty.stamps.filter((s) => s.earned).length, 0);
+  assert.equal((await call('/api/me/progress')).status, 401, 'must be signed in');
+
+  // quin hides at Kenmore (Green) and Park Street (Red + Green); rae finds both, racing a train at Park Street.
+  await ok('/api/eggs', { stationId: 'test-green', level: 5, image: IMG }, quin);
+  await ok('/api/eggs', { stationId: 'test-redgreen', level: 5, image: IMG }, quin);
+  const ken = (await ok('/api/stations/test-green')).slots[4].egg.id;
+  const pk = (await ok('/api/stations/test-redgreen')).slots[4].egg.id;
+
+  const r1 = await ok('/api/attempts', { eggId: ken, mode: 'fixed' }, rae);
+  clock += 20_000;
+  const f1 = await ok(`/api/attempts/${r1.attempt.id}/find`, { image: IMG }, rae);
+  assert.equal(f1.firstFind, true, 'first to find this egg');
+
+  const r2 = await ok('/api/attempts', { eggId: pk, mode: 'train' }, rae);
+  clock += 60_000;
+  await ok(`/api/attempts/${r2.attempt.id}/find`, { image: IMG }, rae);
+
+  const p = await ok('/api/me/progress', null, rae);
+  const earned = new Set(p.stamps.filter((s) => s.earned).map((s) => s.id));
+  for (const id of ['first_find', 'transfer', 'beat_train', 'first_to_find', 'speedy', 'impossible']) {
+    assert.ok(earned.has(id), `${id} should be earned`);
+  }
+  assert.equal(earned.has('all_lines'), false);
+  assert.equal(p.stamps.find((s) => s.id === 'all_lines').progress, 2, 'Red and Green');
+  assert.equal(p.stations.length, 2);
+  assert.deepEqual(p.lines.find((l) => l.line === 'Green'), { line: 'Green', stations: 2 });
+  assert.deepEqual(p.lines.find((l) => l.line === 'Red'), { line: 'Red', stations: 1 });
+  assert.deepEqual(new Set(p.today.lines), new Set(['Green', 'Red']));
+  // 60 + 28 bonus at Kenmore, 60 + 23 bonus racing the train = 171 -> level 3 (150 to 300)
+  assert.equal(p.level.points, 171);
+  assert.deepEqual([p.level.level, p.level.floor, p.level.next], [3, 150, 300]);
+  assert.ok(['transfer', 'racer', 'climber', 'triple'].includes(p.today.id));
+  assert.equal(p.today.target >= p.today.progress, true);
 });

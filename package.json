@@ -2,6 +2,7 @@
   "name": "station-egg-hunt",
   "version": "0.2.0",
   "private": true,
+  "type": "module",
   "description": "Find hidden-in-plain-sight Easter eggs in MBTA stations. BostonHacks 2026, Transit Gamification track.",
   "workspaces": [
     "backend",

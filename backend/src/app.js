@@ -1,16 +1,17 @@
-// Station Egg Hunt API. Stateless: everything lives in Postgres, so any number
-// of instances can run behind a load balancer.
+// Station Egg Hunt API. Stateless: everything lives in MongoDB, so any number
+// of instances (or serverless functions) can serve it.
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { verifyMatch } from './verify.js';
-import { isUniqueViolation } from './db.js';
+import { isDuplicateKey } from './db.js';
 import * as game from './game.js';
 import * as slots from './slots.js';
 import * as auth from './auth.js';
 
-const MAX_BODY_BYTES = 12 * 1024 * 1024;
-const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+// Vercel functions accept request bodies up to 4.5 MB; phones send ~0.3 MB after downscaling.
+const MAX_BODY_BYTES = 4 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 2.5 * 1024 * 1024;
 const HOUSEKEEPING_EVERY_MS = 60_000;
 const SESSION_TOUCH_MS = 60 * 60_000; // refresh last_seen / expiry at most hourly
 const MIME = {
@@ -21,6 +22,14 @@ const MIME = {
   '.png': 'image/png',
   '.json': 'application/json',
 };
+// Friend groups: invite codes avoid look-alike characters (no 0/O, 1/I/L).
+const INVITE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+const INVITE_LENGTH = 8;
+export const MAX_GROUPS_PER_USER = 20;
+export const MAX_GROUP_MEMBERS = 50;
+export const CHAT_PAGE = 50;
+export const CHAT_RATE = { messages: 8, seconds: 10 };
+const GROUP_NAME_RE = /^[\p{L}\p{N} _.,'!&()-]{2,30}$/u;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuid = (v) => typeof v === 'string' && UUID_RE.test(v);
 
@@ -36,7 +45,7 @@ const fail = (status, message) => {
 
 /**
  * @param {object} opts
- * @param {ReturnType<import('./db.js').createDb>} opts.db
+ * @param {Awaited<ReturnType<import('./db.js').createDb>>} opts.db
  * @param {string|null} [opts.frontendDir] serve the web app from here too (handy for one-tunnel phone testing)
  * @param {string[]} [opts.corsOrigins] allowed browser origins, or ['*']
  */
@@ -50,6 +59,8 @@ export async function createApp({
   frontendDir = null,
   corsOrigins = ['*'],
 }) {
+  const { col, tx } = db;
+
   // ---------- stations (static list, cached per instance) ----------
   let stations = [];
   let stationById = new Map();
@@ -68,8 +79,9 @@ export async function createApp({
   const station = (id) => stationById.get(id) ?? fail(404, 'Unknown station');
   const stationName = (id) => stationById.get(id)?.name ?? id;
   const photoUrl = (id) => `/photos/${id}.jpg`;
-  const publicUser = (u) => ({ id: u.id, username: u.username, createdAt: u.created_at });
+  const publicUser = (u) => ({ id: u._id, username: u.username, createdAt: u.createdAt });
   const requireUser = (ctx) => ctx.user ?? fail(401, 'Sign in to play.');
+  const hasFound = (userId, eggId, session) => col.finds.findOne({ userId, eggId }, { session, projection: { _id: 1 } });
 
   function decodeImage(dataUrl) {
     const m = /^data:image\/(jpeg|png|webp);base64,(.+)$/s.exec(String(dataUrl ?? ''));
@@ -80,15 +92,10 @@ export async function createApp({
     return { data: buf, contentType: `image/${m[1]}` };
   }
 
-  async function savePhoto(c, { data, contentType }) {
-    const id = crypto.randomUUID();
-    await c.query('insert into photos (id, content_type, data, created_at) values ($1, $2, $3, $4)', [
-      id,
-      contentType,
-      data,
-      now(),
-    ]);
-    return id;
+  async function savePhoto(session, { data, contentType }) {
+    const _id = crypto.randomUUID();
+    await col.photos.insertOne({ _id, contentType, data, createdAt: now() }, { session });
+    return _id;
   }
 
   // Retiring stale eggs runs lazily on station reads, at most once a minute per instance.
@@ -104,53 +111,104 @@ export async function createApp({
   async function startSession(user, req) {
     const token = auth.newToken();
     const t = now();
-    await db.query(
-      `insert into sessions (id, user_id, token_hash, device, created_at, last_seen_at, expires_at)
-       values ($1, $2, $3, $4, $5, $5, $6)`,
-      [
-        crypto.randomUUID(),
-        user.id,
-        auth.hashToken(token),
-        String(req.headers['user-agent'] ?? '').slice(0, 200),
-        t,
-        new Date(t.getTime() + auth.SESSION_DAYS * 86400_000),
-      ],
-    );
+    await col.sessions.insertOne({
+      _id: crypto.randomUUID(),
+      userId: user._id,
+      tokenHash: auth.hashToken(token),
+      device: String(req.headers['user-agent'] ?? '').slice(0, 200),
+      createdAt: t,
+      lastSeenAt: t,
+      expiresAt: new Date(t.getTime() + auth.SESSION_DAYS * 86400_000),
+    });
     return { user: publicUser(user), token };
   }
 
-  // Returns { user, session } for a valid bearer token, null with no token, 401 for a bad one.
+  // Returns { user, sessionId } for a valid bearer token, null with no token, 401 for a bad one.
   async function authenticate(req) {
     const m = /^Bearer\s+(\S+)$/i.exec(req.headers.authorization ?? '');
     if (!m) return null;
     const t = now();
-    const row = await db.one(
-      `select s.id as session_id, s.last_seen_at, u.id, u.username, u.created_at
-         from sessions s join users u on u.id = s.user_id
-        where s.token_hash = $1 and s.expires_at > $2`,
-      [auth.hashToken(m[1]), t],
-    );
-    if (!row) fail(401, 'Your session has expired. Sign in again.');
-    if (t - row.last_seen_at > SESSION_TOUCH_MS) {
-      await db.query('update sessions set last_seen_at = $2, expires_at = $3 where id = $1', [
-        row.session_id,
-        t,
-        new Date(t.getTime() + auth.SESSION_DAYS * 86400_000),
-      ]);
+    const s = await col.sessions.findOne({ tokenHash: auth.hashToken(m[1]), expiresAt: { $gt: t } });
+    const user = s && (await col.users.findOne({ _id: s.userId }));
+    if (!user) fail(401, 'Your session has expired. Sign in again.');
+    if (t - s.lastSeenAt > SESSION_TOUCH_MS) {
+      await col.sessions.updateOne(
+        { _id: s._id },
+        { $set: { lastSeenAt: t, expiresAt: new Date(t.getTime() + auth.SESSION_DAYS * 86400_000) } },
+      );
     }
-    return { user: row, sessionId: row.session_id };
+    return { user, sessionId: s._id };
   }
 
-  function validateCredentials(body) {
-    const username = String(body?.username ?? '').trim();
-    const password = String(body?.password ?? '');
-    return { username, password };
+  const credentials = (body) => ({ username: String(body?.username ?? '').trim(), password: String(body?.password ?? '') });
+
+  // Points per player for the finds matching `match`, best first. Ties: more finds, then username.
+  function pointsBoard(match) {
+    return col.finds
+      .aggregate([
+        { $match: match },
+        { $group: { _id: '$userId', points: { $sum: '$points' }, finds: { $sum: 1 } } },
+        { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'u' } },
+        { $set: { username: { $first: '$u.username' } } },
+        { $sort: { points: -1, finds: -1, username: 1 } },
+        { $project: { u: 0 } },
+      ])
+      .toArray();
   }
+
+  // ---------- groups ----------
+  function groupName(raw) {
+    const name = String(raw ?? '').trim().replace(/\s+/g, ' ');
+    if (!GROUP_NAME_RE.test(name)) fail(400, 'Group name must be 2–30 letters, numbers, spaces or simple punctuation.');
+    return name;
+  }
+  const normalizeCode = (raw) => String(raw ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const publicGroup = (g, user) => ({
+    id: g._id,
+    name: g.name,
+    memberCount: g.memberCount,
+    isOwner: g.ownerId === user._id,
+    inviteCode: g.inviteCode,
+    createdAt: g.createdAt,
+  });
+
+  async function newInviteCode() {
+    for (let i = 0; i < 10; i++) {
+      const code = Array.from({ length: INVITE_LENGTH }, () => INVITE_ALPHABET[crypto.randomInt(INVITE_ALPHABET.length)]).join('');
+      if (!(await col.groups.findOne({ inviteCode: code }, { projection: { _id: 1 } }))) return code;
+    }
+    throw new Error('Could not generate a unique invite code');
+  }
+
+  // Serializes one player's group joins/creates, so the per-player limit holds under concurrency.
+  const lockUser = (session, userId) =>
+    col.locks.updateOne({ _id: `user:${userId}` }, { $inc: { v: 1 } }, { upsert: true, session });
+
+  async function checkGroupLimit(session, userId) {
+    if ((await col.groupMembers.countDocuments({ userId }, { session })) >= MAX_GROUPS_PER_USER) {
+      fail(409, `You can be in up to ${MAX_GROUPS_PER_USER} groups. Leave one first.`);
+    }
+  }
+
+  // Returns { user, g } when the signed-in player belongs to group `id`.
+  async function memberGroup(ctx, id) {
+    const user = requireUser(ctx);
+    if (!isUuid(id)) fail(404, 'Group not found');
+    const g = (await col.groups.findOne({ _id: id })) ?? fail(404, 'Group not found');
+    if (!(await col.groupMembers.findOne({ groupId: id, userId: user._id }))) fail(403, "You're not in this group.");
+    return { user, g };
+  }
+
+  // Stickers only: messages carry a sticker id from game.STICKERS, never free text.
+  const publicMessage = (m) => {
+    const s = game.stickerById.get(m.sticker);
+    return { id: m._id, seq: m.seq, userId: m.userId, username: m.username, sticker: m.sticker, emoji: s?.emoji ?? '🥚', label: s?.label ?? '', createdAt: m.createdAt };
+  };
 
   // ---------- handlers ----------
   const api = {
     async health() {
-      await db.query('select 1');
+      await db.db.command({ ping: 1 });
       return { ok: true };
     },
 
@@ -161,51 +219,53 @@ export async function createApp({
         graceSeconds: game.GRACE_SECONDS,
         maxTimeBonus: game.MAX_TIME_BONUS,
         passwordMin: auth.PASSWORD_MIN,
+        stickers: game.STICKERS,
       };
     },
 
     // ----- auth -----
     async register({ body, req }) {
-      const { username, password } = validateCredentials(body);
+      const { username, password } = credentials(body);
       if (!/^[A-Za-z0-9_. -]{2,20}$/.test(username)) {
         fail(400, 'Username must be 2–20 letters, numbers, spaces, dots, dashes or underscores.');
       }
       if (password.length < auth.PASSWORD_MIN) fail(400, `Password must be at least ${auth.PASSWORD_MIN} characters.`);
       if (password.length > auth.PASSWORD_MAX) fail(400, 'Password is too long.');
-      const user = { id: crypto.randomUUID(), username, created_at: now() };
+      const user = {
+        _id: crypto.randomUUID(),
+        username,
+        usernameLower: username.toLowerCase(),
+        passwordHash: await auth.hashPassword(password),
+        createdAt: now(),
+      };
       try {
-        await db.query('insert into users (id, username, password_hash, created_at) values ($1, $2, $3, $4)', [
-          user.id,
-          username,
-          await auth.hashPassword(password),
-          user.created_at,
-        ]);
+        await col.users.insertOne(user);
       } catch (err) {
-        if (isUniqueViolation(err)) fail(409, 'That username is taken.');
+        if (isDuplicateKey(err)) fail(409, 'That username is taken.');
         throw err;
       }
       return startSession(user, req);
     },
 
     async login({ body, req }) {
-      const { username, password } = validateCredentials(body);
+      const { username, password } = credentials(body);
       if (!username || !password || password.length > auth.PASSWORD_MAX) fail(400, 'Enter your username and password.');
-      const user = await db.one('select * from users where lower(username) = lower($1)', [username]);
-      const ok = await auth.verifyPassword(password, user?.password_hash ?? auth.DUMMY_HASH);
+      const user = await col.users.findOne({ usernameLower: username.toLowerCase() });
+      const ok = await auth.verifyPassword(password, user?.passwordHash ?? auth.DUMMY_HASH);
       if (!user || !ok) fail(401, 'Wrong username or password.');
       return startSession(user, req);
     },
 
     async logout(ctx) {
       requireUser(ctx);
-      await db.query('delete from sessions where id = $1', [ctx.sessionId]);
+      await col.sessions.deleteOne({ _id: ctx.sessionId });
       return { ok: true };
     },
 
     async logoutAll(ctx) {
       const user = requireUser(ctx);
-      const r = await db.query('delete from sessions where user_id = $1', [user.id]);
-      return { ok: true, signedOut: r.rowCount };
+      const r = await col.sessions.deleteMany({ userId: user._id });
+      return { ok: true, signedOut: r.deletedCount };
     },
 
     me(ctx) {
@@ -214,18 +274,17 @@ export async function createApp({
 
     async sessions(ctx) {
       const user = requireUser(ctx);
-      const rows = await db.many(
-        `select id, device, created_at, last_seen_at from sessions
-          where user_id = $1 and expires_at > $2 order by last_seen_at desc`,
-        [user.id, now()],
-      );
+      const rows = await col.sessions
+        .find({ userId: user._id, expiresAt: { $gt: now() } })
+        .sort({ lastSeenAt: -1 })
+        .toArray();
       return {
         sessions: rows.map((s) => ({
-          id: s.id,
+          id: s._id,
           device: s.device,
-          createdAt: s.created_at,
-          lastSeenAt: s.last_seen_at,
-          current: s.id === ctx.sessionId,
+          createdAt: s.createdAt,
+          lastSeenAt: s.lastSeenAt,
+          current: s._id === ctx.sessionId,
         })),
       };
     },
@@ -235,8 +294,8 @@ export async function createApp({
       await ensureStations();
       await housekeeping();
       const counts = new Map(
-        (await db.many(`select station_id, count(*)::int as n from eggs where status = 'active' group by station_id`)).map(
-          (r) => [r.station_id, r.n],
+        (await col.eggs.aggregate([{ $match: { status: 'active' } }, { $group: { _id: '$stationId', n: { $sum: 1 } } }]).toArray()).map(
+          (r) => [r._id, r.n],
         ),
       );
       return { stations: stations.map((s) => ({ ...s, activeEggs: counts.get(s.id) ?? 0 })) };
@@ -246,12 +305,19 @@ export async function createApp({
       await ensureStations();
       await housekeeping();
       const s = station(id);
-      const eggs = await db.many(
-        `select e.id, e.level, e.times_found, e.created_by, u.username as creator,
-                exists (select 1 from finds f where f.egg_id = e.id and f.user_id = $2::uuid) as found_by_me
-           from eggs e join users u on u.id = e.created_by
-          where e.station_id = $1 and e.status = 'active'`,
-        [id, user?.id ?? null],
+      const eggs = await col.eggs.find({ stationId: id, status: 'active' }).toArray();
+      const creators = new Map(
+        (await col.users.find({ _id: { $in: eggs.map((e) => e.createdBy) } }, { projection: { username: 1 } }).toArray()).map((u) => [
+          u._id,
+          u.username,
+        ]),
+      );
+      const foundByMe = new Set(
+        user
+          ? (await col.finds.find({ userId: user._id, eggId: { $in: eggs.map((e) => e._id) } }, { projection: { eggId: 1 } }).toArray()).map(
+              (f) => f.eggId,
+            )
+          : [],
       );
       const byLevel = new Map(eggs.map((e) => [e.level, e]));
       const slotsOut = game.LEVELS.map((l) => {
@@ -260,11 +326,11 @@ export async function createApp({
           ...l,
           egg: egg
             ? {
-                id: egg.id,
-                timesFound: egg.times_found,
-                createdBy: egg.creator,
-                mine: egg.created_by === user?.id,
-                foundByMe: egg.found_by_me,
+                id: egg._id,
+                timesFound: egg.timesFound,
+                createdBy: creators.get(egg.createdBy) ?? 'someone',
+                mine: egg.createdBy === user?._id,
+                foundByMe: foundByMe.has(egg._id),
               }
             : null,
         };
@@ -286,50 +352,44 @@ export async function createApp({
       requireUser(ctx);
       const [id] = ctx.params;
       if (!isUuid(id)) fail(404, 'Unknown player');
-      const user = (await db.one('select * from users where id = $1', [id])) ?? fail(404, 'Unknown player');
+      const user = (await col.users.findOne({ _id: id })) ?? fail(404, 'Unknown player');
       const month = game.monthKey(now());
-      const totals = await db.one(
-        `select coalesce(sum(points), 0)::int as all_time,
-                coalesce(sum(points) filter (where month = $2), 0)::int as month
-           from finds where user_id = $1`,
-        [id, month],
-      );
-      const rank = await db.one(
-        `with t as (select user_id, sum(points) as p, count(*) as n from finds where month = $1 group by user_id)
-         select r from (select t.user_id, row_number() over (order by t.p desc, t.n desc, u.username) as r
-                          from t join users u on u.id = t.user_id) x
-          where user_id = $2`,
-        [month, id],
-      );
+      const [totals] = await col.finds
+        .aggregate([
+          { $match: { userId: id } },
+          {
+            $group: {
+              _id: null,
+              allTime: { $sum: '$points' },
+              month: { $sum: { $cond: [{ $eq: ['$month', month] }, '$points', 0] } },
+            },
+          },
+        ])
+        .toArray();
+      const board = await pointsBoard({ month });
+      const rankIndex = board.findIndex((r) => r._id === id);
       const findsByLevel = Object.fromEntries(game.LEVELS.map((l) => [l.name, 0]));
-      for (const r of await db.many('select level, count(*)::int as n from finds where user_id = $1 group by level', [id])) {
-        findsByLevel[game.levelInfo(r.level).name] = r.n;
+      for (const r of await col.finds.aggregate([{ $match: { userId: id } }, { $group: { _id: '$level', n: { $sum: 1 } } }]).toArray()) {
+        findsByLevel[game.levelInfo(r._id).name] = r.n;
       }
-      const hidden = await db.one(
-        `select (select count(*)::int from eggs where created_by = $1) as eggs_hidden,
-                (select count(*)::int from finds f join eggs e on e.id = f.egg_id where e.created_by = $1) as found`,
-        [id],
-      );
-      const recent = await db.many(
-        'select * from finds where user_id = $1 order by found_at desc, id desc limit 10',
-        [id],
-      );
+      const myEggIds = (await col.eggs.find({ createdBy: id }, { projection: { _id: 1 } }).toArray()).map((e) => e._id);
+      const recent = await col.finds.find({ userId: id }).sort({ foundAt: -1, _id: -1 }).limit(10).toArray();
       return {
         user: publicUser(user),
-        monthPoints: totals.month,
-        allTimePoints: totals.all_time,
-        monthRank: rank ? Number(rank.r) : null,
+        monthPoints: totals?.month ?? 0,
+        allTimePoints: totals?.allTime ?? 0,
+        monthRank: rankIndex >= 0 ? rankIndex + 1 : null,
         findsByLevel,
-        eggsHidden: hidden.eggs_hidden,
-        timesYourEggsWereFound: hidden.found,
+        eggsHidden: myEggIds.length,
+        timesYourEggsWereFound: myEggIds.length ? await col.finds.countDocuments({ eggId: { $in: myEggIds } }) : 0,
         recentFinds: recent.map((f) => ({
-          id: f.id,
-          stationName: stationName(f.station_id),
+          id: f._id,
+          stationName: stationName(f.stationId),
           level: f.level,
           levelName: game.levelInfo(f.level).name,
           points: f.points,
-          foundAt: f.found_at,
-          photoUrl: photoUrl(f.photo_id),
+          foundAt: f.foundAt,
+          photoUrl: photoUrl(f.photoId),
           verified: f.verified,
         })),
       };
@@ -339,12 +399,10 @@ export async function createApp({
       const user = requireUser(ctx);
       const { body } = ctx;
       if (!isUuid(body?.eggId)) fail(404, 'Egg not found');
-      const egg = (await db.one('select * from eggs where id = $1', [body.eggId])) ?? fail(404, 'Egg not found');
+      const egg = (await col.eggs.findOne({ _id: body.eggId })) ?? fail(404, 'Egg not found');
       if (egg.status !== 'active') fail(409, 'That egg was just swapped out. Pick another.');
-      if (egg.created_by === user.id) fail(403, "You hid this one, so you can't play it.");
-      if (await db.one('select 1 from finds where user_id = $1 and egg_id = $2', [user.id, egg.id])) {
-        fail(409, 'You already found this egg.');
-      }
+      if (egg.createdBy === user._id) fail(403, "You hid this one, so you can't play it.");
+      if (await hasFound(user._id, egg._id)) fail(409, 'You already found this egg.');
 
       const info = game.levelInfo(egg.level);
       let limitSeconds = info.seconds;
@@ -352,7 +410,7 @@ export async function createApp({
       let train = null;
       if (body?.mode === 'train') {
         try {
-          const trains = await mbta.predictions(egg.station_id);
+          const trains = await mbta.predictions(egg.stationId);
           train = trains.find((t) => t.seconds >= game.TRAIN_MIN_SECONDS && t.seconds <= game.TRAIN_MAX_SECONDS) ?? null;
           if (train) {
             limitSeconds = train.seconds;
@@ -364,22 +422,26 @@ export async function createApp({
       }
 
       const attemptId = crypto.randomUUID();
-      await db.query(
-        `insert into attempts (id, user_id, egg_id, started_at, limit_seconds, limit_source, status)
-         values ($1, $2, $3, $4, $5, $6, 'open')`,
-        [attemptId, user.id, egg.id, now(), limitSeconds, limitSource],
-      );
+      await col.attempts.insertOne({
+        _id: attemptId,
+        userId: user._id,
+        eggId: egg._id,
+        startedAt: now(),
+        limitSeconds,
+        limitSource,
+        status: 'open',
+      });
       return {
         attempt: { id: attemptId, limitSeconds, limitSource, secondsLeft: limitSeconds, train },
         egg: {
-          id: egg.id,
+          id: egg._id,
           level: egg.level,
           levelName: info.name,
           points: info.points,
           hint: egg.hint,
-          imageUrl: photoUrl(egg.photo_id),
-          stationId: egg.station_id,
-          stationName: stationName(egg.station_id),
+          imageUrl: photoUrl(egg.photoId),
+          stationId: egg.stationId,
+          stationName: stationName(egg.stationId),
         },
       };
     },
@@ -388,22 +450,20 @@ export async function createApp({
       const user = requireUser(ctx);
       const [attemptId] = ctx.params;
       if (!isUuid(attemptId)) fail(404, 'Round not found');
-      const attempt = (await db.one('select * from attempts where id = $1', [attemptId])) ?? fail(404, 'Round not found');
-      if (attempt.user_id !== user.id) fail(403, 'Not your round');
+      const attempt = (await col.attempts.findOne({ _id: attemptId })) ?? fail(404, 'Round not found');
+      if (attempt.userId !== user._id) fail(403, 'Not your round');
       if (attempt.status !== 'open') fail(409, `This round is already ${attempt.status}.`);
-      const egg = (await db.one('select * from eggs where id = $1', [attempt.egg_id])) ?? fail(404, 'Egg not found');
-      if (await db.one('select 1 from finds where user_id = $1 and egg_id = $2', [user.id, egg.id])) {
-        fail(409, 'You already found this egg.');
-      }
+      const egg = (await col.eggs.findOne({ _id: attempt.eggId })) ?? fail(404, 'Egg not found');
+      if (await hasFound(user._id, egg._id)) fail(409, 'You already found this egg.');
 
-      const elapsed = (now() - attempt.started_at) / 1000;
-      if (elapsed > attempt.limit_seconds + game.GRACE_SECONDS) {
-        await db.query(`update attempts set status = 'expired' where id = $1 and status = 'open'`, [attempt.id]);
+      const elapsed = (now() - attempt.startedAt) / 1000;
+      if (elapsed > attempt.limitSeconds + game.GRACE_SECONDS) {
+        await col.attempts.updateOne({ _id: attempt._id, status: 'open' }, { $set: { status: 'expired' } });
         return { status: 'expired' };
       }
 
       const candidate = decodeImage(ctx.body?.image);
-      const original = await db.one('select data from photos where id = $1', [egg.photo_id]);
+      const original = await col.photos.findOne({ _id: egg.photoId }, { promoteBuffers: true });
       // The (slow) photo check runs outside any transaction.
       const verification = await verify({
         originalJpeg: original.data,
@@ -411,39 +471,53 @@ export async function createApp({
         apiKey: geminiKey,
         model: geminiModel,
       });
-      const secondsLeft = Math.max(0, Math.round(attempt.limit_seconds - elapsed));
+      const secondsLeft = Math.max(0, Math.round(attempt.limitSeconds - elapsed));
       if (!verification.match) return { status: 'no_match', reason: verification.reason, secondsLeft };
 
-      const secondsTaken = Math.min(elapsed, attempt.limit_seconds);
-      const score = game.scoreFind(egg.level, secondsTaken, attempt.limit_seconds);
+      const secondsTaken = Math.min(elapsed, attempt.limitSeconds);
+      const score = game.scoreFind(egg.level, secondsTaken, attempt.limitSeconds);
       const findId = crypto.randomUUID();
       const t = now();
-      await db.tx(async (c) => {
-        await slots.lockSlot(c, egg.station_id, egg.level);
-        // Re-check under lock: the same round may have been submitted from another tab.
-        const locked = await c.one('select status from attempts where id = $1 for update', [attempt.id]);
-        if (locked.status !== 'open') fail(409, `This round is already ${locked.status}.`);
-        const photoId = await savePhoto(c, candidate);
+      let firstFind = false;
+      await tx(async (session) => {
+        await slots.lockSlot(col, session, egg.stationId, egg.level);
+        // Closing the round atomically means a round submitted twice (two tabs) scores once.
+        const closed = await col.attempts.findOneAndUpdate(
+          { _id: attempt._id, status: 'open' },
+          { $set: { status: 'found' } },
+          { session },
+        );
+        if (!closed) fail(409, 'This round is already finished.');
+        const photoId = await savePhoto(session, candidate);
         try {
-          await c.query(
-            `insert into finds (id, egg_id, user_id, station_id, level, found_at, month, seconds_taken,
-                                points, base, bonus, photo_id, verified, can_hide)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, true)`,
-            [findId, egg.id, user.id, egg.station_id, egg.level, t, game.monthKey(t), Math.round(secondsTaken),
-              score.total, score.base, score.bonus, photoId, verification.method === 'gemini'],
+          await col.finds.insertOne(
+            {
+              _id: findId,
+              eggId: egg._id,
+              userId: user._id,
+              stationId: egg.stationId,
+              level: egg.level,
+              foundAt: t,
+              month: game.monthKey(t),
+              secondsTaken: Math.round(secondsTaken),
+              points: score.total,
+              base: score.base,
+              bonus: score.bonus,
+              photoId,
+              verified: verification.method === 'gemini',
+              canHide: true,
+            },
+            { session },
           );
         } catch (err) {
-          if (isUniqueViolation(err)) fail(409, 'You already found this egg.');
+          if (isDuplicateKey(err)) fail(409, 'You already found this egg.');
           throw err;
         }
-        const fresh = await c.one(
-          `update eggs set avg_find_seconds = round((coalesce(avg_find_seconds, 0) * times_found + $2)::numeric / (times_found + 1)),
-                           times_found = times_found + 1
-            where id = $1 returning *`,
-          [egg.id, Math.round(secondsTaken)],
-        );
-        await c.query(`update attempts set status = 'found' where id = $1`, [attempt.id]);
-        if (fresh.status === 'active') await slots.rotateAfterFind(c, fresh, user.id, t);
+        const fresh = await col.eggs.findOne({ _id: egg._id }, { session });
+        const avg = Math.round(((fresh.avgFindSeconds ?? 0) * fresh.timesFound + Math.round(secondsTaken)) / (fresh.timesFound + 1));
+        await col.eggs.updateOne({ _id: egg._id }, { $set: { avgFindSeconds: avg }, $inc: { timesFound: 1 } }, { session });
+        firstFind = fresh.timesFound === 0; // read under the slot lock, before this find was counted
+        if (fresh.status === 'active') await slots.rotateAfterFind(col, session, fresh, user._id, t);
       });
       return {
         status: 'found',
@@ -451,8 +525,9 @@ export async function createApp({
         points: score,
         secondsTaken: Math.round(secondsTaken),
         verification,
-        stationId: egg.station_id,
+        stationId: egg.stationId,
         level: egg.level,
+        firstFind,
       };
     },
 
@@ -468,23 +543,23 @@ export async function createApp({
       const t = now();
       const eggId = crypto.randomUUID();
 
-      await db.tx(async (c) => {
-        await slots.lockSlot(c, s.id, level);
+      await tx(async (session) => {
+        await slots.lockSlot(col, session, s.id, level);
         if (body?.findId) {
           if (!isUuid(body.findId)) fail(404, 'Find not found');
-          const find = (await c.one('select * from finds where id = $1 for update', [body.findId])) ?? fail(404, 'Find not found');
-          if (find.user_id !== user.id) fail(403, 'Not your find');
-          if (!find.can_hide) fail(409, 'You already hid an egg for this find.');
-          if (find.station_id !== s.id || find.level !== level) {
+          const find = (await col.finds.findOne({ _id: body.findId }, { session })) ?? fail(404, 'Find not found');
+          if (find.userId !== user._id) fail(403, 'Not your find');
+          if (!find.canHide) fail(409, 'You already hid an egg for this find.');
+          if (find.stationId !== s.id || find.level !== level) {
             fail(400, 'The new egg must be at the same station and level as the one you found.');
           }
-          if ((t - find.found_at) / 60000 > game.HIDE_WINDOW_MINUTES) fail(409, 'Too long since your find to hide the next egg.');
-          await c.query('update finds set can_hide = false where id = $1', [find.id]);
-        } else if (await slots.activeEgg(c, s.id, level)) {
+          if ((t - find.foundAt) / 60000 > game.HIDE_WINDOW_MINUTES) fail(409, 'Too long since your find to hide the next egg.');
+          await col.finds.updateOne({ _id: find._id }, { $set: { canHide: false } }, { session });
+        } else if (await slots.activeEgg(col, session, s.id, level)) {
           fail(409, 'This level already has an egg. Find it first to earn the right to hide the next one.');
         }
-        const photoId = await savePhoto(c, image);
-        await slots.placeEgg(c, { id: eggId, stationId: s.id, level, photoId, hint, createdBy: user.id }, t);
+        const photoId = await savePhoto(session, image);
+        await slots.placeEgg(col, session, { _id: eggId, stationId: s.id, level, photoId, hint, createdBy: user._id }, t);
       });
       return { egg: { id: eggId, stationId: s.id, level } };
     },
@@ -494,21 +569,256 @@ export async function createApp({
       const [eggId] = ctx.params;
       if (!isUuid(eggId)) fail(404, 'Egg not found');
       const reason = ['cant_find', 'unsafe', 'person', 'other'].includes(ctx.body?.reason) ? ctx.body.reason : 'other';
-      const first = (await db.one('select station_id, level from eggs where id = $1', [eggId])) ?? fail(404, 'Egg not found');
+      const first = (await col.eggs.findOne({ _id: eggId })) ?? fail(404, 'Egg not found');
       const t = now();
-      return db.tx(async (c) => {
-        await slots.lockSlot(c, first.station_id, first.level);
-        const egg = await c.one('select * from eggs where id = $1', [eggId]);
-        await c.query(
-          `insert into reports (id, egg_id, user_id, reason, created_at) values ($1, $2, $3, $4, $5)
-           on conflict (egg_id, user_id) do nothing`,
-          [crypto.randomUUID(), eggId, user.id, reason, t],
+      return tx(async (session) => {
+        await slots.lockSlot(col, session, first.stationId, first.level);
+        const egg = await col.eggs.findOne({ _id: eggId }, { session });
+        // Upsert so a player's repeat report doesn't count twice.
+        await col.reports.updateOne(
+          { eggId, userId: user._id },
+          { $setOnInsert: { _id: crypto.randomUUID(), reason, createdAt: t } },
+          { upsert: true, session },
         );
-        const { n } = await c.one('select count(*)::int as n from reports where egg_id = $1', [eggId]);
+        const n = await col.reports.countDocuments({ eggId }, { session });
         const retired = n >= game.REPORTS_TO_RETIRE && egg.status !== 'retired';
-        if (retired) await slots.retireEgg(c, egg, t);
+        if (retired) await slots.retireEgg(col, session, egg, t);
         return { reports: n, retired };
       });
+    },
+
+    // Rider level, today's challenge, stamps, and the stations and lines you've found eggs on.
+    // All derived from finds, attempts and eggs: nothing extra is stored.
+    async progress(ctx) {
+      const user = requireUser(ctx);
+      await ensureStations();
+      const today = game.dayKey(now());
+      const finds = await col.finds.find({ userId: user._id }).sort({ foundAt: 1, _id: 1 }).toArray();
+      const eggIds = [...new Set(finds.map((f) => f.eggId))];
+      // Whether each find was the first ever on its egg (earliest foundAt, then _id).
+      const firstByEgg = new Map(
+        (await col.finds
+          .aggregate([
+            { $match: { eggId: { $in: eggIds } } },
+            { $sort: { foundAt: 1, _id: 1 } },
+            { $group: { _id: '$eggId', first: { $first: '$_id' } } },
+          ])
+          .toArray()).map((r) => [r._id, r.first]),
+      );
+      // Finds made while racing a train.
+      const raced = new Set(
+        (await col.attempts
+          .find({ userId: user._id, status: 'found', limitSource: 'train' }, { projection: { eggId: 1 } })
+          .toArray()).map((a) => a.eggId),
+      );
+      const hidden = await col.eggs.countDocuments({ createdBy: user._id });
+      const isFirst = (f) => firstByEgg.get(f.eggId) === f._id;
+      const isRaced = (f) => raced.has(f.eggId);
+
+      const families = (stationId) => [...new Set((stationById.get(stationId)?.lines ?? []).map((l) => game.lineFamily(l.id)))];
+      const allLines = new Set();
+      const linesByDay = new Map();
+      const byStation = new Map();
+      let allTime = 0;
+      for (const f of finds) {
+        allTime += f.points;
+        const day = game.dayKey(f.foundAt);
+        const fams = families(f.stationId);
+        fams.forEach((x) => allLines.add(x));
+        if (!linesByDay.has(day)) linesByDay.set(day, new Set());
+        fams.forEach((x) => linesByDay.get(day).add(x));
+        const st = byStation.get(f.stationId) ?? { finds: 0, points: 0, firstFoundAt: f.foundAt };
+        st.finds += 1;
+        st.points += f.points;
+        byStation.set(f.stationId, st);
+      }
+      const todays = finds.filter((f) => game.dayKey(f.foundAt) === today);
+      const mostLinesInADay = Math.max(0, ...[...linesByDay.values()].map((x) => x.size));
+      const mainLinesFound = game.MAIN_LINES.filter((x) => allLines.has(x)).length;
+
+      const stamp = (id, name, description, target, n) => ({ id, name, description, target, progress: Math.min(target, n), earned: n >= target });
+      const stamps = [
+        stamp('first_find', 'First find', 'Find your first egg.', 1, finds.length),
+        stamp('transfer', 'Transfer', 'Find eggs on 2 lines in one day.', 2, mostLinesInADay),
+        stamp('beat_train', 'Beat the train', 'Find an egg while racing a train.', 1, finds.filter(isRaced).length),
+        stamp('first_to_find', 'First', 'Be the first to find an egg.', 1, finds.filter(isFirst).length),
+        stamp('speedy', '30 s', 'Find an egg in 30 seconds or less.', 1, finds.filter((f) => f.secondsTaken <= 30).length),
+        stamp('impossible', 'Impossible', 'Find a level 5 egg.', 1, finds.filter((f) => f.level === 5).length),
+        stamp('all_lines', '4 lines', 'Find eggs on the Red, Orange, Blue and Green lines.', 4, mainLinesFound),
+        stamp('hider', 'Hider', 'Hide 5 eggs.', 5, hidden),
+        stamp('ten_finds', '10 finds', 'Find 10 eggs.', 10, finds.length),
+      ];
+
+      const ch = game.challengeFor(today);
+      const todayLines = [...new Set(todays.flatMap((f) => families(f.stationId)))];
+      const measure = {
+        transfer: todayLines.length,
+        racer: todays.filter(isRaced).length,
+        climber: todays.filter((f) => f.level >= 3).length,
+        triple: todays.length,
+      }[ch.id];
+
+      return {
+        level: game.riderLevel(allTime),
+        today: { day: today, ...ch, progress: Math.min(ch.target, measure), done: measure >= ch.target, lines: todayLines },
+        stamps,
+        stations: [...byStation]
+          .map(([id, st]) => ({ stationId: id, name: stationName(id), lines: families(id), finds: st.finds, points: st.points, firstFoundAt: st.firstFoundAt }))
+          .sort((a, b) => a.firstFoundAt - b.firstFoundAt),
+        lines: game.MAIN_LINES.map((line) => ({ line, stations: [...byStation.keys()].filter((id) => families(id).includes(line)).length })),
+      };
+    },
+
+    // ----- friend groups -----
+    async groups(ctx) {
+      const user = requireUser(ctx);
+      const memberships = await col.groupMembers.find({ userId: user._id }).sort({ joinedAt: 1 }).toArray();
+      const groups = new Map(
+        (await col.groups.find({ _id: { $in: memberships.map((m) => m.groupId) } }).toArray()).map((g) => [g._id, g]),
+      );
+      return {
+        groups: memberships.map((m) => groups.get(m.groupId)).filter(Boolean).map((g) => publicGroup(g, user)),
+        limits: { groups: MAX_GROUPS_PER_USER, members: MAX_GROUP_MEMBERS },
+      };
+    },
+
+    async createGroup(ctx) {
+      const user = requireUser(ctx);
+      const name = groupName(ctx.body?.name);
+      const g = { _id: crypto.randomUUID(), name, ownerId: user._id, inviteCode: await newInviteCode(), memberCount: 1, createdAt: now() };
+      await tx(async (session) => {
+        await lockUser(session, user._id);
+        await checkGroupLimit(session, user._id);
+        await col.groups.insertOne(g, { session });
+        await col.groupMembers.insertOne({ _id: crypto.randomUUID(), groupId: g._id, userId: user._id, joinedAt: g.createdAt }, { session });
+      });
+      return { group: publicGroup(g, user) };
+    },
+
+    // What an invite link points to, so the join screen can show the group's name first.
+    async groupInvite(ctx) {
+      const user = requireUser(ctx);
+      const code = normalizeCode(ctx.params[0]);
+      const g = (code.length === INVITE_LENGTH && (await col.groups.findOne({ inviteCode: code }))) || fail(404, 'That invite link is not valid. Ask for a new one.');
+      const member = await col.groupMembers.findOne({ groupId: g._id, userId: user._id });
+      return {
+        group: { id: g._id, name: g.name, memberCount: g.memberCount, full: g.memberCount >= MAX_GROUP_MEMBERS },
+        alreadyMember: Boolean(member),
+      };
+    },
+
+    async joinGroup(ctx) {
+      const user = requireUser(ctx);
+      const code = normalizeCode(ctx.body?.code);
+      const g = (code.length === INVITE_LENGTH && (await col.groups.findOne({ inviteCode: code }))) || fail(404, 'No group has that invite code.');
+      await tx(async (session) => {
+        await lockUser(session, user._id);
+        if (await col.groupMembers.findOne({ groupId: g._id, userId: user._id }, { session })) return; // already in
+        await checkGroupLimit(session, user._id);
+        // Counting atomically on the group document keeps the size limit under concurrent joins.
+        const r = await col.groups.updateOne({ _id: g._id, memberCount: { $lt: MAX_GROUP_MEMBERS } }, { $inc: { memberCount: 1 } }, { session });
+        if (!r.matchedCount) {
+          const exists = await col.groups.findOne({ _id: g._id }, { session });
+          fail(exists ? 409 : 404, exists ? `This group is full (${MAX_GROUP_MEMBERS} players).` : 'That group no longer exists.');
+        }
+        await col.groupMembers.insertOne({ _id: crypto.randomUUID(), groupId: g._id, userId: user._id, joinedAt: now() }, { session });
+      });
+      return { group: publicGroup(await col.groups.findOne({ _id: g._id }), user) };
+    },
+
+    async group(ctx) {
+      const [id] = ctx.params;
+      const { user, g } = await memberGroup(ctx, id);
+      const period = ctx.query.get('period') === 'all' ? 'all' : 'month';
+      const month = game.monthKey(now());
+      const memberIds = (await col.groupMembers.find({ groupId: id }).sort({ joinedAt: 1 }).toArray()).map((m) => m.userId);
+      const board = await pointsBoard(period === 'all' ? { userId: { $in: memberIds } } : { month, userId: { $in: memberIds } });
+      // Members who haven't scored are listed too (unranked), so everyone sees who's in.
+      const scored = new Set(board.map((r) => r._id));
+      const idle = (await col.users.find({ _id: { $in: memberIds.filter((m) => !scored.has(m)) } }, { projection: { username: 1 } }).toArray())
+        .map((u) => ({ _id: u._id, username: u.username, points: 0, finds: 0 }))
+        .sort((a, b) => a.username.localeCompare(b.username));
+      return {
+        group: publicGroup(g, user),
+        period,
+        month,
+        rows: [...board, ...idle].map((r, i) => ({
+          userId: r._id,
+          username: r.username,
+          points: r.points,
+          finds: r.finds,
+          rank: r.points > 0 ? i + 1 : null,
+          isOwner: r._id === g.ownerId,
+        })),
+      };
+    },
+
+    async renameGroup(ctx) {
+      const [id] = ctx.params;
+      const { user, g } = await memberGroup(ctx, id);
+      if (g.ownerId !== user._id) fail(403, 'Only the group owner can rename it.');
+      const name = groupName(ctx.body?.name);
+      await col.groups.updateOne({ _id: id }, { $set: { name } });
+      return { group: publicGroup({ ...g, name }, user) };
+    },
+
+    // Leaving hands ownership to the longest-standing member; the last one out deletes the group.
+    async leaveGroup(ctx) {
+      const user = requireUser(ctx);
+      const [id] = ctx.params;
+      if (!isUuid(id)) fail(404, 'Group not found');
+      return tx(async (session) => {
+        const g = await col.groups.findOneAndUpdate({ _id: id }, { $inc: { memberCount: -1 } }, { session, returnDocument: 'after' });
+        if (!g) fail(404, 'Group not found');
+        const left = await col.groupMembers.deleteOne({ groupId: id, userId: user._id }, { session });
+        if (!left.deletedCount) fail(403, "You're not in this group.");
+        if (g.memberCount <= 0) {
+          await col.groups.deleteOne({ _id: id }, { session });
+          await col.groupMessages.deleteMany({ groupId: id }, { session });
+          return { left: true, deleted: true };
+        }
+        if (g.ownerId === user._id) {
+          const heir = await col.groupMembers.find({ groupId: id }, { session }).sort({ joinedAt: 1, _id: 1 }).limit(1).next();
+          await col.groups.updateOne({ _id: id }, { $set: { ownerId: heir.userId } }, { session });
+        }
+        return { left: true, deleted: false };
+      });
+    },
+
+    // ----- group chat (stickers only) -----
+    // Without ?after: the latest CHAT_PAGE messages. With ?after=<seq>: only newer ones (for polling).
+    async groupMessages(ctx) {
+      const [id] = ctx.params;
+      await memberGroup(ctx, id);
+      const after = Number(ctx.query.get('after'));
+      const rows = Number.isInteger(after) && after >= 0
+        ? await col.groupMessages.find({ groupId: id, seq: { $gt: after } }).sort({ seq: 1 }).limit(CHAT_PAGE).toArray()
+        : (await col.groupMessages.find({ groupId: id }).sort({ seq: -1 }).limit(CHAT_PAGE).toArray()).reverse();
+      return { messages: rows.map(publicMessage) };
+    },
+
+    async sendGroupMessage(ctx) {
+      const [id] = ctx.params;
+      const { user } = await memberGroup(ctx, id);
+      const sticker = game.stickerById.get(String(ctx.body?.sticker ?? ''));
+      if (!sticker) fail(400, 'Pick one of the stickers.');
+      const t = now();
+      const recent = await col.groupMessages.countDocuments({
+        groupId: id,
+        userId: user._id,
+        createdAt: { $gt: new Date(t.getTime() - CHAT_RATE.seconds * 1000) },
+      });
+      if (recent >= CHAT_RATE.messages) fail(429, 'Easy there! Wait a few seconds before the next sticker.');
+      // The per-group counter runs in the same transaction as the insert, so messages
+      // commit in seq order and a poller using ?after=<seq> never skips one.
+      const message = await tx(async (session) => {
+        const g = await col.groups.findOneAndUpdate({ _id: id }, { $inc: { msgSeq: 1 } }, { session, returnDocument: 'after' });
+        if (!g) fail(404, 'Group not found');
+        const m = { _id: crypto.randomUUID(), groupId: id, seq: g.msgSeq, userId: user._id, username: user.username, sticker: sticker.id, createdAt: t };
+        await col.groupMessages.insertOne(m, { session });
+        return m;
+      });
+      return { message: publicMessage(message) };
     },
 
     async leaderboard({ query }) {
@@ -516,29 +826,18 @@ export async function createApp({
       const month = query.get('month') || game.monthKey(now());
       if (!/^\d{4}-\d{2}$/.test(month)) fail(400, 'Month must look like 2026-11.');
       const stationId = query.get('stationId') || null;
-      const rows = await db.many(
-        `select f.user_id, u.username, sum(f.points)::int as points, count(*)::int as finds
-           from finds f join users u on u.id = f.user_id
-          where f.month = $1 and ($2::text is null or f.station_id = $2)
-          group by f.user_id, u.username
-          order by points desc, finds desc, u.username
-          limit 50`,
-        [month, stationId],
-      );
-      const byStation = await db.many(
-        `select station_id, sum(points)::int as points from finds
-          where month = $1 and ($2::text is null or station_id = $2) group by station_id`,
-        [month, stationId],
-      );
+      const match = stationId ? { month, stationId } : { month };
+      const board = await pointsBoard(match);
+      const byStation = await col.finds.aggregate([{ $match: match }, { $group: { _id: '$stationId', points: { $sum: '$points' } } }]).toArray();
       const lineTotals = new Map();
       for (const r of byStation) {
-        const families = new Set((stationById.get(r.station_id)?.lines ?? []).map((l) => game.lineFamily(l.id)));
+        const families = new Set((stationById.get(r._id)?.lines ?? []).map((l) => game.lineFamily(l.id)));
         for (const fam of families) lineTotals.set(fam, (lineTotals.get(fam) ?? 0) + r.points);
       }
       return {
         month,
         stationId,
-        rows: rows.map((r, i) => ({ userId: r.user_id, username: r.username, points: r.points, finds: r.finds, rank: i + 1 })),
+        rows: board.slice(0, 50).map((r, i) => ({ userId: r._id, username: r.username, points: r.points, finds: r.finds, rank: i + 1 })),
         lines: [...lineTotals].map(([line, points]) => ({ line, points })).sort((a, b) => b.points - a.points),
       };
     },
@@ -563,7 +862,17 @@ export async function createApp({
     ['POST', /^\/api\/attempts\/([^/]+)\/find$/, api.submitFind, 'optional'],
     ['POST', /^\/api\/eggs$/, api.createEgg, 'optional'],
     ['POST', /^\/api\/eggs\/([^/]+)\/report$/, api.reportEgg, 'optional'],
+    ['GET', /^\/api\/me\/progress$/, api.progress, 'optional'],
     ['GET', /^\/api\/leaderboard$/, api.leaderboard, 'none'],
+    ['GET', /^\/api\/groups$/, api.groups, 'optional'],
+    ['POST', /^\/api\/groups$/, api.createGroup, 'optional'],
+    ['POST', /^\/api\/groups\/join$/, api.joinGroup, 'optional'],
+    ['GET', /^\/api\/groups\/invite\/([^/]+)$/, api.groupInvite, 'optional'],
+    ['GET', /^\/api\/groups\/([^/]+)$/, api.group, 'optional'],
+    ['POST', /^\/api\/groups\/([^/]+)\/rename$/, api.renameGroup, 'optional'],
+    ['POST', /^\/api\/groups\/([^/]+)\/leave$/, api.leaveGroup, 'optional'],
+    ['GET', /^\/api\/groups\/([^/]+)\/messages$/, api.groupMessages, 'optional'],
+    ['POST', /^\/api\/groups\/([^/]+)\/messages$/, api.sendGroupMessage, 'optional'],
   ];
 
   function corsHeaders(req) {
@@ -604,11 +913,11 @@ export async function createApp({
 
       const photo = /^\/photos\/([0-9a-f-]{36})\.jpg$/i.exec(pathname);
       if (photo) {
-        const row = isUuid(photo[1]) && (await db.one('select content_type, data from photos where id = $1', [photo[1]]));
+        const row = isUuid(photo[1]) && (await col.photos.findOne({ _id: photo[1] }, { promoteBuffers: true }));
         if (!row) fail(404, 'Photo not found');
         res.writeHead(200, {
           ...cors,
-          'content-type': row.content_type,
+          'content-type': row.contentType,
           // Photos never change, so browsers and CDNs can keep them.
           'cache-control': 'public, max-age=31536000, immutable',
         });
