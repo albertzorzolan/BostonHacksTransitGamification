@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { verifyMatch } from './verify.js';
+import { verifyMatch, checkGemini } from './verify.js';
 import { isDuplicateKey } from './db.js';
 import * as game from './game.js';
 import * as slots from './slots.js';
@@ -207,9 +207,11 @@ export async function createApp({
 
   // ---------- handlers ----------
   const api = {
-    async health() {
+    // ?gemini=1 also checks that the photo-check model is reachable with the configured key.
+    async health({ query }) {
       await db.db.command({ ping: 1 });
-      return { ok: true };
+      if (query.get('gemini') !== '1') return { ok: true };
+      return { ok: true, ...(await checkGemini({ apiKey: geminiKey, model: geminiModel })) };
     },
 
     config() {
@@ -468,11 +470,16 @@ export async function createApp({
       const verification = await verify({
         originalJpeg: original.data,
         candidateJpeg: candidate.data,
+        originalType: original.contentType,
+        candidateType: candidate.contentType,
         apiKey: geminiKey,
         model: geminiModel,
       });
       const secondsLeft = Math.max(0, Math.round(attempt.limitSeconds - elapsed));
-      if (!verification.match) return { status: 'no_match', reason: verification.reason, secondsLeft };
+      // Failed check: nothing is saved and the round stays open, so the player can look again.
+      if (!verification.match) {
+        return { status: 'no_match', verdict: 'failed', reason: verification.reason, unavailable: Boolean(verification.unavailable), secondsLeft };
+      }
 
       const secondsTaken = Math.min(elapsed, attempt.limitSeconds);
       const score = game.scoreFind(egg.level, secondsTaken, attempt.limitSeconds);

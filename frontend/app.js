@@ -819,12 +819,14 @@ function viewPlay() {
     if (!file) return;
     const status = $('#status');
     $('#snap').hidden = true;
-    status.innerHTML = `<div class="notice row"><div class="spin" aria-hidden="true"></div>${state.config?.gemini ? 'Checking your photo against the egg' : 'Saving your find'}</div>`;
+    status.innerHTML = `<div class="notice row"><div class="spin" aria-hidden="true"></div>${state.config?.gemini ? 'Checking it is the same object as the egg' : 'Saving your find'}</div>`;
     try {
       const image = await photoToJpeg(file);
       const result = await api(`/api/attempts/${attempt.id}/find`, { image });
       if (result.status === 'no_match') {
-        status.innerHTML = `<div class="notice bad"><b>Not a match.</b> ${esc(result.reason)} Keep looking.</div>`;
+        status.innerHTML = result.unavailable
+          ? `<div class="notice bad"><b>Photo check failed.</b> ${esc(result.reason)} Your timer is still running.</div>`
+          : `<div class="notice bad"><b>Failed: not the same object.</b> ${esc(result.reason)} Keep looking.</div>`;
         $('#snap').hidden = false;
         e.target.value = '';
         return;
@@ -915,7 +917,7 @@ async function renderResult() {
         <figure class="m"><img src="${apiUrl(egg.imageUrl)}" alt="The egg photo" /><figcaption>The egg</figcaption></figure>
         ${play.myPhoto ? `<figure class="m"><img src="${play.myPhoto}" alt="Your photo" /><figcaption>Your photo</figcaption></figure>` : ''}
       </div>
-      <p class="match-verdict ${verification.method === 'gemini' ? 'is-ok' : ''}">${verification.method === 'gemini' ? `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>Photos match${verification.reason ? `: ${esc(verification.reason)}` : ''}` : esc(verification.reason)}</p>
+      <p class="match-verdict ${verification.method === 'gemini' ? 'is-ok' : ''}">${verification.method === 'gemini' ? `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg><b>Cleared.</b> Same object${verification.reason ? `: ${esc(verification.reason)}` : ''}` : esc(verification.reason)}</p>
     </section>
     <ul id="gains" class="gains" aria-live="polite"></ul>
     <section class="next-egg">
