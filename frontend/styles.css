@@ -123,7 +123,7 @@ h2 { font-size: 17px; margin: 22px 0 10px; }
 /* ---------- station list ---------- */
 .list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--surface); }
 .list li + li { border-top: 1px solid var(--border); }
-.list a { display: flex; align-items: center; gap: 12px; padding: 13px 14px; text-decoration: none; }
+.list a, .list .item { display: flex; align-items: center; gap: 12px; padding: 13px 14px; text-decoration: none; }
 .list .name { font-weight: 600; }
 .list .meta { font-size: 13px; color: var(--muted); }
 
@@ -172,9 +172,15 @@ h2 { font-size: 17px; margin: 22px 0 10px; }
 .seg button { border: 0; background: transparent; padding: 9px 6px; border-radius: 9px; font-weight: 600; font-size: 14px; cursor: pointer; color: var(--muted); }
 .seg button.on { background: var(--surface); color: var(--text); box-shadow: 0 1px 3px rgb(0 0 0 / 0.12); }
 .board { list-style: none; margin: 0; padding: 0; }
-.board li { display: grid; grid-template-columns: 34px 1fr auto; gap: 10px; align-items: center; padding: 11px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; }
+.board li { position: relative; display: grid; grid-template-columns: 34px 1fr auto; gap: 10px; align-items: center; padding: 11px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; }
 .board li + li { margin-top: 6px; }
 .board li.me { outline: 2px solid var(--accent); }
+/* The player link stretches over its whole row, so anywhere on the row opens the profile. */
+.board a.player { text-decoration: none; }
+.board a.player::after { content: ''; position: absolute; inset: 0; border-radius: 12px; }
+.board a.player:focus-visible { outline: none; }
+.board a.player:focus-visible::after { outline: 3px solid var(--accent); outline-offset: 1px; }
+.board li:has(a.player:active) { background: var(--surface-2); }
 .board .rank { font-weight: 800; color: var(--muted); }
 .board .pts { font-weight: 800; font-variant-numeric: tabular-nums; }
 
