@@ -54,7 +54,7 @@ export async function createApp({
   mbta,
   verify = verifyMatch,
   geminiKey = '',
-  geminiModel = 'gemini-3.8-flash',
+  geminiModel = 'gemini-3.1-flash-lite,gemini-3-flash-preview',
   now = () => new Date(),
   frontendDir = null,
   corsOrigins = ['*'],

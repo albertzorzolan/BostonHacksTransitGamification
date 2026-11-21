@@ -93,3 +93,28 @@ test('health check sends a tiny real request and reports a retired model', async
   await checkGemini({ apiKey: 'k', model: 'c', now: 2000, fetchImpl: count });
   assert.equal(calls, 1);
 });
+
+test('falls back to the next model when the first errors or is slow', async () => {
+  const tried = [];
+  const fetchImpl = async (url, init) => {
+    const m = url.match(/models\/([^:]+):/)[1];
+    tried.push(m);
+    if (m === 'busy') return new Response('high demand', { status: 503 });
+    if (m === 'slow') return new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(init.signal.reason)));
+    return Response.json({ candidates: [{ content: { parts: [{ text: JSON.stringify({ sameObject: true, confidence: 0.9, reason: 'same scratch' }) }] } }] });
+  };
+  const v = await verifyMatch({ originalJpeg: EGG, candidateJpeg: PHOTO, apiKey: 'k', model: 'busy, slow ,good', fetchImpl, timeoutMs: 50 });
+  assert.deepEqual(tried, ['busy', 'slow', 'good']);
+  assert.deepEqual([v.verdict, v.model], ['cleared', 'good']);
+
+  // A real "different object" answer is final: no second opinion shopping.
+  const tried2 = [];
+  const no = async (url) => (tried2.push(url), Response.json({ candidates: [{ content: { parts: [{ text: JSON.stringify({ sameObject: false, confidence: 0.9, reason: 'blue' }) }] } }] }));
+  const v2 = await verifyMatch({ originalJpeg: EGG, candidateJpeg: PHOTO, apiKey: 'k', model: 'a,b', fetchImpl: no });
+  assert.deepEqual([v2.verdict, tried2.length], ['failed', 1]);
+
+  // Every model down: unavailable.
+  const down = async () => new Response('', { status: 503 });
+  const v3 = await verifyMatch({ originalJpeg: EGG, candidateJpeg: PHOTO, apiKey: 'k', model: 'a,b', fetchImpl: down });
+  assert.deepEqual([v3.verdict, v3.unavailable], ['failed', true]);
+});
