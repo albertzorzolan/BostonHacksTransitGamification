@@ -1,18 +1,16 @@
-// End-to-end API tests against a real Postgres. Each run creates its own
-// throwaway schema in TEST_DATABASE_URL (default: local egg_hunt_test) and drops it after.
+// End-to-end API tests against a real MongoDB: a throwaway in-memory replica set
+// (mongodb-memory-server), or TEST_MONGODB_URI if set (a random database is used and dropped).
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import pg from 'pg';
 import { createApp } from '../src/app.js';
-import { createDb } from '../src/db.js';
+import { createDb, startMemoryMongo } from '../src/db.js';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const DB_URL = process.env.TEST_DATABASE_URL || 'postgres://localhost:5432/egg_hunt_test';
-const SCHEMA = `test_${crypto.randomBytes(4).toString('hex')}`;
+const DB_NAME = `egghunt_test_${crypto.randomBytes(4).toString('hex')}`;
 
 const STATIONS = [
   { id: 'place-kencl', name: 'Kenmore', lat: 42.3489, lng: -71.0952, lines: [{ id: 'Green-B', name: 'Green Line B', color: '#00843D' }] },
@@ -30,14 +28,15 @@ let nextVerify = { method: 'gemini', match: true, confidence: 0.9, reason: 'Same
 let server;
 let base;
 let db;
+let memory;
 
 before(async () => {
-  const admin = new pg.Client({ connectionString: DB_URL });
-  await admin.connect();
-  await admin.query(`create schema ${SCHEMA}`);
-  await admin.end();
-  db = createDb({ connectionString: DB_URL, schema: SCHEMA, max: 5 });
-  await db.migrate(path.join(ROOT, 'migrations'));
+  let uri = process.env.TEST_MONGODB_URI;
+  if (!uri) {
+    memory = await startMemoryMongo();
+    uri = memory.uri;
+  }
+  db = await createDb({ uri, dbName: DB_NAME, maxPoolSize: 5 });
   const app = await createApp({
     db,
     mbta: fakeMbta,
@@ -53,8 +52,9 @@ before(async () => {
 });
 after(async () => {
   server?.close();
-  await db?.query(`drop schema ${SCHEMA} cascade`);
+  await db?.db.dropDatabase();
   await db?.close();
+  await memory?.stop();
 });
 
 // `as` is a session ({ token }) or null for an anonymous call.
@@ -182,8 +182,26 @@ test('the same round submitted twice at once scores once', async () => {
   const round = await ok('/api/attempts', { eggId }, ned);
   const results = await Promise.all([1, 2, 3].map(() => call(`/api/attempts/${round.attempt.id}/find`, { image: IMG }, ned)));
   assert.deepEqual(results.map((r) => r.status).sort(), [200, 409, 409]);
-  const { rows } = await db.query('select count(*)::int as n from finds where user_id = $1', [ned.id]);
-  assert.equal(rows[0].n, 1);
+  assert.equal(await db.col.finds.countDocuments({ userId: ned.id }), 1);
+});
+
+test('two players finding the same egg at once rotate the slot once', async () => {
+  const [ola, pat, quinn, ray] = [await user('ola'), await user('pat'), await user('quinn'), await user('ray')];
+  // Two eggs in the Park Street level-5 slot: ola's in the pool, pat's active.
+  await ok('/api/eggs', { stationId: 'place-pktrm', level: 5, image: IMG }, ola);
+  const r0 = await ok('/api/attempts', { eggId: (await ok('/api/stations/place-pktrm')).slots[4].egg.id }, pat);
+  const f0 = await ok(`/api/attempts/${r0.attempt.id}/find`, { image: IMG }, pat);
+  await ok('/api/eggs', { stationId: 'place-pktrm', level: 5, findId: f0.findId, image: IMG }, pat);
+  const eggId = (await ok('/api/stations/place-pktrm')).slots[4].egg.id;
+
+  const [a, b] = [await ok('/api/attempts', { eggId }, quinn), await ok('/api/attempts', { eggId }, ray)];
+  const results = await Promise.all([
+    call(`/api/attempts/${a.attempt.id}/find`, { image: IMG }, quinn),
+    call(`/api/attempts/${b.attempt.id}/find`, { image: IMG }, ray),
+  ]);
+  assert.deepEqual(results.map((r) => r.status), [200, 200], 'both finds count');
+  assert.equal(await db.col.eggs.countDocuments({ stationId: 'place-pktrm', level: 5, status: 'active' }), 1, 'still exactly one active egg');
+  assert.equal((await db.col.eggs.findOne({ _id: eggId })).timesFound, 2);
 });
 
 test('no match keeps the round open; time runs out', async () => {

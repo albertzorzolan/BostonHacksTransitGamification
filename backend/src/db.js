@@ -1,60 +1,73 @@
-// Postgres connection pool, transactions and migrations.
-import fs from 'node:fs';
-import path from 'node:path';
-import pg from 'pg';
+// MongoDB connection, collections, indexes and transactions.
+// Transactions need a replica set: MongoDB Atlas always is one, and the
+// in-memory server used for tests/dev is started as one.
+import { MongoClient } from 'mongodb';
 
-export function createDb({ connectionString, schema, max = 10 }) {
-  const pool = new pg.Pool({
-    connectionString,
-    max,
-    // Tests run inside their own schema so they never touch real data.
-    ...(schema ? { options: `-c search_path=${schema}` } : {}),
-  });
-  pool.on('error', (err) => console.error('[db] idle client error:', err.message));
+export async function createDb({ uri, dbName = 'egghunt', maxPoolSize = 10 }) {
+  const client = new MongoClient(uri, { maxPoolSize, serverSelectionTimeoutMS: 10_000 });
+  await client.connect();
+  const db = client.db(dbName);
 
-  const query = (text, params) => pool.query(text, params);
-  const one = async (text, params) => (await pool.query(text, params)).rows[0] ?? null;
-  const many = async (text, params) => (await pool.query(text, params)).rows;
+  const col = {
+    users: db.collection('users'),
+    sessions: db.collection('sessions'),
+    photos: db.collection('photos'),
+    eggs: db.collection('eggs'),
+    attempts: db.collection('attempts'),
+    finds: db.collection('finds'),
+    reports: db.collection('reports'),
+    locks: db.collection('locks'),
+  };
 
-  // Runs fn(client) inside BEGIN/COMMIT. The client has the same one/many helpers.
+  // Idempotent, so every instance runs it on startup.
+  await Promise.all([
+    col.users.createIndex({ usernameLower: 1 }, { unique: true }),
+    col.sessions.createIndex({ tokenHash: 1 }, { unique: true }),
+    col.sessions.createIndex({ userId: 1 }),
+    // MongoDB deletes expired sessions on its own.
+    col.sessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+    // At most one active egg per (station, level) slot, enforced by the database.
+    col.eggs.createIndex(
+      { stationId: 1, level: 1 },
+      { unique: true, partialFilterExpression: { status: 'active' }, name: 'one_active_per_slot' },
+    ),
+    col.eggs.createIndex({ stationId: 1, level: 1, status: 1 }),
+    col.eggs.createIndex({ createdBy: 1 }),
+    col.eggs.createIndex({ status: 1, activatedAt: 1 }),
+    col.attempts.createIndex({ userId: 1 }),
+    col.finds.createIndex({ userId: 1, eggId: 1 }, { unique: true }), // each egg scores once per player
+    col.finds.createIndex({ month: 1, stationId: 1 }),
+    col.finds.createIndex({ eggId: 1, foundAt: 1 }),
+    col.finds.createIndex({ userId: 1, foundAt: -1 }),
+    col.reports.createIndex({ eggId: 1, userId: 1 }, { unique: true }),
+  ]);
+
+  // Runs fn(session) in a transaction. withTransaction retries the whole
+  // callback on transient write conflicts, so fn must only touch the database.
   async function tx(fn) {
-    const client = await pool.connect();
-    const c = {
-      query: (t, p) => client.query(t, p),
-      one: async (t, p) => (await client.query(t, p)).rows[0] ?? null,
-      many: async (t, p) => (await client.query(t, p)).rows,
-    };
+    const session = client.startSession();
     try {
-      await client.query('begin');
-      const result = await fn(c);
-      await client.query('commit');
+      let result;
+      await session.withTransaction(async () => {
+        result = await fn(session);
+      });
       return result;
-    } catch (err) {
-      await client.query('rollback').catch(() => {});
-      throw err;
     } finally {
-      client.release();
+      await session.endSession();
     }
   }
 
-  // Applies migrations/NNN_*.sql in order. The advisory lock stops several
-  // instances starting at once from running the same migration twice.
-  async function migrate(dir) {
-    const files = fs.readdirSync(dir).filter((f) => /^\d+_.*\.sql$/.test(f)).sort();
-    await tx(async (c) => {
-      await c.query('select pg_advisory_xact_lock(727274)');
-      await c.query('create table if not exists schema_migrations (version text primary key, applied_at timestamptz not null default now())');
-      const done = new Set((await c.many('select version from schema_migrations')).map((r) => r.version));
-      for (const file of files) {
-        if (done.has(file)) continue;
-        await c.query(fs.readFileSync(path.join(dir, file), 'utf8'));
-        await c.query('insert into schema_migrations (version) values ($1)', [file]);
-        console.log(`[db] applied ${file}`);
-      }
-    });
-  }
-
-  return { pool, query, one, many, tx, migrate, close: () => pool.end() };
+  return { client, db, col, tx, close: () => client.close() };
 }
 
-export const isUniqueViolation = (err) => err?.code === '23505';
+export const isDuplicateKey = (err) => err?.code === 11000;
+
+// Local dev and tests: a throwaway single-node replica set (data is lost on exit).
+export async function startMemoryMongo() {
+  const { MongoMemoryReplSet } = await import('mongodb-memory-server');
+  const replSet = await MongoMemoryReplSet.create({
+    replSet: { count: 1, storageEngine: 'wiredTiger' },
+    binary: { version: process.env.MONGOMS_VERSION || '7.0.14' },
+  });
+  return { uri: replSet.getUri(), stop: () => replSet.stop() };
+}
