@@ -722,14 +722,106 @@ async function viewGroups() {
   });
 }
 
+const CHAT_POLL_MS = 4000;
+const fmtTime = (iso) => new Date(iso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+
 async function viewGroup(id) {
   loading();
+  const gid = encodeURIComponent(id);
+  let tab = 'board';
   let period = 'month';
-  let data = await api(`/api/groups/${encodeURIComponent(id)}`);
+  let data = await api(`/api/groups/${gid}`);
+  let chat = null; // { messages, lastSeq } once the chat tab has been opened
+  let stopPolling = null;
   const monthLabel = new Date().toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'America/New_York' });
 
+  // Rank in this group, shown next to each sticker sender (it's a competition).
+  const rankOf = (userId) => data.rows.find((r) => r.userId === userId)?.rank ?? null;
+  const rankBadge = (userId) => {
+    const r = rankOf(userId);
+    return r === 1 ? '<span class="pill badge">👑 #1</span>' : r ? `<span class="pill badge">#${r}</span>` : '';
+  };
+
+  const stickerHtml = (m) => `
+    <div class="msg ${m.userId === state.user.id ? 'mine' : ''}" data-seq="${m.seq}">
+      <div class="sticker" title="${esc(m.label)}">${esc(m.emoji)}</div>
+      <div class="cap"><strong>${esc(m.label)}</strong></div>
+      <div class="small">${m.userId === state.user.id ? 'You' : esc(m.username)}${rankBadge(m.userId)} · ${fmtTime(m.createdAt)}</div>
+    </div>`;
+
+  function boardHtml() {
+    const { rows } = data;
+    return `
+      <div class="seg" role="tablist">
+        <button data-period="month" class="${period === 'month' ? 'on' : ''}">${esc(monthLabel)}</button>
+        <button data-period="all" class="${period === 'all' ? 'on' : ''}">All time</button>
+      </div>
+      <ol class="board" style="margin-top:12px">${rows
+        .map((r) => `<li class="${r.userId === state.user.id ? 'me' : ''} ${r.rank ? '' : 'idle'}">
+            <span class="rank">${r.rank ?? '–'}</span>
+            <span><strong>${esc(r.username)}</strong>${r.isOwner ? '<span class="pill badge">Owner</span>' : ''}<br/>
+              <span class="small">${r.finds ? `${r.finds} find${r.finds === 1 ? '' : 's'}` : 'No finds yet'}</span></span>
+            <span class="pts">${r.points}</span>
+          </li>`)
+        .join('')}</ol>
+      ${rows.every((r) => !r.points) ? `<p class="small" style="margin-top:10px">Nobody has scored ${period === 'month' ? 'this month' : 'yet'}. Pick a station and find an egg to take the lead.</p>` : ''}`;
+  }
+
+  function chatHtml() {
+    const stickers = state.config?.stickers ?? [];
+    return `
+      <div id="feed" class="feed" aria-live="polite">${chat.messages.length
+        ? chat.messages.map(stickerHtml).join('')
+        : '<div class="empty">No stickers yet. Start the trash talk 👇</div>'}</div>
+      <div class="small" style="margin:10px 2px 6px">Tap a sticker to send it to the group</div>
+      <div class="stickers">${stickers
+        .map((st) => `<button class="stk" data-sticker="${esc(st.id)}" title="${esc(st.label)}" aria-label="Send ${esc(st.label)}"><span>${esc(st.emoji)}</span><small>${esc(st.label)}</small></button>`)
+        .join('')}</div>`;
+  }
+
+  function scrollFeed(force) {
+    const feed = $('#feed');
+    if (!feed) return;
+    const nearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80;
+    if (force || nearBottom) feed.scrollTop = feed.scrollHeight;
+  }
+
+  function appendMessages(messages) {
+    const fresh = messages.filter((m) => m.seq > chat.lastSeq);
+    if (!fresh.length) return;
+    chat.messages.push(...fresh);
+    chat.lastSeq = fresh[fresh.length - 1].seq;
+    const feed = $('#feed');
+    if (!feed) return;
+    feed.querySelector('.empty')?.remove();
+    feed.insertAdjacentHTML('beforeend', fresh.map(stickerHtml).join(''));
+    scrollFeed(fresh.some((m) => m.userId === state.user.id));
+  }
+
+  async function poll() {
+    if (document.visibilityState !== 'visible' || tab !== 'chat') return;
+    try {
+      appendMessages((await api(`/api/groups/${gid}/messages?after=${chat.lastSeq}`)).messages);
+    } catch {
+      /* network hiccup: try again next tick */
+    }
+  }
+
+  function startPolling() {
+    if (stopPolling) return;
+    const iv = setInterval(poll, CHAT_POLL_MS);
+    const onVisible = () => document.visibilityState === 'visible' && poll();
+    document.addEventListener('visibilitychange', onVisible);
+    stopPolling = () => {
+      clearInterval(iv);
+      document.removeEventListener('visibilitychange', onVisible);
+      stopPolling = null;
+    };
+    state.timers.push(() => stopPolling?.()); // stops when leaving the page
+  }
+
   const draw = () => {
-    const { group, rows } = data;
+    const { group } = data;
     app.innerHTML = `
       <a href="#/groups" class="small">← All groups</a>
       <div class="row" style="justify-content:space-between; align-items:flex-start">
@@ -743,33 +835,60 @@ async function viewGroup(id) {
         <div class="invite"><code>${esc(group.inviteCode)}</code><span class="spacer"></span><button id="share" class="btn small primary">Share invite link</button></div>
       </div>
 
-      <h2>Leaderboard</h2>
-      <div class="seg" role="tablist">
-        <button data-period="month" class="${period === 'month' ? 'on' : ''}">${esc(monthLabel)}</button>
-        <button data-period="all" class="${period === 'all' ? 'on' : ''}">All time</button>
+      <div class="seg" role="tablist" style="margin-top:18px">
+        <button data-tab="board" class="${tab === 'board' ? 'on' : ''}">🏆 Leaderboard</button>
+        <button data-tab="chat" class="${tab === 'chat' ? 'on' : ''}">💬 Chat</button>
       </div>
-      <ol class="board" style="margin-top:12px">${rows
-        .map((r) => `<li class="${r.userId === state.user.id ? 'me' : ''} ${r.rank ? '' : 'idle'}">
-            <span class="rank">${r.rank ?? '–'}</span>
-            <span><strong>${esc(r.username)}</strong>${r.isOwner ? '<span class="pill badge">Owner</span>' : ''}<br/>
-              <span class="small">${r.finds ? `${r.finds} find${r.finds === 1 ? '' : 's'}` : 'No finds yet'}</span></span>
-            <span class="pts">${r.points}</span>
-          </li>`)
-        .join('')}</ol>
-      ${rows.every((r) => !r.points) ? `<p class="small" style="margin-top:10px">Nobody has scored ${period === 'month' ? 'this month' : 'yet'}. Pick a station and find an egg to take the lead.</p>` : ''}
+      <div id="pane" style="margin-top:12px">${tab === 'board' ? boardHtml() : chatHtml()}</div>
 
       <p style="margin-top:28px"><button id="leave" class="linkbtn">Leave group</button></p>`;
 
     $('#share').addEventListener('click', () => shareInvite(group));
+    app.querySelectorAll('[data-tab]').forEach((b) =>
+      b.addEventListener('click', async () => {
+        if (b.dataset.tab === tab) return;
+        tab = b.dataset.tab;
+        if (tab === 'chat' && !chat) {
+          try {
+            const { messages } = await api(`/api/groups/${gid}/messages`);
+            chat = { messages, lastSeq: messages.at(-1)?.seq ?? 0 };
+          } catch (err) {
+            tab = 'board';
+            return toast(err.message);
+          }
+        }
+        draw();
+        if (tab === 'chat') {
+          scrollFeed(true);
+          startPolling();
+          poll();
+        } else stopPolling?.();
+      }),
+    );
     app.querySelectorAll('[data-period]').forEach((b) =>
       b.addEventListener('click', async () => {
         if (b.dataset.period === period) return;
         period = b.dataset.period;
         try {
-          data = await api(`/api/groups/${encodeURIComponent(id)}${period === 'all' ? '?period=all' : ''}`);
+          data = await api(`/api/groups/${gid}${period === 'all' ? '?period=all' : ''}`);
           draw();
         } catch (err) {
           toast(err.message);
+        }
+      }),
+    );
+    app.querySelectorAll('[data-sticker]').forEach((b) =>
+      b.addEventListener('click', async () => {
+        b.disabled = true;
+        try {
+          const { message } = await api(`/api/groups/${gid}/messages`, { sticker: b.dataset.sticker });
+          // Pick up anything others sent meanwhile, then ours, in order.
+          const { messages } = await api(`/api/groups/${gid}/messages?after=${chat.lastSeq}`);
+          appendMessages(messages.length ? messages : [message]);
+        } catch (err) {
+          toast(err.message);
+        } finally {
+          b.disabled = false;
         }
       }),
     );
@@ -777,7 +896,7 @@ async function viewGroup(id) {
       const name = prompt('New group name', group.name);
       if (!name || name.trim() === group.name) return;
       try {
-        data.group = (await api(`/api/groups/${encodeURIComponent(id)}/rename`, { name })).group;
+        data.group = (await api(`/api/groups/${gid}/rename`, { name })).group;
         draw();
         toast('Group renamed.');
       } catch (err) {
@@ -787,13 +906,13 @@ async function viewGroup(id) {
     $('#leave').addEventListener('click', async () => {
       const lastOne = group.memberCount === 1;
       const msg = lastOne
-        ? `You're the only member. Leaving deletes "${group.name}". Continue?`
+        ? `You're the only member. Leaving deletes "${group.name}" and its chat. Continue?`
         : group.isOwner
           ? `Leave "${group.name}"? The longest-standing member becomes the new owner.`
           : `Leave "${group.name}"?`;
       if (!confirm(msg)) return;
       try {
-        await api(`/api/groups/${encodeURIComponent(id)}/leave`, {});
+        await api(`/api/groups/${gid}/leave`, {});
         toast(lastOne ? 'Group deleted.' : 'You left the group.');
         location.hash = '#/groups';
       } catch (err) {

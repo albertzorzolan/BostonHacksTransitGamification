@@ -44,3 +44,29 @@ export function lineFamily(routeId) {
   if (routeId === 'Mattapan') return 'Red';
   return routeId;
 }
+
+// Group chat is stickers only (no typed messages): competitive trash talk from a fixed set.
+// The server accepts only these ids; the client gets the list from /api/config.
+export const STICKERS = [
+  { id: 'crown', emoji: '👑', label: "Who's the king now" },
+  { id: 'trophy', emoji: '🏆', label: 'Champion' },
+  { id: 'goat', emoji: '🐐', label: 'GOAT' },
+  { id: 'fire', emoji: '🔥', label: 'On fire' },
+  { id: 'flex', emoji: '💪', label: 'Too easy' },
+  { id: 'target', emoji: '🎯', label: 'Nailed it' },
+  { id: 'rocket', emoji: '🚀', label: 'Speedrun' },
+  { id: 'egg', emoji: '🥚', label: 'Found it first' },
+  { id: 'challenge', emoji: '⚔️', label: 'Bring it on' },
+  { id: 'eyes', emoji: '👀', label: 'Coming for you' },
+  { id: 'snail', emoji: '🐌', label: 'Too slow' },
+  { id: 'train', emoji: '🚇', label: 'Missed the train' },
+  { id: 'sleep', emoji: '😴', label: 'Wake up' },
+  { id: 'clown', emoji: '🤡', label: 'Clown move' },
+  { id: 'salt', emoji: '🧂', label: 'Salty?' },
+  { id: 'skull', emoji: '💀', label: "I'm dead" },
+  { id: 'laugh', emoji: '😂', label: 'LOL' },
+  { id: 'cry', emoji: '😭', label: 'Not fair' },
+  { id: 'sweat', emoji: '😅', label: 'Close one' },
+  { id: 'wave', emoji: '👋', label: 'See ya at the top' },
+];
+export const stickerById = new Map(STICKERS.map((s) => [s.id, s]));

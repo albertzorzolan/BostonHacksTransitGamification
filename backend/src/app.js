@@ -27,6 +27,8 @@ const INVITE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const INVITE_LENGTH = 8;
 export const MAX_GROUPS_PER_USER = 20;
 export const MAX_GROUP_MEMBERS = 50;
+export const CHAT_PAGE = 50;
+export const CHAT_RATE = { messages: 8, seconds: 10 };
 const GROUP_NAME_RE = /^[\p{L}\p{N} _.,'!&()-]{2,30}$/u;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuid = (v) => typeof v === 'string' && UUID_RE.test(v);
@@ -197,6 +199,12 @@ export async function createApp({
     return { user, g };
   }
 
+  // Stickers only: messages carry a sticker id from game.STICKERS, never free text.
+  const publicMessage = (m) => {
+    const s = game.stickerById.get(m.sticker);
+    return { id: m._id, seq: m.seq, userId: m.userId, username: m.username, sticker: m.sticker, emoji: s?.emoji ?? '🥚', label: s?.label ?? '', createdAt: m.createdAt };
+  };
+
   // ---------- handlers ----------
   const api = {
     async health() {
@@ -211,6 +219,7 @@ export async function createApp({
         graceSeconds: game.GRACE_SECONDS,
         maxTimeBonus: game.MAX_TIME_BONUS,
         passwordMin: auth.PASSWORD_MIN,
+        stickers: game.STICKERS,
       };
     },
 
@@ -680,6 +689,7 @@ export async function createApp({
         if (!left.deletedCount) fail(403, "You're not in this group.");
         if (g.memberCount <= 0) {
           await col.groups.deleteOne({ _id: id }, { session });
+          await col.groupMessages.deleteMany({ groupId: id }, { session });
           return { left: true, deleted: true };
         }
         if (g.ownerId === user._id) {
@@ -688,6 +698,42 @@ export async function createApp({
         }
         return { left: true, deleted: false };
       });
+    },
+
+    // ----- group chat (stickers only) -----
+    // Without ?after: the latest CHAT_PAGE messages. With ?after=<seq>: only newer ones (for polling).
+    async groupMessages(ctx) {
+      const [id] = ctx.params;
+      await memberGroup(ctx, id);
+      const after = Number(ctx.query.get('after'));
+      const rows = Number.isInteger(after) && after >= 0
+        ? await col.groupMessages.find({ groupId: id, seq: { $gt: after } }).sort({ seq: 1 }).limit(CHAT_PAGE).toArray()
+        : (await col.groupMessages.find({ groupId: id }).sort({ seq: -1 }).limit(CHAT_PAGE).toArray()).reverse();
+      return { messages: rows.map(publicMessage) };
+    },
+
+    async sendGroupMessage(ctx) {
+      const [id] = ctx.params;
+      const { user } = await memberGroup(ctx, id);
+      const sticker = game.stickerById.get(String(ctx.body?.sticker ?? ''));
+      if (!sticker) fail(400, 'Pick one of the stickers.');
+      const t = now();
+      const recent = await col.groupMessages.countDocuments({
+        groupId: id,
+        userId: user._id,
+        createdAt: { $gt: new Date(t.getTime() - CHAT_RATE.seconds * 1000) },
+      });
+      if (recent >= CHAT_RATE.messages) fail(429, 'Easy there! Wait a few seconds before the next sticker.');
+      // The per-group counter runs in the same transaction as the insert, so messages
+      // commit in seq order and a poller using ?after=<seq> never skips one.
+      const message = await tx(async (session) => {
+        const g = await col.groups.findOneAndUpdate({ _id: id }, { $inc: { msgSeq: 1 } }, { session, returnDocument: 'after' });
+        if (!g) fail(404, 'Group not found');
+        const m = { _id: crypto.randomUUID(), groupId: id, seq: g.msgSeq, userId: user._id, username: user.username, sticker: sticker.id, createdAt: t };
+        await col.groupMessages.insertOne(m, { session });
+        return m;
+      });
+      return { message: publicMessage(message) };
     },
 
     async leaderboard({ query }) {
@@ -739,6 +785,8 @@ export async function createApp({
     ['GET', /^\/api\/groups\/([^/]+)$/, api.group, 'optional'],
     ['POST', /^\/api\/groups\/([^/]+)\/rename$/, api.renameGroup, 'optional'],
     ['POST', /^\/api\/groups\/([^/]+)\/leave$/, api.leaveGroup, 'optional'],
+    ['GET', /^\/api\/groups\/([^/]+)\/messages$/, api.groupMessages, 'optional'],
+    ['POST', /^\/api\/groups\/([^/]+)\/messages$/, api.sendGroupMessage, 'optional'],
   ];
 
   function corsHeaders(req) {

@@ -198,3 +198,25 @@ h2 { font-size: 17px; margin: 22px 0 10px; }
 .invite code { font-size: 22px; font-weight: 800; letter-spacing: 0.12em; font-variant-numeric: tabular-nums; }
 .board li .badge { margin-left: 6px; }
 .board li.idle { opacity: 0.7; }
+
+/* ---------- group sticker chat ---------- */
+.feed {
+  height: min(46vh, 420px); overflow-y: auto; overscroll-behavior: contain;
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 12px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.feed .empty { margin: auto; }
+.msg { align-self: flex-start; max-width: 80%; text-align: left; }
+.msg.mine { align-self: flex-end; text-align: right; }
+.msg .sticker { font-size: 52px; line-height: 1.1; }
+.msg .cap { font-size: 14px; }
+.msg .small .badge { margin-left: 4px; font-size: 11px; padding: 1px 6px; }
+.stickers { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
+.stk {
+  display: flex; flex-direction: column; align-items: center; gap: 2px; min-width: 0;
+  padding: 8px 2px 6px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); cursor: pointer;
+}
+.stk span { font-size: 28px; line-height: 1.1; }
+.stk small { font-size: 9.5px; color: var(--muted); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stk:active { transform: scale(0.94); }
+.stk:disabled { opacity: 0.5; }

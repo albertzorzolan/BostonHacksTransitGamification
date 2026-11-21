@@ -340,6 +340,52 @@ test('friend groups: size and per-player limits hold under concurrent joins', as
   assert.equal(await db.col.groupMembers.countDocuments({ userId: busy.id }), MAX_GROUPS_PER_USER);
 });
 
+test('group sticker chat: members only, stickers only, polling, rate limit', async () => {
+  const [kai, lou, nosy] = [await user('kai'), await user('lou'), await user('nosy')];
+  const { group } = await ok('/api/groups', { name: 'Sticker Squad' }, kai);
+  await ok('/api/groups/join', { code: group.inviteCode }, lou);
+  const chat = `/api/groups/${group.id}/messages`;
+
+  const { stickers } = await ok('/api/config');
+  assert.ok(stickers.length >= 10 && stickers.every((s) => s.id && s.emoji && s.label));
+
+  assert.equal((await call(chat, { sticker: 'crown' }, nosy)).status, 403, 'non-members cannot send');
+  assert.equal((await call(chat, null, nosy)).status, 403, 'or read');
+  assert.equal((await call(chat, { text: 'hello' }, kai)).status, 400, 'no typed messages');
+  assert.equal((await call(chat, { sticker: '<img src=x>' }, kai)).status, 400, 'unknown sticker');
+
+  const first = await ok(chat, { sticker: 'crown' }, kai);
+  assert.deepEqual([first.message.emoji, first.message.label, first.message.username, first.message.seq], ['👑', "Who's the king now", 'kai', 1]);
+  await ok(chat, { sticker: 'snail' }, lou);
+
+  const all = await ok(chat, null, lou);
+  assert.deepEqual(all.messages.map((m) => [m.username, m.sticker]), [['kai', 'crown'], ['lou', 'snail']]);
+  assert.equal(all.messages.some((m) => 'text' in m), false);
+  // Polling returns only what's new.
+  assert.deepEqual((await ok(`${chat}?after=2`, null, kai)).messages, []);
+  await ok(chat, { sticker: 'fire' }, kai);
+  assert.deepEqual((await ok(`${chat}?after=2`, null, lou)).messages.map((m) => m.sticker), ['fire']);
+
+  // Concurrent sends get unique, gap-free sequence numbers.
+  clock += 60_000;
+  await Promise.all(['eyes', 'goat', 'skull', 'egg'].map((st, i) => ok(chat, { sticker: st }, i % 2 ? kai : lou)));
+  const seqs = (await ok(chat, null, kai)).messages.map((m) => m.seq);
+  assert.deepEqual(seqs, [1, 2, 3, 4, 5, 6, 7]);
+
+  // Rate limit: 8 per 10 seconds per player.
+  clock += 60_000;
+  for (let i = 0; i < 8; i++) await ok(chat, { sticker: 'laugh' }, lou);
+  assert.equal((await call(chat, { sticker: 'laugh' }, lou)).status, 429);
+  await ok(chat, { sticker: 'cry' }, kai); // others aren't affected
+  clock += 11_000;
+  await ok(chat, { sticker: 'wave' }, lou);
+
+  // Deleting the group (last one out) deletes its chat.
+  await ok(`/api/groups/${group.id}/leave`, {}, kai);
+  await ok(`/api/groups/${group.id}/leave`, {}, lou);
+  assert.equal(await db.col.groupMessages.countDocuments({ groupId: group.id }), 0);
+});
+
 test('bad input, CORS, health and static files', async () => {
   assert.equal((await call('/api/auth/register', { username: '<script>', password: PW })).status, 400);
   const lee = await user('lee');

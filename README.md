@@ -97,6 +97,7 @@ To host `frontend/` somewhere else, set `window.EGG_API_BASE` in `frontend/confi
 - Each group has its own leaderboard covering only its members, for this month or all time. Members with no points are listed unranked.
 - When the owner leaves, the longest-standing member becomes the owner. The last member to leave deletes the group.
 - Limits: 20 groups per player and 50 players per group. Both hold even when people join at the same moment.
+- **Sticker chat:** each group has a chat for trash talk, using stickers only (no typed messages). There are 20 competitive stickers such as 👑 "Who's the king now", 🐌 "Too slow" and ⚔️ "Bring it on". Each sticker shows the sender's current rank in the group. New stickers appear within about 4 seconds (the app checks for new ones while the chat is open). The limit is 8 stickers per 10 seconds per player, and stickers are deleted after 30 days.
 
 ## Code map
 

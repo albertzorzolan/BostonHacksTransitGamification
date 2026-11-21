@@ -19,6 +19,7 @@ export async function createDb({ uri, dbName = 'egghunt', maxPoolSize = 10 }) {
     locks: db.collection('locks'),
     groups: db.collection('groups'),
     groupMembers: db.collection('groupMembers'),
+    groupMessages: db.collection('groupMessages'),
   };
 
   // Idempotent, so every instance runs it on startup.
@@ -46,6 +47,10 @@ export async function createDb({ uri, dbName = 'egghunt', maxPoolSize = 10 }) {
     col.groupMembers.createIndex({ groupId: 1, userId: 1 }, { unique: true }),
     col.groupMembers.createIndex({ userId: 1, joinedAt: 1 }),
     col.groupMembers.createIndex({ groupId: 1, joinedAt: 1 }),
+    col.groupMessages.createIndex({ groupId: 1, seq: 1 }, { unique: true }),
+    col.groupMessages.createIndex({ groupId: 1, userId: 1, createdAt: -1 }), // rate limit
+    // Chat history is kept for 30 days (keeps the free Atlas tier from filling up).
+    col.groupMessages.createIndex({ createdAt: 1 }, { expireAfterSeconds: 30 * 86400 }),
   ]);
 
   // Runs fn(session) in a transaction. withTransaction retries the whole
