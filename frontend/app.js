@@ -142,6 +142,9 @@ const routes = [
   [/^#\/leaderboard$/, viewLeaderboard],
   [/^#\/profile$/, viewProfile],
   [/^#\/map$/, viewMap],
+  [/^#\/groups$/, viewGroups],
+  [/^#\/group\/([^/]+)$/, viewGroup],
+  [/^#\/join\/([^/]+)$/, viewJoin],
 ];
 
 async function render() {
@@ -155,7 +158,15 @@ async function render() {
   if (!state.user) return viewSignup();
 
   const hash = location.hash || '#/';
-  const tab = hash.startsWith('#/map') ? 'map' : hash.startsWith('#/leaderboard') ? 'leaderboard' : hash.startsWith('#/profile') ? 'profile' : 'stations';
+  const tab = hash.startsWith('#/map')
+    ? 'map'
+    : hash.startsWith('#/leaderboard')
+      ? 'leaderboard'
+      : hash.startsWith('#/profile')
+        ? 'profile'
+        : /^#\/(groups|group\/|join\/)/.test(hash)
+          ? 'groups'
+          : 'stations';
   document.querySelectorAll('#tabs a').forEach((a) => a.classList.toggle('active', a.dataset.tab === tab));
 
   for (const [re, view] of routes) {
@@ -639,6 +650,188 @@ async function viewLeaderboard() {
     draw();
   });
   await draw();
+}
+
+// ---------- friend groups ----------
+const inviteLink = (code) => `${location.origin}${location.pathname}#/join/${code}`;
+
+async function shareInvite(group) {
+  const url = inviteLink(group.inviteCode);
+  const text = `Join my Station Egg Hunt group "${group.name}" and see who finds the most eggs.`;
+  try {
+    if (navigator.share) return await navigator.share({ title: group.name, text, url });
+  } catch (err) {
+    if (err?.name === 'AbortError') return; // user closed the share sheet
+  }
+  try {
+    await navigator.clipboard.writeText(url);
+    toast('Invite link copied.');
+  } catch {
+    prompt('Copy this invite link:', url);
+  }
+}
+
+async function viewGroups() {
+  loading();
+  const { groups, limits } = await api('/api/groups');
+  app.innerHTML = `
+    <h1>Groups</h1>
+    <p class="sub">Compete with friends on your own leaderboard. Make a group, then send your friends the invite link.</p>
+    ${groups.length
+      ? `<ul class="list">${groups
+          .map((g) => `<li><a href="#/group/${encodeURIComponent(g.id)}">
+              <span><span class="name">${esc(g.name)}</span><br/><span class="meta">${g.memberCount} member${g.memberCount === 1 ? '' : 's'}${g.isOwner ? ' · you own it' : ''}</span></span>
+              <span class="spacer"></span><span class="pill">Board →</span>
+            </a></li>`)
+          .join('')}</ul>`
+      : '<div class="empty">You\'re not in any groups yet.</div>'}
+    <h2>Create a group</h2>
+    <form id="create" class="card stack">
+      <label for="gname"><strong>Group name</strong></label>
+      <input id="gname" class="input" maxlength="30" placeholder="e.g. Red Line Regulars" required />
+      <button class="btn primary block">Create group</button>
+      <div id="createErr"></div>
+    </form>
+    <h2>Join with a code</h2>
+    <form id="join" class="card stack">
+      <label for="gcode"><strong>Invite code</strong> <span class="small">(8 letters and numbers)</span></label>
+      <input id="gcode" class="input" maxlength="12" autocapitalize="characters" autocomplete="off" placeholder="e.g. K7PQ2MXR" required />
+      <button class="btn block">Join group</button>
+      <div id="joinErr"></div>
+    </form>
+    <p class="small" style="margin-top:12px">You can be in up to ${limits.groups} groups, with up to ${limits.members} players each.</p>`;
+
+  $('#create').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      const { group } = await api('/api/groups', { name: $('#gname').value });
+      location.hash = `#/group/${encodeURIComponent(group.id)}`;
+    } catch (err) {
+      $('#createErr').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+    }
+  });
+  $('#join').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      const { group } = await api('/api/groups/join', { code: $('#gcode').value });
+      toast(`You joined ${group.name}.`);
+      location.hash = `#/group/${encodeURIComponent(group.id)}`;
+    } catch (err) {
+      $('#joinErr').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+    }
+  });
+}
+
+async function viewGroup(id) {
+  loading();
+  let period = 'month';
+  let data = await api(`/api/groups/${encodeURIComponent(id)}`);
+  const monthLabel = new Date().toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'America/New_York' });
+
+  const draw = () => {
+    const { group, rows } = data;
+    app.innerHTML = `
+      <a href="#/groups" class="small">← All groups</a>
+      <div class="row" style="justify-content:space-between; align-items:flex-start">
+        <h1 id="gtitle">${esc(group.name)}</h1>
+        ${group.isOwner ? '<button id="rename" class="linkbtn" style="margin-top:22px">Rename</button>' : ''}
+      </div>
+      <p class="sub">${group.memberCount} member${group.memberCount === 1 ? '' : 's'}${group.isOwner ? ' · you own this group' : ''}</p>
+
+      <div class="card stack">
+        <div class="small">Invite friends with this code or link</div>
+        <div class="invite"><code>${esc(group.inviteCode)}</code><span class="spacer"></span><button id="share" class="btn small primary">Share invite link</button></div>
+      </div>
+
+      <h2>Leaderboard</h2>
+      <div class="seg" role="tablist">
+        <button data-period="month" class="${period === 'month' ? 'on' : ''}">${esc(monthLabel)}</button>
+        <button data-period="all" class="${period === 'all' ? 'on' : ''}">All time</button>
+      </div>
+      <ol class="board" style="margin-top:12px">${rows
+        .map((r) => `<li class="${r.userId === state.user.id ? 'me' : ''} ${r.rank ? '' : 'idle'}">
+            <span class="rank">${r.rank ?? '–'}</span>
+            <span><strong>${esc(r.username)}</strong>${r.isOwner ? '<span class="pill badge">Owner</span>' : ''}<br/>
+              <span class="small">${r.finds ? `${r.finds} find${r.finds === 1 ? '' : 's'}` : 'No finds yet'}</span></span>
+            <span class="pts">${r.points}</span>
+          </li>`)
+        .join('')}</ol>
+      ${rows.every((r) => !r.points) ? `<p class="small" style="margin-top:10px">Nobody has scored ${period === 'month' ? 'this month' : 'yet'}. Pick a station and find an egg to take the lead.</p>` : ''}
+
+      <p style="margin-top:28px"><button id="leave" class="linkbtn">Leave group</button></p>`;
+
+    $('#share').addEventListener('click', () => shareInvite(group));
+    app.querySelectorAll('[data-period]').forEach((b) =>
+      b.addEventListener('click', async () => {
+        if (b.dataset.period === period) return;
+        period = b.dataset.period;
+        try {
+          data = await api(`/api/groups/${encodeURIComponent(id)}${period === 'all' ? '?period=all' : ''}`);
+          draw();
+        } catch (err) {
+          toast(err.message);
+        }
+      }),
+    );
+    $('#rename')?.addEventListener('click', async () => {
+      const name = prompt('New group name', group.name);
+      if (!name || name.trim() === group.name) return;
+      try {
+        data.group = (await api(`/api/groups/${encodeURIComponent(id)}/rename`, { name })).group;
+        draw();
+        toast('Group renamed.');
+      } catch (err) {
+        toast(err.message);
+      }
+    });
+    $('#leave').addEventListener('click', async () => {
+      const lastOne = group.memberCount === 1;
+      const msg = lastOne
+        ? `You're the only member. Leaving deletes "${group.name}". Continue?`
+        : group.isOwner
+          ? `Leave "${group.name}"? The longest-standing member becomes the new owner.`
+          : `Leave "${group.name}"?`;
+      if (!confirm(msg)) return;
+      try {
+        await api(`/api/groups/${encodeURIComponent(id)}/leave`, {});
+        toast(lastOne ? 'Group deleted.' : 'You left the group.');
+        location.hash = '#/groups';
+      } catch (err) {
+        toast(err.message);
+      }
+    });
+  };
+  draw();
+}
+
+// Opened from an invite link. Signing up first works too: the hash survives it.
+async function viewJoin(code) {
+  loading();
+  const { group, alreadyMember } = await api(`/api/groups/invite/${encodeURIComponent(code)}`);
+  if (alreadyMember) {
+    location.replace(`#/group/${encodeURIComponent(group.id)}`);
+    return;
+  }
+  app.innerHTML = `
+    <p class="small">You're invited to a group</p>
+    <h1>${esc(group.name)}</h1>
+    <p class="sub">${group.memberCount} member${group.memberCount === 1 ? '' : 's'}. Join to see the group leaderboard and compete with them.</p>
+    ${group.full
+      ? '<div class="notice bad">This group is full.</div><p><a class="btn block" href="#/groups">Back to groups</a></p>'
+      : `<button id="joinBtn" class="btn primary block">Join ${esc(group.name)}</button>
+         <a class="btn block" style="margin-top:8px" href="#/groups">Not now</a>
+         <div id="err" style="margin-top:10px"></div>`}`;
+  $('#joinBtn')?.addEventListener('click', async () => {
+    $('#joinBtn').disabled = true;
+    try {
+      const { group: joined } = await api('/api/groups/join', { code });
+      toast(`You joined ${joined.name}.`);
+      location.replace(`#/group/${encodeURIComponent(joined.id)}`);
+    } catch (err) {
+      $('#err').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+      $('#joinBtn').disabled = false;
+    }
+  });
 }
 
 // ---------- profile ----------

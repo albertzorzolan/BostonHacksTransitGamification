@@ -22,6 +22,12 @@ const MIME = {
   '.png': 'image/png',
   '.json': 'application/json',
 };
+// Friend groups: invite codes avoid look-alike characters (no 0/O, 1/I/L).
+const INVITE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+const INVITE_LENGTH = 8;
+export const MAX_GROUPS_PER_USER = 20;
+export const MAX_GROUP_MEMBERS = 50;
+const GROUP_NAME_RE = /^[\p{L}\p{N} _.,'!&()-]{2,30}$/u;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuid = (v) => typeof v === 'string' && UUID_RE.test(v);
 
@@ -134,8 +140,8 @@ export async function createApp({
 
   const credentials = (body) => ({ username: String(body?.username ?? '').trim(), password: String(body?.password ?? '') });
 
-  // Monthly totals per player, best first. Ties: more finds, then username.
-  function monthBoard(match) {
+  // Points per player for the finds matching `match`, best first. Ties: more finds, then username.
+  function pointsBoard(match) {
     return col.finds
       .aggregate([
         { $match: match },
@@ -146,6 +152,49 @@ export async function createApp({
         { $project: { u: 0 } },
       ])
       .toArray();
+  }
+
+  // ---------- groups ----------
+  function groupName(raw) {
+    const name = String(raw ?? '').trim().replace(/\s+/g, ' ');
+    if (!GROUP_NAME_RE.test(name)) fail(400, 'Group name must be 2–30 letters, numbers, spaces or simple punctuation.');
+    return name;
+  }
+  const normalizeCode = (raw) => String(raw ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const publicGroup = (g, user) => ({
+    id: g._id,
+    name: g.name,
+    memberCount: g.memberCount,
+    isOwner: g.ownerId === user._id,
+    inviteCode: g.inviteCode,
+    createdAt: g.createdAt,
+  });
+
+  async function newInviteCode() {
+    for (let i = 0; i < 10; i++) {
+      const code = Array.from({ length: INVITE_LENGTH }, () => INVITE_ALPHABET[crypto.randomInt(INVITE_ALPHABET.length)]).join('');
+      if (!(await col.groups.findOne({ inviteCode: code }, { projection: { _id: 1 } }))) return code;
+    }
+    throw new Error('Could not generate a unique invite code');
+  }
+
+  // Serializes one player's group joins/creates, so the per-player limit holds under concurrency.
+  const lockUser = (session, userId) =>
+    col.locks.updateOne({ _id: `user:${userId}` }, { $inc: { v: 1 } }, { upsert: true, session });
+
+  async function checkGroupLimit(session, userId) {
+    if ((await col.groupMembers.countDocuments({ userId }, { session })) >= MAX_GROUPS_PER_USER) {
+      fail(409, `You can be in up to ${MAX_GROUPS_PER_USER} groups. Leave one first.`);
+    }
+  }
+
+  // Returns { user, g } when the signed-in player belongs to group `id`.
+  async function memberGroup(ctx, id) {
+    const user = requireUser(ctx);
+    if (!isUuid(id)) fail(404, 'Group not found');
+    const g = (await col.groups.findOne({ _id: id })) ?? fail(404, 'Group not found');
+    if (!(await col.groupMembers.findOne({ groupId: id, userId: user._id }))) fail(403, "You're not in this group.");
+    return { user, g };
   }
 
   // ---------- handlers ----------
@@ -308,7 +357,7 @@ export async function createApp({
           },
         ])
         .toArray();
-      const board = await monthBoard({ month });
+      const board = await pointsBoard({ month });
       const rankIndex = board.findIndex((r) => r._id === id);
       const findsByLevel = Object.fromEntries(game.LEVELS.map((l) => [l.name, 0]));
       for (const r of await col.finds.aggregate([{ $match: { userId: id } }, { $group: { _id: '$level', n: { $sum: 1 } } }]).toArray()) {
@@ -526,13 +575,128 @@ export async function createApp({
       });
     },
 
+    // ----- friend groups -----
+    async groups(ctx) {
+      const user = requireUser(ctx);
+      const memberships = await col.groupMembers.find({ userId: user._id }).sort({ joinedAt: 1 }).toArray();
+      const groups = new Map(
+        (await col.groups.find({ _id: { $in: memberships.map((m) => m.groupId) } }).toArray()).map((g) => [g._id, g]),
+      );
+      return {
+        groups: memberships.map((m) => groups.get(m.groupId)).filter(Boolean).map((g) => publicGroup(g, user)),
+        limits: { groups: MAX_GROUPS_PER_USER, members: MAX_GROUP_MEMBERS },
+      };
+    },
+
+    async createGroup(ctx) {
+      const user = requireUser(ctx);
+      const name = groupName(ctx.body?.name);
+      const g = { _id: crypto.randomUUID(), name, ownerId: user._id, inviteCode: await newInviteCode(), memberCount: 1, createdAt: now() };
+      await tx(async (session) => {
+        await lockUser(session, user._id);
+        await checkGroupLimit(session, user._id);
+        await col.groups.insertOne(g, { session });
+        await col.groupMembers.insertOne({ _id: crypto.randomUUID(), groupId: g._id, userId: user._id, joinedAt: g.createdAt }, { session });
+      });
+      return { group: publicGroup(g, user) };
+    },
+
+    // What an invite link points to, so the join screen can show the group's name first.
+    async groupInvite(ctx) {
+      const user = requireUser(ctx);
+      const code = normalizeCode(ctx.params[0]);
+      const g = (code.length === INVITE_LENGTH && (await col.groups.findOne({ inviteCode: code }))) || fail(404, 'That invite link is not valid. Ask for a new one.');
+      const member = await col.groupMembers.findOne({ groupId: g._id, userId: user._id });
+      return {
+        group: { id: g._id, name: g.name, memberCount: g.memberCount, full: g.memberCount >= MAX_GROUP_MEMBERS },
+        alreadyMember: Boolean(member),
+      };
+    },
+
+    async joinGroup(ctx) {
+      const user = requireUser(ctx);
+      const code = normalizeCode(ctx.body?.code);
+      const g = (code.length === INVITE_LENGTH && (await col.groups.findOne({ inviteCode: code }))) || fail(404, 'No group has that invite code.');
+      await tx(async (session) => {
+        await lockUser(session, user._id);
+        if (await col.groupMembers.findOne({ groupId: g._id, userId: user._id }, { session })) return; // already in
+        await checkGroupLimit(session, user._id);
+        // Counting atomically on the group document keeps the size limit under concurrent joins.
+        const r = await col.groups.updateOne({ _id: g._id, memberCount: { $lt: MAX_GROUP_MEMBERS } }, { $inc: { memberCount: 1 } }, { session });
+        if (!r.matchedCount) {
+          const exists = await col.groups.findOne({ _id: g._id }, { session });
+          fail(exists ? 409 : 404, exists ? `This group is full (${MAX_GROUP_MEMBERS} players).` : 'That group no longer exists.');
+        }
+        await col.groupMembers.insertOne({ _id: crypto.randomUUID(), groupId: g._id, userId: user._id, joinedAt: now() }, { session });
+      });
+      return { group: publicGroup(await col.groups.findOne({ _id: g._id }), user) };
+    },
+
+    async group(ctx) {
+      const [id] = ctx.params;
+      const { user, g } = await memberGroup(ctx, id);
+      const period = ctx.query.get('period') === 'all' ? 'all' : 'month';
+      const month = game.monthKey(now());
+      const memberIds = (await col.groupMembers.find({ groupId: id }).sort({ joinedAt: 1 }).toArray()).map((m) => m.userId);
+      const board = await pointsBoard(period === 'all' ? { userId: { $in: memberIds } } : { month, userId: { $in: memberIds } });
+      // Members who haven't scored are listed too (unranked), so everyone sees who's in.
+      const scored = new Set(board.map((r) => r._id));
+      const idle = (await col.users.find({ _id: { $in: memberIds.filter((m) => !scored.has(m)) } }, { projection: { username: 1 } }).toArray())
+        .map((u) => ({ _id: u._id, username: u.username, points: 0, finds: 0 }))
+        .sort((a, b) => a.username.localeCompare(b.username));
+      return {
+        group: publicGroup(g, user),
+        period,
+        month,
+        rows: [...board, ...idle].map((r, i) => ({
+          userId: r._id,
+          username: r.username,
+          points: r.points,
+          finds: r.finds,
+          rank: r.points > 0 ? i + 1 : null,
+          isOwner: r._id === g.ownerId,
+        })),
+      };
+    },
+
+    async renameGroup(ctx) {
+      const [id] = ctx.params;
+      const { user, g } = await memberGroup(ctx, id);
+      if (g.ownerId !== user._id) fail(403, 'Only the group owner can rename it.');
+      const name = groupName(ctx.body?.name);
+      await col.groups.updateOne({ _id: id }, { $set: { name } });
+      return { group: publicGroup({ ...g, name }, user) };
+    },
+
+    // Leaving hands ownership to the longest-standing member; the last one out deletes the group.
+    async leaveGroup(ctx) {
+      const user = requireUser(ctx);
+      const [id] = ctx.params;
+      if (!isUuid(id)) fail(404, 'Group not found');
+      return tx(async (session) => {
+        const g = await col.groups.findOneAndUpdate({ _id: id }, { $inc: { memberCount: -1 } }, { session, returnDocument: 'after' });
+        if (!g) fail(404, 'Group not found');
+        const left = await col.groupMembers.deleteOne({ groupId: id, userId: user._id }, { session });
+        if (!left.deletedCount) fail(403, "You're not in this group.");
+        if (g.memberCount <= 0) {
+          await col.groups.deleteOne({ _id: id }, { session });
+          return { left: true, deleted: true };
+        }
+        if (g.ownerId === user._id) {
+          const heir = await col.groupMembers.find({ groupId: id }, { session }).sort({ joinedAt: 1, _id: 1 }).limit(1).next();
+          await col.groups.updateOne({ _id: id }, { $set: { ownerId: heir.userId } }, { session });
+        }
+        return { left: true, deleted: false };
+      });
+    },
+
     async leaderboard({ query }) {
       await ensureStations();
       const month = query.get('month') || game.monthKey(now());
       if (!/^\d{4}-\d{2}$/.test(month)) fail(400, 'Month must look like 2026-11.');
       const stationId = query.get('stationId') || null;
       const match = stationId ? { month, stationId } : { month };
-      const board = await monthBoard(match);
+      const board = await pointsBoard(match);
       const byStation = await col.finds.aggregate([{ $match: match }, { $group: { _id: '$stationId', points: { $sum: '$points' } } }]).toArray();
       const lineTotals = new Map();
       for (const r of byStation) {
@@ -568,6 +732,13 @@ export async function createApp({
     ['POST', /^\/api\/eggs$/, api.createEgg, 'optional'],
     ['POST', /^\/api\/eggs\/([^/]+)\/report$/, api.reportEgg, 'optional'],
     ['GET', /^\/api\/leaderboard$/, api.leaderboard, 'none'],
+    ['GET', /^\/api\/groups$/, api.groups, 'optional'],
+    ['POST', /^\/api\/groups$/, api.createGroup, 'optional'],
+    ['POST', /^\/api\/groups\/join$/, api.joinGroup, 'optional'],
+    ['GET', /^\/api\/groups\/invite\/([^/]+)$/, api.groupInvite, 'optional'],
+    ['GET', /^\/api\/groups\/([^/]+)$/, api.group, 'optional'],
+    ['POST', /^\/api\/groups\/([^/]+)\/rename$/, api.renameGroup, 'optional'],
+    ['POST', /^\/api\/groups\/([^/]+)\/leave$/, api.leaveGroup, 'optional'],
   ];
 
   function corsHeaders(req) {

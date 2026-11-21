@@ -43,6 +43,8 @@ Env vars live in `backend/.env` locally (see `backend/.env.example`) and in Verc
 
 **Game rules (`backend/src/game.js`).** Pure functions and constants: `LEVELS`, scoring, `monthKey` (America/New_York), timer bounds and line families. Change game balance here. `finds.month` is stored at insert time so the monthly leaderboard is an indexed `$group`.
 
+**Friend groups (`app.js`, `groups` + `groupMembers` collections).** A group stores `name`, `ownerId`, `inviteCode` (unique, 8 characters from a look-alike-free alphabet) and a denormalized `memberCount`. Joins run in `db.tx`: `lockUser()` (a `locks` doc per player) enforces `MAX_GROUPS_PER_USER`, and a conditional `$inc` on `memberCount` enforces `MAX_GROUP_MEMBERS`. Leaving decrements the count, hands ownership to the earliest `joinedAt`, or deletes the group at 0 members. Group boards reuse `pointsBoard(match)` with `userId: { $in: members }`, and members with no finds are appended unranked.
+
 **MBTA (`backend/src/mbta.js`).** V3 API client. Stations are fetched once and cached in `backend/data/stations.json`, which is committed and included in the Vercel function through `includeFiles`. Live `/predictions` drive "race the next train", which applies only when the next train is 90–900s away.
 
 **Verification (`backend/src/verify.js`).** Gemini compares the two photos, with a confidence threshold of 0.6. With no key, or when the call fails, it falls back to `{ method: 'honor', match: true }`.

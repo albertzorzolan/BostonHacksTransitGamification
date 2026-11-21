@@ -90,6 +90,14 @@ To host `frontend/` somewhere else, set `window.EGG_API_BASE` in `frontend/confi
   - An egg is retired after 3 reports, or after 7 days live with no finds.
 - **Leaderboard:** this month (Boston time) for everyone, by station, or by line (Red / Orange / Blue / Green).
 
+## Friend groups
+
+- Any player can create a named group. The creator owns it and is the only one who can rename it.
+- Every group has an 8-character invite code and a link (`/#/join/CODE`) that any member can share. Opening the link signed out goes through sign-up first, then straight to the join screen.
+- Each group has its own leaderboard covering only its members, for this month or all time. Members with no points are listed unranked.
+- When the owner leaves, the longest-standing member becomes the owner. The last member to leave deletes the group.
+- Limits: 20 groups per player and 50 players per group. Both hold even when people join at the same moment.
+
 ## Code map
 
 - `api/index.js`: Vercel function entry

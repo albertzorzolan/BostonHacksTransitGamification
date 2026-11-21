@@ -257,6 +257,89 @@ test('unfound eggs retire after 7 days', async () => {
   assert.equal((await ok('/api/stations/place-kencl')).slots[4].egg, null);
 });
 
+test('friend groups: create, invite, join, group leaderboard', async () => {
+  const [gia, hugo, iris, outsider] = [await user('gia'), await user('hugo'), await user('iris'), await user('outsider')];
+  assert.equal((await call('/api/groups', { name: 'Red Line Crew' })).status, 401, 'must be signed in');
+  assert.equal((await call('/api/groups', { name: 'x' }, gia)).status, 400, 'name too short');
+  assert.equal((await call('/api/groups', { name: '<b>hi</b>' }, gia)).status, 400, 'no markup in names');
+
+  const { group } = await ok('/api/groups', { name: '  Red   Line Crew ' }, gia);
+  assert.equal(group.name, 'Red Line Crew', 'whitespace is tidied');
+  assert.equal(group.isOwner, true);
+  assert.match(group.inviteCode, /^[A-HJ-NP-Z2-9]{8}$/);
+
+  // Invite preview, then join (codes are case- and dash-insensitive).
+  const preview = await ok(`/api/groups/invite/${group.inviteCode.toLowerCase()}`, null, hugo);
+  assert.deepEqual([preview.group.name, preview.alreadyMember], ['Red Line Crew', false]);
+  const sloppy = `${group.inviteCode.slice(0, 4)}-${group.inviteCode.slice(4)}`.toLowerCase();
+  assert.equal((await ok('/api/groups/join', { code: sloppy }, hugo)).group.memberCount, 2);
+  assert.equal((await ok('/api/groups/join', { code: group.inviteCode }, hugo)).group.memberCount, 2, 'joining twice is a no-op');
+  await ok('/api/groups/join', { code: group.inviteCode }, iris);
+  assert.equal((await call('/api/groups/join', { code: 'ZZZZZZZZ' }, iris)).status, 404);
+  assert.equal((await call(`/api/groups/invite/nope`, null, iris)).status, 404);
+
+  // Only members can see the board.
+  assert.equal((await call(`/api/groups/${group.id}`, null, outsider)).status, 403);
+  assert.equal((await call(`/api/groups/${group.id}`)).status, 401);
+
+  // hugo scores; the outsider scores more but isn't in the group.
+  await ok('/api/eggs', { stationId: 'place-kencl', level: 4, image: IMG }, gia);
+  const egg4 = (await ok('/api/stations/place-kencl')).slots[3].egg.id;
+  for (const who of [hugo, outsider]) {
+    const r = await ok('/api/attempts', { eggId: egg4 }, who);
+    await ok(`/api/attempts/${r.attempt.id}/find`, { image: IMG }, who);
+  }
+  const board = await ok(`/api/groups/${group.id}`, null, iris);
+  assert.equal(board.group.isOwner, false);
+  assert.deepEqual(board.rows.map((r) => [r.username, r.rank]), [['hugo', 1], ['gia', null], ['iris', null]], 'members only; zero-point members listed unranked');
+  assert.equal(board.rows[0].points, 60, 'level 4 = 40 base + 20 full time bonus');
+  assert.equal(board.rows.find((r) => r.username === 'gia').isOwner, true);
+  const allTime = await ok(`/api/groups/${group.id}?period=all`, null, iris);
+  assert.equal(allTime.period, 'all');
+  assert.equal(allTime.rows[0].points, 60);
+
+  const mine = await ok('/api/groups', null, hugo);
+  assert.deepEqual(mine.groups.map((g) => g.name), ['Red Line Crew']);
+
+  // Rename: owner only.
+  assert.equal((await call(`/api/groups/${group.id}/rename`, { name: 'Hacked' }, hugo)).status, 403);
+  assert.equal((await ok(`/api/groups/${group.id}/rename`, { name: 'Green Line Gang' }, gia)).group.name, 'Green Line Gang');
+
+  // Owner leaves: the longest-standing member (hugo) takes over.
+  assert.equal((await call(`/api/groups/${group.id}/leave`, {}, outsider)).status, 403);
+  await ok(`/api/groups/${group.id}/leave`, {}, gia);
+  const after = await ok(`/api/groups/${group.id}`, null, hugo);
+  assert.equal(after.group.isOwner, true, 'ownership passed to hugo');
+  assert.equal(after.group.memberCount, 2);
+  assert.equal((await call(`/api/groups/${group.id}`, null, gia)).status, 403, 'gia is out');
+
+  // Last one out deletes the group.
+  await ok(`/api/groups/${group.id}/leave`, {}, iris);
+  const last = await ok(`/api/groups/${group.id}/leave`, {}, hugo);
+  assert.equal(last.deleted, true);
+  assert.equal((await call(`/api/groups/join`, { code: group.inviteCode }, gia)).status, 404, 'invite dies with the group');
+});
+
+test('friend groups: size and per-player limits hold under concurrent joins', async () => {
+  const { MAX_GROUP_MEMBERS, MAX_GROUPS_PER_USER } = await import('../src/app.js');
+  const owner = await user('bigowner');
+  const { group } = await ok('/api/groups', { name: 'Huge Group' }, owner);
+  // Fill to one below the limit directly, then race 3 joiners for the last seat.
+  const filler = Array.from({ length: MAX_GROUP_MEMBERS - 2 }, (_, i) => ({ _id: crypto.randomUUID(), groupId: group.id, userId: crypto.randomUUID(), joinedAt: new Date(clock) }));
+  await db.col.groupMembers.insertMany(filler);
+  await db.col.groups.updateOne({ _id: group.id }, { $set: { memberCount: MAX_GROUP_MEMBERS - 1 } });
+  const racers = [await user('racer1'), await user('racer2'), await user('racer3')];
+  const results = await Promise.all(racers.map((r) => call('/api/groups/join', { code: group.inviteCode }, r)));
+  assert.deepEqual(results.map((r) => r.status).sort(), [200, 409, 409], 'exactly one gets the last seat');
+  assert.equal(await db.col.groupMembers.countDocuments({ groupId: group.id }), MAX_GROUP_MEMBERS);
+  assert.equal((await db.col.groups.findOne({ _id: group.id })).memberCount, MAX_GROUP_MEMBERS);
+
+  const busy = await user('busy');
+  await Promise.all(Array.from({ length: MAX_GROUPS_PER_USER }, (_, i) => ok('/api/groups', { name: `Group ${i}` }, busy)));
+  assert.equal((await call('/api/groups', { name: 'One too many' }, busy)).status, 409);
+  assert.equal(await db.col.groupMembers.countDocuments({ userId: busy.id }), MAX_GROUPS_PER_USER);
+});
+
 test('bad input, CORS, health and static files', async () => {
   assert.equal((await call('/api/auth/register', { username: '<script>', password: PW })).status, 400);
   const lee = await user('lee');

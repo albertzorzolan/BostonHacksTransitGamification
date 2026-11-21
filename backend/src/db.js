@@ -17,6 +17,8 @@ export async function createDb({ uri, dbName = 'egghunt', maxPoolSize = 10 }) {
     finds: db.collection('finds'),
     reports: db.collection('reports'),
     locks: db.collection('locks'),
+    groups: db.collection('groups'),
+    groupMembers: db.collection('groupMembers'),
   };
 
   // Idempotent, so every instance runs it on startup.
@@ -40,6 +42,10 @@ export async function createDb({ uri, dbName = 'egghunt', maxPoolSize = 10 }) {
     col.finds.createIndex({ eggId: 1, foundAt: 1 }),
     col.finds.createIndex({ userId: 1, foundAt: -1 }),
     col.reports.createIndex({ eggId: 1, userId: 1 }, { unique: true }),
+    col.groups.createIndex({ inviteCode: 1 }, { unique: true }),
+    col.groupMembers.createIndex({ groupId: 1, userId: 1 }, { unique: true }),
+    col.groupMembers.createIndex({ userId: 1, joinedAt: 1 }),
+    col.groupMembers.createIndex({ groupId: 1, joinedAt: 1 }),
   ]);
 
   // Runs fn(session) in a transaction. withTransaction retries the whole
