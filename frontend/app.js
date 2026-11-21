@@ -698,7 +698,7 @@ async function showStation(id, { here = false, distance = null } = {}) {
 function stubRow(slot) {
   const { egg } = slot;
   const pips = `<span class="pips" aria-label="Difficulty ${slot.level} of 5">${[1, 2, 3, 4, 5].map((i) => `<i class="${i <= slot.level ? 'on' : ''}"></i>`).join('')}</span>`;
-  const mins = `${Math.round(slot.seconds / 60)} min`;
+  const mins = `${Math.round(slot.seconds / 60)} min${slot.blur ? (slot.blur >= 12 ? ', very blurry photo' : ', blurred photo') : ''}`;
   if (!egg) {
     return `<li class="stub is-empty">
       <span class="punch" aria-hidden="true">${slot.level}</span>
@@ -772,6 +772,7 @@ function viewPlay() {
         <div class="egg-photo">
           <img src="${apiUrl(egg.imageUrl)}" alt="The egg to find: a photo of something in this station" />
           ${play.firstChance ? '<p class="first-tag">Nobody has found this yet</p>' : ''}
+          ${egg.blur ? `<p class="blur-tag">${egg.blur === 'heavy' ? 'Heavily blurred' : 'Blurred'}: ${esc(egg.levelName)}</p>` : ''}
         </div>
         ${egg.hint ? `<p class="hint"><b>Hint</b> ${esc(egg.hint)}</p>` : ''}
       </div>
@@ -819,12 +820,14 @@ function viewPlay() {
     if (!file) return;
     const status = $('#status');
     $('#snap').hidden = true;
-    status.innerHTML = `<div class="notice row"><div class="spin" aria-hidden="true"></div>${state.config?.gemini ? 'Checking your photo against the egg' : 'Saving your find'}</div>`;
+    status.innerHTML = `<div class="notice row"><div class="spin" aria-hidden="true"></div>${state.config?.gemini ? 'Checking it is the same object as the egg' : 'Saving your find'}</div>`;
     try {
       const image = await photoToJpeg(file);
       const result = await api(`/api/attempts/${attempt.id}/find`, { image });
       if (result.status === 'no_match') {
-        status.innerHTML = `<div class="notice bad"><b>Not a match.</b> ${esc(result.reason)} Keep looking.</div>`;
+        status.innerHTML = result.unavailable
+          ? `<div class="notice bad"><b>Photo check failed.</b> ${esc(result.reason)} Your timer is still running.</div>`
+          : `<div class="notice bad"><b>Failed: not the same object.</b> ${esc(result.reason)} Keep looking.</div>`;
         $('#snap').hidden = false;
         e.target.value = '';
         return;
@@ -912,10 +915,10 @@ async function renderResult() {
     </section>
     <section class="match" aria-label="Photo check">
       <div class="match-pair">
-        <figure class="m"><img src="${apiUrl(egg.imageUrl)}" alt="The egg photo" /><figcaption>The egg</figcaption></figure>
+        <figure class="m"><img src="${apiUrl(result.revealUrl || egg.imageUrl)}" alt="The egg photo" /><figcaption>${egg.blur && result.revealUrl ? 'The egg, unblurred' : 'The egg'}</figcaption></figure>
         ${play.myPhoto ? `<figure class="m"><img src="${play.myPhoto}" alt="Your photo" /><figcaption>Your photo</figcaption></figure>` : ''}
       </div>
-      <p class="match-verdict ${verification.method === 'gemini' ? 'is-ok' : ''}">${verification.method === 'gemini' ? `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>Photos match${verification.reason ? `: ${esc(verification.reason)}` : ''}` : esc(verification.reason)}</p>
+      <p class="match-verdict ${verification.method === 'gemini' ? 'is-ok' : ''}">${verification.method === 'gemini' ? `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg><b>Cleared.</b> Same object${verification.reason ? `: ${esc(verification.reason)}` : ''}` : esc(verification.reason)}</p>
     </section>
     <ul id="gains" class="gains" aria-live="polite"></ul>
     <section class="next-egg">
@@ -1021,7 +1024,7 @@ function viewHide() {
     <section class="tk hide-tk">
       <div class="tk-top">
         <div id="preview" class="egg-photo egg-photo-empty">
-          <p class="photo-empty">Photograph something small in ${esc(hide.stationName)}. Easy should take a minute to find. Impossible should take real searching.</p>
+          <p class="photo-empty">Photograph something small in ${esc(hide.stationName)}. Easy should take a minute to find. Impossible should take real searching.${level.blur ? ` Finders will see this photo ${level.blur >= 12 ? 'heavily blurred' : 'blurred'}, so pick something they can still recognise up close.` : ''}</p>
         </div>
         <label class="btn btn-ghost btn-block" id="pick">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
@@ -1168,7 +1171,9 @@ function ticketsGrid(finds) {
           const fam = st ? familiesOf(st.lines)[0] : null;
           return `<li class="mini" style="--ln:${LINE_VAR[fam] ?? 'var(--ink)'}">
             <p class="mini-band ${fam === 'Orange' ? 'mini-band-dark' : ''}">${esc(f.stationName)}</p>
-            <div class="mini-pic"><img src="${apiUrl(f.photoUrl)}" alt="Find at ${esc(f.stationName)}" loading="lazy" /></div>
+            <div class="mini-pic">${f.photoUrl
+              ? `<img src="${apiUrl(f.photoUrl)}" alt="Find at ${esc(f.stationName)}" loading="lazy" />`
+              : '<p class="mini-hidden">Hidden until you find it</p>'}</div>
             <p class="mini-lv">${esc(f.levelName)} <b>+${f.points}</b></p>
             <span class="hole hole-s" aria-hidden="true"></span>
           </li>`;

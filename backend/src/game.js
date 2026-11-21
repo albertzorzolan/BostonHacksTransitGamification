@@ -1,12 +1,15 @@
 // Game rules: levels, scoring, timers. Pure functions, no database.
 // How eggs rotate through a station's slots lives in slots.js (SQL).
 
+// Every level gets the same 3-minute timer; harder levels show the finder a blurred photo instead.
+// blur = Gaussian sigma in pixels, applied after scaling the photo to fit 1024 px (0 = sharp).
+export const ROUND_SECONDS = 180;
 export const LEVELS = [
-  { level: 1, name: 'Easy', points: 10, seconds: 120 },
-  { level: 2, name: 'Medium', points: 20, seconds: 180 },
-  { level: 3, name: 'Hard', points: 30, seconds: 240 },
-  { level: 4, name: 'Extreme', points: 40, seconds: 300 },
-  { level: 5, name: 'Impossible', points: 60, seconds: 360 },
+  { level: 1, name: 'Easy', points: 10, seconds: ROUND_SECONDS, blur: 0 },
+  { level: 2, name: 'Medium', points: 20, seconds: ROUND_SECONDS, blur: 0 },
+  { level: 3, name: 'Hard', points: 30, seconds: ROUND_SECONDS, blur: 0 },
+  { level: 4, name: 'Extreme', points: 40, seconds: ROUND_SECONDS, blur: 6 },
+  { level: 5, name: 'Impossible', points: 60, seconds: ROUND_SECONDS, blur: 16 },
 ];
 
 export const GRACE_SECONDS = 15; // upload time allowance after the clock hits zero

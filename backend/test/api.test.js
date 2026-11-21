@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createApp } from '../src/app.js';
 import { createDb, startMemoryMongo } from '../src/db.js';
+import sharp from 'sharp';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DB_NAME = `egghunt_test_${crypto.randomBytes(4).toString('hex')}`;
@@ -18,12 +19,18 @@ const STATIONS = [
   // Same line layout as the two above, kept for the progress test so its slots are free.
   { id: 'test-green', name: 'Test Green', lat: 42.35, lng: -71.09, lines: [{ id: 'Green-B', name: 'Green Line B', color: '#00843D' }] },
   { id: 'test-redgreen', name: 'Test Red Green', lat: 42.355, lng: -71.06, lines: [{ id: 'Red', name: 'Red Line', color: '#DA291C' }, { id: 'Green-B', name: 'Green Line B', color: '#00843D' }] },
+  { id: 'test-blur', name: 'Test Blur', lat: 42.36, lng: -71.07, lines: [{ id: 'Orange', name: 'Orange Line', color: '#ED8B00' }] },
 ];
 const fakeMbta = {
   loadStations: async () => STATIONS,
   predictions: async () => [{ routeId: 'Green-B', line: 'Green Line B', color: '#00843D', headsign: 'Boston College', seconds: 240 }],
 };
-const IMG = `data:image/jpeg;base64,${Buffer.alloc(300, 7).toString('base64')}`;
+// A real JPEG (with some detail, so a blurred copy is measurably different).
+const IMG_BUF = await sharp({ create: { width: 320, height: 240, channels: 3, background: '#d94a3a' } })
+  .composite([{ input: Buffer.from('<svg width="320" height="240"><rect x="40" y="40" width="80" height="160" fill="#fff"/><rect x="200" y="60" width="60" height="60" fill="#123"/></svg>'), top: 0, left: 0 }])
+  .jpeg({ quality: 90 })
+  .toBuffer();
+const IMG = `data:image/jpeg;base64,${IMG_BUF.toString('base64')}`;
 const PW = 'correct horse';
 
 let clock = Date.parse('2026-11-21T20:00:00Z');
@@ -136,7 +143,7 @@ test('full round: hide, find, hide next, leaderboard', async () => {
   assert.equal(round.egg.hint, 'by the stairs');
   const photo = await fetch(base + round.egg.imageUrl);
   assert.equal(photo.status, 200);
-  assert.equal((await photo.arrayBuffer()).byteLength, 300, 'egg photo is served from the database');
+  assert.equal((await photo.arrayBuffer()).byteLength, IMG_BUF.length, 'level 2: the original photo, served from the database');
 
   assert.equal((await call(`/api/attempts/${round.attempt.id}/find`, { image: IMG }, ana)).status, 403, 'not your round');
 
@@ -219,7 +226,7 @@ test('no match keeps the round open; time runs out', async () => {
   assert.equal(miss.status, 'no_match');
   nextVerify = { method: 'gemini', match: true, confidence: 0.9, reason: 'ok' };
 
-  clock += (120 + 16) * 1000; // past limit + grace
+  clock += (180 + 16) * 1000; // past the 3-minute limit + grace
   const late = await ok(`/api/attempts/${round.attempt.id}/find`, { image: IMG }, dan);
   assert.equal(late.status, 'expired');
 });
@@ -390,6 +397,60 @@ test('group sticker chat: members only, stickers only, polling, rate limit', asy
   assert.equal(await db.col.groupMessages.countDocuments({ groupId: group.id }), 0);
 });
 
+test('every level has a 3-minute timer; Extreme and Impossible show a blurred photo', async () => {
+  const cfg = await ok('/api/config');
+  assert.deepEqual(cfg.levels.map((l) => l.seconds), [180, 180, 180, 180, 180]);
+  assert.deepEqual(cfg.levels.map((l) => l.points), [10, 20, 30, 40, 60], 'points unchanged');
+
+  const [hider, finder, rival] = [await user('blurhider'), await user('blurfinder'), await user('blurrival')];
+  for (const level of [1, 4, 5]) await ok('/api/eggs', { stationId: 'test-blur', level, image: IMG }, hider);
+  const slots = (await ok('/api/stations/test-blur', null, finder)).slots;
+  const pixels = async (url) => sharp(Buffer.from(await (await fetch(base + url)).arrayBuffer())).resize(64, 48).raw().toBuffer();
+  const sharpPx = await sharp(IMG_BUF).resize(64, 48).raw().toBuffer();
+  // Mean absolute pixel difference from the original: 0 = identical.
+  const diffFrom = (px) => px.reduce((sum, v, i) => sum + Math.abs(v - sharpPx[i]), 0) / px.length;
+
+  const rounds = {};
+  for (const level of [1, 4, 5]) {
+    const egg = slots.find((s) => s.level === level).egg;
+    rounds[level] = await ok('/api/attempts', { eggId: egg.id }, finder);
+    assert.equal(rounds[level].attempt.limitSeconds, 180, `level ${level}: 3 minutes`);
+  }
+  assert.equal(rounds[1].egg.blur, null);
+  assert.equal(rounds[4].egg.blur, 'light');
+  assert.equal(rounds[5].egg.blur, 'heavy');
+
+  const d1 = diffFrom(await pixels(rounds[1].egg.imageUrl));
+  const d4 = diffFrom(await pixels(rounds[4].egg.imageUrl));
+  const d5 = diffFrom(await pixels(rounds[5].egg.imageUrl));
+  assert.ok(d1 < 2, `Easy is the original (diff ${d1.toFixed(1)})`);
+  assert.ok(d4 > d1 + 3, `Extreme is blurred (diff ${d4.toFixed(1)})`);
+  assert.ok(d5 > d4 + 3, `Impossible is blurred much more (diff ${d5.toFixed(1)})`);
+
+  // The finder never gets the original's URL until they find it; then it's revealed.
+  const egg5 = await db.col.eggs.findOne({ _id: rounds[5].egg.id });
+  assert.notEqual(rounds[5].egg.imageUrl, `/photos/${egg5.photoId}.jpg`);
+  const found = await ok(`/api/attempts/${rounds[5].attempt.id}/find`, { image: IMG }, finder);
+  assert.equal(found.revealUrl, `/photos/${egg5.photoId}.jpg`);
+
+  // A rival can't see the finder's sharp find photo while that egg is still in play...
+  const fromRival = await ok(`/api/users/${finder.id}`, null, rival);
+  assert.equal(fromRival.recentFinds[0].photoUrl, null);
+  // ...but the finder sees their own.
+  assert.ok((await ok(`/api/users/${finder.id}`, null, finder)).recentFinds[0].photoUrl);
+
+  // Eggs hidden before blurring existed get their blurred copy on first play.
+  const egg4 = await db.col.eggs.findOne({ _id: rounds[4].egg.id });
+  await db.col.eggs.updateOne({ _id: egg4._id }, { $unset: { displayPhotoId: '' } });
+  const again = await ok('/api/attempts', { eggId: egg4._id }, rival);
+  assert.notEqual(again.egg.imageUrl, `/photos/${egg4.photoId}.jpg`);
+  assert.ok((await db.col.eggs.findOne({ _id: egg4._id })).displayPhotoId, 'copy saved for next time');
+
+  // A level-5 upload that isn't a real image is refused instead of breaking later.
+  const junk = `data:image/jpeg;base64,${Buffer.alloc(400, 7).toString('base64')}`;
+  assert.equal((await call('/api/eggs', { stationId: 'test-blur', level: 4, image: junk }, hider)).status, 400);
+});
+
 test('bad input, CORS, health and static files', async () => {
   assert.equal((await call('/api/auth/register', { username: '<script>', password: PW })).status, 400);
   const lee = await user('lee');
@@ -453,8 +514,8 @@ test('progress: rider level, daily challenge, stamps, stations and lines', async
   assert.deepEqual(p.lines.find((l) => l.line === 'Green'), { line: 'Green', stations: 2 });
   assert.deepEqual(p.lines.find((l) => l.line === 'Red'), { line: 'Red', stations: 1 });
   assert.deepEqual(new Set(p.today.lines), new Set(['Green', 'Red']));
-  // 60 + 28 bonus at Kenmore, 60 + 23 bonus racing the train = 171 -> level 3 (150 to 300)
-  assert.equal(p.level.points, 171);
+  // 60 + 27 bonus (20 s of 3 min) at Kenmore, 60 + 23 bonus racing the train = 170 -> level 3 (150 to 300)
+  assert.equal(p.level.points, 170);
   assert.deepEqual([p.level.level, p.level.floor, p.level.next], [3, 150, 300]);
   assert.ok(['transfer', 'racer', 'climber', 'triple'].includes(p.today.id));
   assert.equal(p.today.target >= p.today.progress, true);

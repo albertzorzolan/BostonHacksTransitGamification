@@ -8,7 +8,7 @@ Station Egg Hunt is a BostonHacks 2026 (Transit Gamification) hackathon app. Rid
 
 An npm workspace: `backend/` (Node API + MongoDB) and `frontend/` (static phone web app, no build step), plus `api/index.js` and `vercel.json` for deploying both as one Vercel project. Needs Node 22.9+.
 
-The backend's only runtime dependency is `mongodb`, and `mongodb-memory-server` is a dev dependency. Use Node built-ins for everything else (`node:http`, `node:test`, `node:crypto`, global `fetch`), and ask before adding packages. The frontend has no dependencies and no build step.
+The backend's runtime dependencies are `mongodb` and `sharp` (image processing, for blurred egg photos), and `mongodb-memory-server` is a dev dependency. Use Node built-ins for everything else (`node:http`, `node:test`, `node:crypto`, global `fetch`), and ask before adding packages. The frontend has no dependencies and no build step.
 
 ```bash
 npm install                                  # once, at the repo root
@@ -40,6 +40,8 @@ Env vars live in `backend/.env` locally (see `backend/.env.example`) and in Verc
 **Concurrency (`backend/src/slots.js`, `db.tx`).** All egg-slot changes (place, rotate after a find, retire) run inside `db.tx(fn)`, a MongoDB transaction through `session.withTransaction`, after `lockSlot()`, which `$inc`s a per-slot document in `locks`. Two transactions on the same slot then write-conflict, and the driver retries the loser. `withTransaction` may run `fn` more than once, so `fn` must only touch the database (no Gemini or MBTA calls), and every query inside it must pass `{ session }`. A partial unique index also enforces one active egg per slot. `submitFind` runs the slow Gemini check *outside* the transaction, then closes the round atomically with `findOneAndUpdate({ status: 'open' })`. `finds {userId, eggId}` is unique, and `isDuplicateKey` turns a race into a 409. Transactions need a replica set: Atlas always is one, and the in-memory server is started as one.
 
 **DB (`backend/src/db.js`).** `createDb({ uri, dbName })` connects, creates all indexes (idempotent, on every start) and returns `{ client, db, col, tx, close }`, where `col.<name>` is each collection. `startMemoryMongo()` starts mongodb-memory-server, pinned to mongod 7.0.14 (`MONGOMS_VERSION` overrides it). Add new collections and indexes to `createDb`.
+
+**Blurred eggs (`backend/src/images.js`).** Every level has a 3-minute timer (`ROUND_SECONDS`). `LEVELS[].blur` is a Gaussian sigma: 0 for Easy to Hard, 6 for Extreme and 16 for Impossible, applied after scaling to fit 1024 px. `createEgg` stores a blurred copy as `eggs.displayPhotoId`, and `displayPhotoId(egg)` makes it lazily for older eggs. Finders only ever get the copy's URL. `submitFind` returns `revealUrl` (the original) after a find, and `profile()` hides other players' find photos (`photoUrl: null`) of eggs that are still active or pooled, unless the viewer has found that egg too. Never send `egg.photoId` to a finder.
 
 **Game rules (`backend/src/game.js`).** Pure functions and constants: `LEVELS`, scoring, `monthKey` (America/New_York), timer bounds and line families. Change game balance here. `finds.month` is stored at insert time so the monthly leaderboard is an indexed `$group`.
 

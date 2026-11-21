@@ -3,11 +3,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { verifyMatch } from './verify.js';
+import { verifyMatch, checkGemini } from './verify.js';
 import { isDuplicateKey } from './db.js';
 import * as game from './game.js';
 import * as slots from './slots.js';
 import * as auth from './auth.js';
+import { blurredCopy } from './images.js';
 
 // Vercel functions accept request bodies up to 4.5 MB; phones send ~0.3 MB after downscaling.
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
@@ -54,7 +55,7 @@ export async function createApp({
   mbta,
   verify = verifyMatch,
   geminiKey = '',
-  geminiModel = 'gemini-2.5-flash',
+  geminiModel = 'gemini-3.1-flash-lite,gemini-3-flash-preview',
   now = () => new Date(),
   frontendDir = null,
   corsOrigins = ['*'],
@@ -96,6 +97,25 @@ export async function createApp({
     const _id = crypto.randomUUID();
     await col.photos.insertOne({ _id, contentType, data, createdAt: now() }, { session });
     return _id;
+  }
+
+  // The photo a finder is shown: the original for Easy to Hard, a blurred copy for Extreme and
+  // Impossible. Eggs hidden before blurring existed get their copy made on first play.
+  async function displayPhotoId(egg) {
+    const sigma = game.levelInfo(egg.level).blur;
+    if (!sigma) return egg.photoId;
+    if (egg.displayPhotoId) return egg.displayPhotoId;
+    const original = await col.photos.findOne({ _id: egg.photoId }, { promoteBuffers: true });
+    let data;
+    try {
+      data = await blurredCopy(original.data, sigma);
+    } catch {
+      fail(409, "This egg's photo can't be prepared. Please report it.");
+    }
+    const id = await savePhoto(undefined, { data, contentType: 'image/jpeg' });
+    // If another request got there first, use theirs (the extra copy is just unused).
+    await col.eggs.updateOne({ _id: egg._id, displayPhotoId: { $exists: false } }, { $set: { displayPhotoId: id } });
+    return (await col.eggs.findOne({ _id: egg._id }, { projection: { displayPhotoId: 1 } })).displayPhotoId;
   }
 
   // Retiring stale eggs runs lazily on station reads, at most once a minute per instance.
@@ -207,9 +227,11 @@ export async function createApp({
 
   // ---------- handlers ----------
   const api = {
-    async health() {
+    // ?gemini=1 also checks that the photo-check model is reachable with the configured key.
+    async health({ query }) {
       await db.db.command({ ping: 1 });
-      return { ok: true };
+      if (query.get('gemini') !== '1') return { ok: true };
+      return { ok: true, ...(await checkGemini({ apiKey: geminiKey, model: geminiModel })) };
     },
 
     config() {
@@ -374,6 +396,16 @@ export async function createApp({
       }
       const myEggIds = (await col.eggs.find({ createdBy: id }, { projection: { _id: 1 } }).toArray()).map((e) => e._id);
       const recent = await col.finds.find({ userId: id }).sort({ foundAt: -1, _id: -1 }).limit(10).toArray();
+      // Someone else's find photo is a sharp picture of the egg. Keep it hidden while that egg can
+      // still be played (active, or in the pool) unless the viewer has found it too.
+      const viewerId = ctx.user._id;
+      let hidden = new Set();
+      if (viewerId !== id && recent.length) {
+        const eggIds = recent.map((f) => f.eggId);
+        const live = (await col.eggs.find({ _id: { $in: eggIds }, status: { $in: ['active', 'pool'] } }, { projection: { _id: 1 } }).toArray()).map((e) => e._id);
+        const seen = new Set((await col.finds.find({ userId: viewerId, eggId: { $in: live } }, { projection: { eggId: 1 } }).toArray()).map((f) => f.eggId));
+        hidden = new Set(live.filter((e) => !seen.has(e)));
+      }
       return {
         user: publicUser(user),
         monthPoints: totals?.month ?? 0,
@@ -389,7 +421,7 @@ export async function createApp({
           levelName: game.levelInfo(f.level).name,
           points: f.points,
           foundAt: f.foundAt,
-          photoUrl: photoUrl(f.photoId),
+          photoUrl: hidden.has(f.eggId) ? null : photoUrl(f.photoId),
           verified: f.verified,
         })),
       };
@@ -439,7 +471,8 @@ export async function createApp({
           levelName: info.name,
           points: info.points,
           hint: egg.hint,
-          imageUrl: photoUrl(egg.photoId),
+          imageUrl: photoUrl(await displayPhotoId(egg)),
+          blur: info.blur ? (info.blur >= 12 ? 'heavy' : 'light') : null,
           stationId: egg.stationId,
           stationName: stationName(egg.stationId),
         },
@@ -468,11 +501,16 @@ export async function createApp({
       const verification = await verify({
         originalJpeg: original.data,
         candidateJpeg: candidate.data,
+        originalType: original.contentType,
+        candidateType: candidate.contentType,
         apiKey: geminiKey,
         model: geminiModel,
       });
       const secondsLeft = Math.max(0, Math.round(attempt.limitSeconds - elapsed));
-      if (!verification.match) return { status: 'no_match', reason: verification.reason, secondsLeft };
+      // Failed check: nothing is saved and the round stays open, so the player can look again.
+      if (!verification.match) {
+        return { status: 'no_match', verdict: 'failed', reason: verification.reason, unavailable: Boolean(verification.unavailable), secondsLeft };
+      }
 
       const secondsTaken = Math.min(elapsed, attempt.limitSeconds);
       const score = game.scoreFind(egg.level, secondsTaken, attempt.limitSeconds);
@@ -528,6 +566,8 @@ export async function createApp({
         stationId: egg.stationId,
         level: egg.level,
         firstFind,
+        // Earned: the sharp original of a blurred egg, shown on the result screen.
+        revealUrl: photoUrl(egg.photoId),
       };
     },
 
@@ -539,6 +579,15 @@ export async function createApp({
       const level = Number(body?.level);
       if (!game.LEVELS.some((l) => l.level === level)) fail(400, 'Level must be 1–5.');
       const image = decodeImage(body?.image);
+      const sigma = game.levelInfo(level).blur;
+      let blurred = null;
+      if (sigma) {
+        try {
+          blurred = { data: await blurredCopy(image.data, sigma), contentType: 'image/jpeg' };
+        } catch {
+          fail(400, "Couldn't read that photo. Try taking it again.");
+        }
+      }
       const hint = String(body?.hint ?? '').trim().slice(0, 80);
       const t = now();
       const eggId = crypto.randomUUID();
@@ -559,7 +608,13 @@ export async function createApp({
           fail(409, 'This level already has an egg. Find it first to earn the right to hide the next one.');
         }
         const photoId = await savePhoto(session, image);
-        await slots.placeEgg(col, session, { _id: eggId, stationId: s.id, level, photoId, hint, createdBy: user._id }, t);
+        const displayPhotoId = blurred ? await savePhoto(session, blurred) : undefined;
+        await slots.placeEgg(
+          col,
+          session,
+          { _id: eggId, stationId: s.id, level, photoId, ...(displayPhotoId && { displayPhotoId }), hint, createdBy: user._id },
+          t,
+        );
       });
       return { egg: { id: eggId, stationId: s.id, level } };
     },
