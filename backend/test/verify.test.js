@@ -1,7 +1,7 @@
 // The photo check's verdicts, with a fake Gemini (no key or network needed).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { verifyMatch, checkGemini, MIN_CONFIDENCE } from '../src/verify.js';
+import { verifyMatch, checkGemini, MIN_CONFIDENCE, screenEggPhoto, SCREEN_MESSAGES } from '../src/verify.js';
 
 const EGG = Buffer.alloc(500, 1);
 const PHOTO = Buffer.alloc(500, 2);
@@ -117,4 +117,43 @@ test('falls back to the next model when the first errors or is slow', async () =
   const down = async () => new Response('', { status: 503 });
   const v3 = await verifyMatch({ originalJpeg: EGG, candidateJpeg: PHOTO, apiKey: 'k', model: 'a,b', fetchImpl: down });
   assert.deepEqual([v3.verdict, v3.unavailable], ['failed', true]);
+});
+
+const screenWith = (fake, extra = {}) => screenEggPhoto({ jpeg: PHOTO, apiKey: 'k', model: 'm1,m2', fetchImpl: fake.fetchImpl, ...extra });
+
+test('screen: a clear findable object passes', async () => {
+  const fake = gemini({ problem: 'none', subject: 'red sticker on a pillar', nameMatches: true, reason: 'One clear sticker.' });
+  const r = await screenWith(fake, { name: 'design' });
+  assert.deepEqual([r.ok, r.subject], [true, 'red sticker on a pillar']);
+  assert.match(fake.calls[0].body.contents[0].parts[1].text, /"design"/, 'what they typed is sent, quoted');
+  const { body } = fake.calls[0];
+  assert.equal(body.contents[0].parts.filter((p) => p.inlineData).length, 1);
+  assert.deepEqual(body.generationConfig.responseSchema.properties.problem.enum, ['none', 'face', 'no_object', 'too_plain', 'unclear', 'inappropriate']);
+});
+
+test('screen: faces, no object, plain walls, blur and bad content are rejected with a plain message', async () => {
+  for (const problem of ['face', 'no_object', 'too_plain', 'unclear', 'inappropriate']) {
+    const r = await screenWith(gemini({ problem, subject: '', nameMatches: true, reason: 'x' }));
+    assert.deepEqual([r.ok, r.problem, r.message], [false, problem, SCREEN_MESSAGES[problem]]);
+  }
+});
+
+test('screen: with a key, a failed check never lets a photo through; without one, it is skipped', async () => {
+  const down = await screenWith(gemini(null, { status: 429 }));
+  assert.deepEqual([down.ok, down.problem], [false, 'unavailable']);
+  const junk = await screenWith(gemini({ problem: 'maybe', subject: '', reason: '' }));
+  assert.equal(junk.ok, false, 'an answer outside the list is not a pass');
+  assert.equal((await screenEggPhoto({ jpeg: PHOTO, apiKey: '' })).ok, true);
+});
+
+test('screen: a name that does not match the photo is rejected, and says what the photo looks like', async () => {
+  const r = await screenWith(gemini({ problem: 'none', subject: 'a red sticker', nameMatches: false, reason: 'It is a sticker, not a bench.' }), { name: 'bench' });
+  assert.deepEqual([r.ok, r.problem], [false, 'name_mismatch']);
+  assert.equal(r.message, 'That doesn\'t look like "bench". It looks like a red sticker. Change what you typed, or retake the photo.');
+  // A photo problem wins over the name: fix the photo first.
+  const face = await screenWith(gemini({ problem: 'face', subject: '', nameMatches: false, reason: 'x' }), { name: 'bench' });
+  assert.equal(face.problem, 'face');
+  // No answer about the name is not a pass.
+  const vague = await screenWith(gemini({ problem: 'none', subject: 'a sticker', reason: 'x' }), { name: 'sticker' });
+  assert.equal(vague.ok, false);
 });

@@ -24,6 +24,7 @@ const STATIONS = [
   { id: 'test-activity', name: 'Test Activity', lat: 42.4, lng: -71.11, lines: [{ id: 'Red', name: 'Red Line', color: '#DA291C' }] },
   { id: 'test-clock', name: 'Test Clock', lat: 42.37, lng: -71.08, lines: [{ id: 'Blue', name: 'Blue Line', color: '#003DA5' }] },
   { id: 'test-bounty', name: 'Test Bounty', lat: 42.38, lng: -71.09, lines: [{ id: 'Blue', name: 'Blue Line', color: '#003DA5' }] },
+  { id: 'test-screen', name: 'Test Screen', lat: 42.43, lng: -71.14, lines: [{ id: 'Red', name: 'Red Line', color: '#DA291C' }] },
   { id: 'test-map', name: 'Test Map', lat: 42.41, lng: -71.12, lines: [{ id: 'Orange', name: 'Orange Line', color: '#ED8B00' }] },
 ];
 const fakeMbta = {
@@ -40,6 +41,8 @@ const PW = 'correct horse';
 
 let clock = Date.parse('2026-11-21T20:00:00Z');
 let nextVerify = { method: 'gemini', match: true, confidence: 0.9, reason: 'Same sticker.' };
+let nextScreen = { ok: true, method: 'gemini', subject: 'a red sticker' };
+const screened = [];
 let server;
 let base;
 let db;
@@ -56,6 +59,7 @@ before(async () => {
     db,
     mbta: fakeMbta,
     verify: async () => nextVerify,
+    screen: async (args) => { screened.push(args); return nextScreen; },
     geminiKey: 'test',
     now: () => new Date(clock),
     frontendDir: path.resolve(ROOT, '../frontend'),
@@ -86,8 +90,9 @@ const ok = async (p, body, as) => {
   return r.data;
 };
 // Registers and returns { id, username, token }.
+let emailN = 0; // a username can be freed and reused (renames), so each sign-up gets its own address
 const user = async (name) => {
-  const { user: u, token } = await ok('/api/auth/register', { username: name, password: PW });
+  const { user: u, token } = await ok('/api/auth/register', { username: name, password: PW, email: `player${++emailN}@example.com` });
   return { ...u, token };
 };
 
@@ -131,9 +136,9 @@ test('full round: hide, find, hide next, leaderboard', async () => {
   const ana = await user('ana');
   const ben = await user('ben');
 
-  assert.equal((await call('/api/eggs', { stationId: 'place-kencl', level: 2, image: IMG })).status, 401, 'must be signed in');
-  await ok('/api/eggs', { stationId: 'place-kencl', level: 2, image: IMG, hint: 'by the stairs' }, ana);
-  assert.equal((await call('/api/eggs', { stationId: 'place-kencl', level: 2, image: IMG }, ana)).status, 409, 'slot is taken');
+  assert.equal((await call('/api/eggs', { name: 'sticker', stationId: 'place-kencl', level: 2, image: IMG })).status, 401, 'must be signed in');
+  await ok('/api/eggs', { name: 'sticker', stationId: 'place-kencl', level: 2, image: IMG, hint: 'by the stairs' }, ana);
+  assert.equal((await call('/api/eggs', { name: 'sticker', stationId: 'place-kencl', level: 2, image: IMG }, ana)).status, 409, 'slot is taken');
 
   const st = await ok('/api/stations/place-kencl', null, ben);
   const egg = st.slots.find((s) => s.level === 2).egg;
@@ -162,10 +167,10 @@ test('full round: hide, find, hide next, leaderboard', async () => {
   assert.equal((await call(`/api/attempts/${round.attempt.id}/find`, { image: IMG }, ben)).status, 409);
 
   // Hide-next must match the station and level of the find.
-  assert.equal((await call('/api/eggs', { stationId: 'place-kencl', level: 3, findId: found.findId, image: IMG }, ben)).status, 400);
-  assert.equal((await call('/api/eggs', { stationId: 'place-kencl', level: 2, findId: found.findId, image: IMG }, ana)).status, 403, "can't use someone else's find");
-  await ok('/api/eggs', { stationId: 'place-kencl', level: 2, findId: found.findId, image: IMG }, ben);
-  assert.equal((await call('/api/eggs', { stationId: 'place-kencl', level: 2, findId: found.findId, image: IMG }, ben)).status, 409, 'one hide per find');
+  assert.equal((await call('/api/eggs', { name: 'sticker', stationId: 'place-kencl', level: 3, findId: found.findId, image: IMG }, ben)).status, 400);
+  assert.equal((await call('/api/eggs', { name: 'sticker', stationId: 'place-kencl', level: 2, findId: found.findId, image: IMG }, ana)).status, 403, "can't use someone else's find");
+  await ok('/api/eggs', { name: 'sticker', stationId: 'place-kencl', level: 2, findId: found.findId, image: IMG }, ben);
+  assert.equal((await call('/api/eggs', { name: 'sticker', stationId: 'place-kencl', level: 2, findId: found.findId, image: IMG }, ben)).status, 409, 'one hide per find');
 
   const after = await ok('/api/stations/place-kencl', null, ana);
   const newEgg = after.slots.find((s) => s.level === 2).egg;
@@ -193,7 +198,7 @@ test('full round: hide, find, hide next, leaderboard', async () => {
 test('the same round submitted twice at once scores once', async () => {
   const mo = await user('mo');
   const ned = await user('ned');
-  await ok('/api/eggs', { stationId: 'place-pktrm', level: 2, image: IMG }, mo);
+  await ok('/api/eggs', { name: 'sticker', stationId: 'place-pktrm', level: 2, image: IMG }, mo);
   const eggId = (await ok('/api/stations/place-pktrm')).slots[1].egg.id;
   const round = await ok('/api/attempts', { eggId }, ned);
   const results = await Promise.all([1, 2, 3].map(() => call(`/api/attempts/${round.attempt.id}/find`, { image: IMG }, ned)));
@@ -204,10 +209,10 @@ test('the same round submitted twice at once scores once', async () => {
 test('two players finding the same egg at once rotate the slot once', async () => {
   const [ola, pat, quinn, ray] = [await user('ola'), await user('pat'), await user('quinn'), await user('ray')];
   // Two eggs in the Park Street level-5 slot: ola's in the pool, pat's active.
-  await ok('/api/eggs', { stationId: 'place-pktrm', level: 5, image: IMG }, ola);
+  await ok('/api/eggs', { name: 'sticker', stationId: 'place-pktrm', level: 5, image: IMG }, ola);
   const r0 = await ok('/api/attempts', { eggId: (await ok('/api/stations/place-pktrm')).slots[4].egg.id }, pat);
   const f0 = await ok(`/api/attempts/${r0.attempt.id}/find`, { image: IMG }, pat);
-  await ok('/api/eggs', { stationId: 'place-pktrm', level: 5, findId: f0.findId, image: IMG }, pat);
+  await ok('/api/eggs', { name: 'sticker', stationId: 'place-pktrm', level: 5, findId: f0.findId, image: IMG }, pat);
   const eggId = (await ok('/api/stations/place-pktrm')).slots[4].egg.id;
 
   const [a, b] = [await ok('/api/attempts', { eggId }, quinn), await ok('/api/attempts', { eggId }, ray)];
@@ -223,7 +228,7 @@ test('two players finding the same egg at once rotate the slot once', async () =
 test('no match keeps the round open; time runs out', async () => {
   const cat = await user('cat');
   const dan = await user('dan');
-  await ok('/api/eggs', { stationId: 'place-pktrm', level: 1, image: IMG }, cat);
+  await ok('/api/eggs', { name: 'sticker', stationId: 'place-pktrm', level: 1, image: IMG }, cat);
   const eggId = (await ok('/api/stations/place-pktrm')).slots[0].egg.id;
   const round = await ok('/api/attempts', { eggId }, dan);
 
@@ -240,7 +245,7 @@ test('no match keeps the round open; time runs out', async () => {
 test('there is no race-the-train mode: every round gets the 3-minute clock', async () => {
   const eve = await user('eve');
   const fay = await user('fay');
-  await ok('/api/eggs', { stationId: 'place-pktrm', level: 4, image: IMG }, eve);
+  await ok('/api/eggs', { name: 'sticker', stationId: 'place-pktrm', level: 4, image: IMG }, eve);
   const eggId = (await ok('/api/stations/place-pktrm')).slots[3].egg.id;
   const round = await ok('/api/attempts', { eggId, mode: 'train' }, fay);
   assert.equal(round.attempt.limitSeconds, 180);
@@ -249,12 +254,12 @@ test('there is no race-the-train mode: every round gets the 3-minute clock', asy
 
 test('three reports retire an egg and the pool refills the slot', async () => {
   const [gus, hal, ivy, jo] = [await user('gus'), await user('hal'), await user('ivy'), await user('jo')];
-  await ok('/api/eggs', { stationId: 'place-pktrm', level: 3, image: IMG }, gus);
+  await ok('/api/eggs', { name: 'sticker', stationId: 'place-pktrm', level: 3, image: IMG }, gus);
   const first = (await ok('/api/stations/place-pktrm')).slots[2].egg.id;
   // hal finds it and hides a new one, so the first egg goes to the pool.
   const r = await ok('/api/attempts', { eggId: first }, hal);
   const f = await ok(`/api/attempts/${r.attempt.id}/find`, { image: IMG }, hal);
-  await ok('/api/eggs', { stationId: 'place-pktrm', level: 3, findId: f.findId, image: IMG }, hal);
+  await ok('/api/eggs', { name: 'sticker', stationId: 'place-pktrm', level: 3, findId: f.findId, image: IMG }, hal);
   const second = (await ok('/api/stations/place-pktrm')).slots[2].egg.id;
   assert.notEqual(second, first);
 
@@ -267,7 +272,7 @@ test('three reports retire an egg and the pool refills the slot', async () => {
 
 test('unfound eggs retire after 7 days', async () => {
   const kim = await user('kim');
-  await ok('/api/eggs', { stationId: 'place-kencl', level: 5, image: IMG }, kim);
+  await ok('/api/eggs', { name: 'sticker', stationId: 'place-kencl', level: 5, image: IMG }, kim);
   assert.ok((await ok('/api/stations/place-kencl')).slots[4].egg);
   clock += 8 * 86400_000;
   assert.equal((await ok('/api/stations/place-kencl')).slots[4].egg, null);
@@ -300,7 +305,7 @@ test('friend groups: create, invite, join, group leaderboard', async () => {
   assert.equal((await call(`/api/groups/${group.id}`)).status, 401);
 
   // hugo scores; the outsider scores more but isn't in the group.
-  await ok('/api/eggs', { stationId: 'place-kencl', level: 4, image: IMG }, gia);
+  await ok('/api/eggs', { name: 'sticker', stationId: 'place-kencl', level: 4, image: IMG }, gia);
   const egg4 = (await ok('/api/stations/place-kencl')).slots[3].egg.id;
   for (const who of [hugo, outsider]) {
     const r = await ok('/api/attempts', { eggId: egg4 }, who);
@@ -414,7 +419,7 @@ test('every level has a 3-minute timer; Extreme and Impossible show a blurred ph
   assert.deepEqual(cfg.levels.map((l) => l.points), [10, 20, 30, 40, 60], 'points unchanged');
 
   const [hider, finder, rival] = [await user('blurhider'), await user('blurfinder'), await user('blurrival')];
-  for (const level of [1, 4, 5]) await ok('/api/eggs', { stationId: 'test-blur', level, image: IMG }, hider);
+  for (const level of [1, 4, 5]) await ok('/api/eggs', { name: 'sticker', stationId: 'test-blur', level, image: IMG }, hider);
   const slots = (await ok('/api/stations/test-blur', null, finder)).slots;
   const pixels = async (url) => sharp(Buffer.from(await (await fetch(base + url)).arrayBuffer())).resize(64, 48).raw().toBuffer();
   const sharpPx = await sharp(IMG_BUF).resize(64, 48).raw().toBuffer();
@@ -459,13 +464,13 @@ test('every level has a 3-minute timer; Extreme and Impossible show a blurred ph
 
   // A level-5 upload that isn't a real image is refused instead of breaking later.
   const junk = `data:image/jpeg;base64,${Buffer.alloc(400, 7).toString('base64')}`;
-  assert.equal((await call('/api/eggs', { stationId: 'test-blur', level: 4, image: junk }, hider)).status, 400);
+  assert.equal((await call('/api/eggs', { name: 'sticker', stationId: 'test-blur', level: 4, image: junk }, hider)).status, 400);
 });
 
 test('station list: egg count at every station, what each player can still find, totals', async () => {
   const [ann, bo, cy] = [await user('countann'), await user('countbo'), await user('countcy')];
-  await ok('/api/eggs', { stationId: 'test-count', level: 1, image: IMG }, ann);
-  await ok('/api/eggs', { stationId: 'test-count', level: 2, image: IMG }, ann);
+  await ok('/api/eggs', { name: 'sticker', stationId: 'test-count', level: 1, image: IMG }, ann);
+  await ok('/api/eggs', { name: 'sticker', stationId: 'test-count', level: 2, image: IMG }, ann);
   const eggId = (await ok('/api/stations/test-count')).slots[0].egg.id;
   const r = await ok('/api/attempts', { eggId }, bo);
   await ok(`/api/attempts/${r.attempt.id}/find`, { image: IMG }, bo);
@@ -490,9 +495,9 @@ test('station list: egg count at every station, what each player can still find,
 test('bad input, CORS, health and static files', async () => {
   assert.equal((await call('/api/auth/register', { username: '<script>', password: PW })).status, 400);
   const lee = await user('lee');
-  assert.equal((await call('/api/eggs', { stationId: 'place-kencl', level: 1, image: 'data:text/html;base64,AAAA' }, lee)).status, 400);
-  assert.equal((await call('/api/eggs', { stationId: 'nope', level: 1, image: IMG }, lee)).status, 404);
-  assert.equal((await call('/api/eggs', { stationId: 'place-kencl', level: 9, image: IMG }, lee)).status, 400, 'unknown level');
+  assert.equal((await call('/api/eggs', { name: 'sticker', stationId: 'place-kencl', level: 1, image: 'data:text/html;base64,AAAA' }, lee)).status, 400);
+  assert.equal((await call('/api/eggs', { name: 'sticker', stationId: 'nope', level: 1, image: IMG }, lee)).status, 404);
+  assert.equal((await call('/api/eggs', { name: 'sticker', stationId: 'place-kencl', level: 9, image: IMG }, lee)).status, 400, 'unknown level');
   assert.equal((await call('/api/attempts', { eggId: 'x' }, lee)).status, 404);
   assert.equal((await call('/api/attempts/not-a-uuid/find', { image: IMG }, lee)).status, 404);
   assert.equal((await call('/api/attempts', { eggId: crypto.randomUUID() })).status, 401);
@@ -525,8 +530,8 @@ test('progress: rider level, daily challenge, stamps, stations and lines', async
   assert.equal((await call('/api/me/progress')).status, 401, 'must be signed in');
 
   // quin hides at Kenmore (Green) and Park Street (Red + Green); rae finds both, racing a train at Park Street.
-  await ok('/api/eggs', { stationId: 'test-green', level: 5, image: IMG }, quin);
-  await ok('/api/eggs', { stationId: 'test-redgreen', level: 5, image: IMG }, quin);
+  await ok('/api/eggs', { name: 'sticker', stationId: 'test-green', level: 5, image: IMG }, quin);
+  await ok('/api/eggs', { name: 'sticker', stationId: 'test-redgreen', level: 5, image: IMG }, quin);
   const ken = (await ok('/api/stations/test-green')).slots[4].egg.id;
   const pk = (await ok('/api/stations/test-redgreen')).slots[4].egg.id;
 
@@ -596,7 +601,7 @@ test('profile activity: finds, eggs hidden, your eggs found by others, groups, s
   const [cy, dot] = [await user('cy'), await user('dot')];
   const st = { id: 'test-activity', name: 'Test Activity' };
   clock += 1000;
-  const { egg } = await ok('/api/eggs', { stationId: st.id, level: 2, image: IMG, hint: 'by the map' }, cy);
+  const { egg } = await ok('/api/eggs', { name: 'sticker', stationId: st.id, level: 2, image: IMG, hint: 'by the map' }, cy);
   clock += 1000;
   const { attempt } = await ok('/api/attempts', { eggId: egg.id }, dot);
   clock += 5000;
@@ -620,7 +625,7 @@ test('notifications: your eggs, a heads-up when one is found, counts', async () 
   assert.equal((await call('/api/me/notifications')).status, 401);
 
   clock += 1000;
-  const { egg } = await ok('/api/eggs', { stationId: 'test-activity', level: 3, image: IMG, hint: 'under the clock' }, eve);
+  const { egg } = await ok('/api/eggs', { name: 'sticker', stationId: 'test-activity', level: 3, image: IMG, hint: 'under the clock' }, eve);
   const hid = (await ok('/api/me/notifications', null, eve)).items[0];
   assert.deepEqual([hid.type, hid.levelName, hid.hint, hid.timesFound, hid.status], ['egg_hidden', 'Hard', 'under the clock', 0, 'active']);
   assert.ok(hid.photoUrl, 'you see your own egg photo');
@@ -651,7 +656,7 @@ test('notifications: your eggs, a heads-up when one is found, counts', async () 
 
 test('one clock per egg: coming back resumes it; a retry after a miss gets a fresh clock but no time bonus', async () => {
   const [hid, sam, pal] = [await user('clockhider'), await user('clocksam'), await user('clockpal')];
-  await ok('/api/eggs', { stationId: 'test-clock', level: 3, image: IMG }, hid);
+  await ok('/api/eggs', { name: 'sticker', stationId: 'test-clock', level: 3, image: IMG }, hid);
   const eggId = (await ok('/api/stations/test-clock')).slots[2].egg.id;
 
   const first = await ok('/api/attempts', { eggId, mode: 'fixed' }, sam);
@@ -711,14 +716,14 @@ test('bounty: players an egg beats build a pot; the finder takes it and the hide
     ['bhider', 'bplayer_a', 'bplayer_b', 'bplayer_c', 'bnewbie', 'bfinder'].map((n) => user(n)),
   );
   // a, b and c each find one easy egg first: only players with a find count toward a bounty.
-  await ok('/api/eggs', { stationId: 'test-bounty', level: 1, image: IMG }, hider);
+  await ok('/api/eggs', { name: 'sticker', stationId: 'test-bounty', level: 1, image: IMG }, hider);
   const easy = (await ok('/api/stations/test-bounty')).slots[0].egg.id;
   for (const p of [a, b, c]) {
     const r = await ok('/api/attempts', { eggId: easy }, p);
     await ok(`/api/attempts/${r.attempt.id}/find`, { image: IMG }, p);
   }
 
-  await ok('/api/eggs', { stationId: 'test-bounty', level: 3, image: IMG }, hider);
+  await ok('/api/eggs', { name: 'sticker', stationId: 'test-bounty', level: 3, image: IMG }, hider);
   const eggId = (await ok('/api/stations/test-bounty')).slots[2].egg.id;
   clock += 1000; // a miss counts only if it ends after the egg was hidden (or last claimed)
   const rounds = {};
@@ -789,7 +794,7 @@ test('leaderboard: this month or all time', async () => {
 test('map: per-station stats, keeper and hunting now; lines and trains degrade to empty without the MBTA', async () => {
   const sal = await user('sal');
   const tia = await user('tia');
-  await ok('/api/eggs', { stationId: 'test-map', level: 3, image: IMG }, sal);
+  await ok('/api/eggs', { name: 'sticker', stationId: 'test-map', level: 3, image: IMG }, sal);
   const eggId = (await ok('/api/stations/test-map')).slots[2].egg.id;
 
   // tia starts a round: she's hunting there now, then finds it.
@@ -817,4 +822,75 @@ test('map: per-station stats, keeper and hunting now; lines and trains degrade t
   // The fake MBTA has no shapes or vehicles: the endpoints answer with empty lists instead of failing.
   assert.deepEqual(await ok('/api/map/lines'), { lines: [] });
   assert.deepEqual((await ok('/api/map/vehicles')).vehicles, []);
+});
+
+test('email: required at sign-up, unique, private, usable to sign in, and addable later', async () => {
+  const reg = (body) => call('/api/auth/register', { password: PW, ...body });
+  assert.equal((await reg({ username: 'em_a' })).status, 400, 'no email');
+  assert.equal((await reg({ username: 'em_a', email: 'not-an-email' })).status, 400);
+  const a = await ok('/api/auth/register', { username: 'em_a', password: PW, email: 'Em.A@Example.com' });
+  assert.equal(a.user.email, 'Em.A@Example.com');
+  assert.equal((await reg({ username: 'em_b', email: 'em.a@example.com' })).status, 409, 'one account per email');
+
+  // Sign in with the email instead of the username (any case).
+  assert.equal((await ok('/api/auth/login', { username: 'EM.A@example.com', password: PW })).user.username, 'em_a');
+  assert.equal((await call('/api/auth/login', { username: 'em.a@example.com', password: 'wrong password' })).status, 401);
+
+  // Other players never see it.
+  const b = await user('em_viewer');
+  const seen = await ok(`/api/users/${a.user.id}`, null, b);
+  assert.equal('email' in seen.user, false);
+
+  // An older account without an email adds one; it can't take someone else's.
+  const legacy = await user('em_legacy');
+  await db.col.users.updateOne({ _id: legacy.id }, { $unset: { email: 1, emailLower: 1 } });
+  assert.equal((await ok('/api/auth/me', null, legacy)).user.email, null);
+  assert.equal((await call('/api/me/email', { email: 'em.a@example.com' }, legacy)).status, 409);
+  assert.equal((await ok('/api/me/email', { email: 'legacy@example.com' }, legacy)).user.email, 'legacy@example.com');
+  assert.equal((await ok('/api/auth/me', null, legacy)).user.email, 'legacy@example.com');
+});
+
+test('photo screen: a rejected egg photo is never hidden, and the player is told why', async () => {
+  const hider = await user('screen_hider');
+  const hide = () => call('/api/eggs', { name: 'sticker', stationId: 'test-screen', level: 1, image: IMG }, hider);
+  const before = await db.col.eggs.countDocuments({ stationId: 'test-screen' });
+
+  for (const [problem, status, words] of [['face', 422, /face/], ['too_plain', 422, /too plain/], ['no_object', 422, /nothing specific/], ['unavailable', 503, /unavailable/]]) {
+    const { SCREEN_MESSAGES } = await import('../src/verify.js');
+    nextScreen = { ok: false, method: 'gemini', problem, message: SCREEN_MESSAGES[problem] ?? 'The photo check is unavailable right now. Try again in a moment.' };
+    const r = await hide();
+    assert.equal(r.status, status, problem);
+    assert.match(r.data.error, words);
+  }
+  assert.equal(await db.col.eggs.countDocuments({ stationId: 'test-screen' }), before, 'nothing saved');
+
+  // A good photo goes through; the screen saw the uploaded image.
+  nextScreen = { ok: true, method: 'gemini', subject: 'a red sticker' };
+  const n = screened.length;
+  assert.equal((await hide()).status, 200);
+  assert.equal(screened.length, n + 1);
+  assert.ok(Buffer.isBuffer(screened.at(-1).jpeg));
+  // A slot that's already taken is refused before spending a Gemini call.
+  assert.equal((await hide()).status, 409);
+  assert.equal(screened.length, n + 1);
+});
+
+test('egg name: required, passed to the photo screen, rejected when it does not match, shown to finders', async () => {
+  const [hider, finder] = [await user('name_hider'), await user('name_finder')];
+  const hide = (body) => call('/api/eggs', { stationId: 'test-screen', level: 2, image: IMG, ...body }, hider);
+  assert.equal((await hide({})).status, 400, 'no name');
+  assert.equal((await hide({ name: 'x' })).status, 400, 'too short');
+  assert.equal((await hide({ name: 'a'.repeat(41) })).status, 400, 'too long');
+
+  nextScreen = { ok: false, method: 'gemini', problem: 'name_mismatch', message: 'That doesn\'t look like "bench". It looks like a red sticker. Change what you typed, or retake the photo.' };
+  const bad = await hide({ name: 'bench' });
+  assert.equal(bad.status, 422);
+  assert.match(bad.data.error, /doesn't look like "bench"/);
+  assert.equal(screened.at(-1).name, 'bench', 'the screen saw what they typed');
+
+  nextScreen = { ok: true, method: 'gemini', subject: 'a red sticker' };
+  await ok('/api/eggs', { stationId: 'test-screen', level: 2, image: IMG, name: '  red   sticker ' }, hider);
+  const egg = (await ok('/api/stations/test-screen', null, finder)).slots[1].egg;
+  const round = await ok('/api/attempts', { eggId: egg.id }, finder);
+  assert.equal(round.egg.name, 'red sticker', 'finders see what it is');
 });

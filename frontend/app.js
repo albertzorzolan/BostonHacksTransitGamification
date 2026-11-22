@@ -81,6 +81,7 @@ function toast(msg, ms = 2600) {
   const el = $('#toast');
   el.textContent = msg;
   el.hidden = false;
+  el.onclick = () => (el.hidden = true); // tap to dismiss
   clearTimeout(toast.t);
   toast.t = setTimeout(() => (el.hidden = true), ms);
 }
@@ -347,9 +348,12 @@ async function checkArrival() {
   const s = fresh.find((x) => x.id === st.id) ?? st;
   const left = s.playable ?? 0;
   const href = `#/station/${encodeURIComponent(s.id)}`;
-  if (left) notifyPlayer(`You're at ${s.name}.`, `Find your eggs today: ${plural(left, 'egg')} waiting for you here.`, href);
-  else if (s.activeEggs) notifyPlayer(`You're at ${s.name}.`, "You've cleared every egg here today. Hide a new one!", href);
-  else notifyPlayer(`You're at ${s.name}.`, 'No eggs here yet. Hide the first one today!', href);
+  // The Here tab and the station's own page already say all this: don't cover them with a toast.
+  const h = location.hash || '#/';
+  if (document.visibilityState === 'visible' && (h === '#/' || h === href)) return;
+  if (left) notifyPlayer(`${s.name}:`, `${plural(left, 'egg')} for you here.`, href);
+  else if (s.activeEggs) notifyPlayer(`${s.name}:`, 'you found every egg here.', href);
+  else notifyPlayer(`${s.name}:`, 'no eggs yet. Hide the first.', href);
 }
 
 function startAlerts() {
@@ -459,6 +463,11 @@ async function render() {
     drawHud();
     return viewSignup();
   }
+  if (!state.user.email) {
+    $('#tabs').hidden = true;
+    drawHud();
+    return viewAddEmail();
+  }
   const hash = location.hash || '#/';
   const playing = hash.startsWith('#/play') || hash.startsWith('#/hide');
   $('#hud').classList.toggle('hud-quiet', playing);
@@ -549,8 +558,11 @@ function viewSignup(mode = 'register') {
           <button type="button" role="tab" data-mode="register" aria-selected="${registering}">Create account</button>
           <button type="button" role="tab" data-mode="login" aria-selected="${!registering}">Sign in</button>
         </div>
-        <label class="field-label" for="username">Username</label>
-        <input id="username" class="input" maxlength="20" autocomplete="username" autocapitalize="none" placeholder="e.g. kenmore_kid" required />
+        ${registering ? `<label class="field-label" for="email">Email</label>
+        <input id="email" class="input" type="email" maxlength="254" autocomplete="email" autocapitalize="none" inputmode="email" required />
+        <p class="field-hint">Private. Only you see it, and you can sign in with it.</p>` : ''}
+        <label class="field-label" for="username">${registering ? 'Username' : 'Username or email'}</label>
+        <input id="username" class="input" maxlength="${registering ? 20 : 254}" autocomplete="username" autocapitalize="none" ${registering ? 'placeholder="e.g. kenmore_kid"' : ''} required />
         ${registering ? '<p class="field-hint">Shown on leaderboards. Group chats use a separate anonymous name.</p>' : ''}
         <label class="field-label" for="password">Password ${registering ? `<span class="opt">(at least ${min} characters)</span>` : ''}</label>
         <input id="password" class="input" type="password" maxlength="200" ${registering ? `minlength="${min}"` : ''} autocomplete="${registering ? 'new-password' : 'current-password'}" required />
@@ -568,6 +580,7 @@ function viewSignup(mode = 'register') {
       const data = await api(registering ? '/api/auth/register' : '/api/auth/login', {
         username: $('#username').value,
         password: $('#password').value,
+        ...(registering && { email: $('#email').value }),
       });
       setSession(data);
       startLocation();
@@ -585,6 +598,40 @@ function viewSignup(mode = 'register') {
       if (t && b.lines.length) t.innerHTML = lineWar(b.lines, { title: 'Line war this month', sub: 'Every find scores for its line' });
     })
     .catch(() => {});
+}
+
+// Accounts made before emails were required add one before they keep playing.
+function viewAddEmail() {
+  app.innerHTML = `
+    <form id="emailForm" class="tk welcome">
+      ${BAND_LINES}
+      <div class="tk-top">
+        <h1 class="welcome-h">Add your email</h1>
+        <p class="welcome-p">Every Lookout account is now linked to an email. It stays private, and you can sign in with it.</p>
+      </div>
+      <div class="tk-perf" aria-hidden="true"></div>
+      <div class="tk-bottom stack">
+        <label class="field-label" for="email">Email</label>
+        <input id="email" class="input" type="email" maxlength="254" autocomplete="email" autocapitalize="none" inputmode="email" required />
+        <button class="btn btn-ink btn-block btn-l">Save and keep playing</button>
+        <button id="emailOut" class="btn btn-ghost btn-block" type="button">Sign out</button>
+        <div id="err"></div>
+      </div>
+    </form>`;
+  $('#emailOut').addEventListener('click', () => signOut({ remote: true }));
+  $('#emailForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = $('#emailForm .btn-ink');
+    btn.disabled = true;
+    try {
+      const { user } = await api('/api/me/email', { email: $('#email').value });
+      setSession({ user: { ...state.user, ...user }, token: state.token });
+      render();
+    } catch (err) {
+      $('#err').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+      btn.disabled = false;
+    }
+  });
 }
 
 // ---------- Here: the station you're standing in ----------
@@ -808,7 +855,7 @@ async function showStation(id, { here = false, distance = null } = {}) {
         <p class="clear-note">${card.cleared ? '<b>Cleared.</b> Every egg here is punched.' : `<b>${card.found} of ${card.playable}</b> found here`}</p>
       </div>` : ''}
     </div>
-    <ol class="stubs">${slots.map((s) => stubRow(s)).join('')}</ol>`;
+    <ol class="stubs">${stubsHtml(slots)}</ol>`;
 
   app.querySelectorAll('[data-play]').forEach((btn) =>
     btn.addEventListener('click', async () => {
@@ -847,6 +894,31 @@ async function showStation(id, { here = false, distance = null } = {}) {
       }
     });
   }
+}
+
+// Stamp text size: as big as fits, so a long word ("Impossible", "Massachusetts") stays whole
+// on one line and a long name ("Boston University Central") fits in the circle.
+function sealFont(name) {
+  const inner = 58; // px of text width inside an 80px stamp
+  const words = name.split(/\s+/);
+  const longest = Math.max(...words.map((w) => w.length));
+  const byWord = inner / (longest * 0.55);
+  const byLines = 46 / (Math.min(words.length, 3) * 1.1); // up to 3 lines tall
+  return Math.max(8, Math.min(13.5, byWord, byLines)).toFixed(1);
+}
+
+// Eggs you can play first, then yours and ones you've found; empty slots fold into one row.
+function stubsHtml(slots) {
+  const rank = (s) => (!s.egg ? 3 : s.egg.mine || s.egg.foundByMe ? 2 : 1);
+  const filled = slots.filter((s) => s.egg).sort((a, b) => rank(a) - rank(b) || a.level - b.level);
+  const empty = slots.filter((s) => !s.egg);
+  const emptyRow = empty.length
+    ? `<li class="stub-empties">
+        <p><b>${empty.length === slots.length ? 'No eggs here yet.' : `${plural(empty.length, 'empty slot')}.`}</b> Hide one and earn points when it's found.</p>
+        <div class="hide-chips">${empty.map((s) => `<button class="hide-chip" type="button" data-hide="${s.level}"><b>${s.level}</b>${esc(s.name)}<span class="hide-pts">${s.points}</span></button>`).join('')}</div>
+      </li>`
+    : '';
+  return filled.map((s) => stubRow(s)).join('') + emptyRow;
 }
 
 function stubRow(slot) {
@@ -934,10 +1006,11 @@ function viewPlay() {
     <section class="tk play-tk">
       <div class="tk-top">
         <div class="egg-photo">
-          <img src="${apiUrl(egg.imageUrl)}" alt="The egg to find: a photo of something in this station" />
+          <img src="${apiUrl(egg.imageUrl)}" alt="The egg to find: ${egg.name ? esc(egg.name) : 'a photo of something in this station'}" />
           ${tag ? `<p class="first-tag">${esc(tag)}</p>` : ''}
           ${egg.blur ? `<p class="blur-tag">${egg.blur === 'heavy' ? 'Heavily blurred' : 'Blurred'}: ${esc(egg.levelName)}</p>` : ''}
         </div>
+        ${egg.name ? `<p class="hint"><b>Find</b> ${esc(egg.name)}</p>` : ''}
         ${egg.hint ? `<p class="hint"><b>Hint</b> ${esc(egg.hint)}</p>` : ''}
       </div>
       <div class="tk-perf" aria-hidden="true"></div>
@@ -1216,6 +1289,9 @@ function viewHide() {
       </div>
       <div class="tk-perf" aria-hidden="true"></div>
       <div class="tk-bottom">
+        <label class="field-label" for="eggName">What is it?</label>
+        <input id="eggName" class="input" maxlength="40" required placeholder="e.g. sticker, red sign, cracked tile" />
+        <p class="field-hint">Finders see this. It has to match what's in the photo.</p>
         <label class="field-label" for="hint">Hint <span class="opt">(optional, one line)</span></label>
         <input id="hint" class="input" maxlength="80" placeholder="e.g. near the stairs to outbound" />
         <p class="clock-ctx">You score when your egg beats people. Each player who runs out of time adds to its bounty, and you get half when someone finally finds it. An egg nobody finds pays nothing, so make it hard but findable.</p>
@@ -1247,10 +1323,17 @@ function viewHide() {
 
   $('#submit').addEventListener('click', async () => {
     const btn = $('#submit');
+    const name = $('#eggName').value.trim();
+    if (name.length < 2) {
+      $('#err').innerHTML = '<div class="notice bad">Say what it is, like "sticker" or "red sign".</div>';
+      $('#eggName').focus();
+      return;
+    }
     btn.disabled = true;
-    btn.textContent = 'Hiding';
+    btn.textContent = 'Checking your photo';
+    $('#err').innerHTML = '';
     try {
-      await api('/api/eggs', { stationId: hide.stationId, level: hide.level, findId: hide.findId, hint: $('#hint').value, image });
+      await api('/api/eggs', { stationId: hide.stationId, level: hide.level, findId: hide.findId, name, hint: $('#hint').value, image });
       state.pendingHide = null;
       state.stations = null; // egg counts changed
       toast('Egg hidden. Now someone else has to find it.');
@@ -1519,9 +1602,9 @@ async function viewProfile() {
       .join('')}</ol>
     <div class="eggs-head"><h2 class="sec-h">Stamps</h2><p class="eggs-count">${earned} of ${progress.stamps.length}</p></div>
     <ul class="stamps">${progress.stamps
-      .map((s) => `<li class="st ${s.earned ? 'is-got' : ''}"><span class="st-seal">${esc(s.name)}</span><p>${s.earned || s.target === 1 ? esc(s.description) : `${esc(s.description)} ${s.progress} of ${s.target}.`}</p></li>`)
+      .map((s) => `<li class="st ${s.earned ? 'is-got' : ''}"><span class="st-seal" style="font-size:${sealFont(s.name)}px">${esc(s.name)}</span><p>${s.earned || s.target === 1 ? esc(s.description) : `${esc(s.description)} ${s.progress} of ${s.target}.`}</p></li>`)
       .join('')}${progress.stations
-      .map((s) => `<li class="st is-got"><span class="st-seal st-station" style="--ln:${LINE_VAR[s.lines[0]] ?? 'var(--stamp)'}">${esc(s.name)}</span><p>${plural(s.finds, 'find')} here</p></li>`)
+      .map((s) => `<li class="st is-got"><span class="st-seal st-station" style="--ln:${LINE_VAR[s.lines[0]] ?? 'var(--stamp)'};font-size:${sealFont(s.name)}px">${esc(s.name)}</span><p>${plural(s.finds, 'find')} here</p></li>`)
       .join('')}</ul>` : ''}
     <div class="eggs-head"><h2 class="sec-h">Recent finds</h2><p class="eggs-count">${plural(p.recentFinds.length, 'find')}</p></div>
     ${ticketsGrid(p.recentFinds)}
@@ -1570,7 +1653,7 @@ async function viewNotifications() {
   const row = (n) =>
     n.type === 'egg_found'
       ? `<li class="${n.unseen ? 'is-new' : ''}"><span class="act-ic" aria-hidden="true">🎉</span><p><b>${esc(n.by)}</b> found your ${esc(n.levelName)} egg at ${at(n)}<small>${fmtWhen(n.at)}${n.unseen ? ' · New' : ''}</small></p><b class="act-pts">+${n.points}</b></li>`
-      : `<li class="nt-egg"><img src="${apiUrl(n.photoUrl)}" alt="Your egg at ${esc(n.stationName)}" loading="lazy" /><p>You hid a ${esc(n.levelName)} egg at ${at(n)}${n.hint ? `<small>Hint: ${esc(n.hint)}</small>` : ''}<small>${fmtWhen(n.at)} · ${EGG_STATUS[n.status] ?? esc(n.status)} · ${n.timesFound ? `found ${plural(n.timesFound, 'time')}` : 'not found yet'}</small></p></li>`;
+      : `<li class="nt-egg"><img src="${apiUrl(n.photoUrl)}" alt="Your egg at ${esc(n.stationName)}" loading="lazy" /><p>You hid a ${esc(n.levelName)} egg${n.name ? ` (${esc(n.name)})` : ''} at ${at(n)}${n.hint ? `<small>Hint: ${esc(n.hint)}</small>` : ''}<small>${fmtWhen(n.at)} · ${EGG_STATUS[n.status] ?? esc(n.status)} · ${n.timesFound ? `found ${plural(n.timesFound, 'time')}` : 'not found yet'}</small></p></li>`;
   const ask = 'Notification' in window && Notification.permission === 'default';
   app.innerHTML = `
     <h1 class="page-h">Notifications</h1>
