@@ -919,6 +919,14 @@ test('train simulation: off by default; when on, puts a player on a live train f
   assert.deepEqual([r.onTrain.tripId, r.onTrain.verified], ['trip-sim', true]);
   assert.equal((await ok('/api/trains/lobby', {}, sim)).lobby.riders, 1, 'then the real lobby flow');
   assert.equal('tester' in (await ok(`/api/users/${sim.id}`, null, await user('sim_other'))).user, false);
+  // A second tester simulating from somewhere else lands on the same train, in the same lobby.
+  const sim2 = await user('sim_rider_2');
+  await db.col.users.updateOne({ _id: sim2.id }, { $set: { tester: true } });
+  fakeVehicles.push({ id: 'v-far', tripId: 'trip-far', routeId: 'Blue', line: 'Blue Line', headsign: 'Wonderland', status: 'IN_TRANSIT_TO', lat: 42.41, lng: -70.99 });
+  const r2 = await ok('/api/trains/simulate', { lat: 42.41, lng: -70.99 }, sim2);
+  assert.deepEqual([r2.onTrain.tripId, r2.onTrain.sharedLobby], ['trip-sim', true]);
+  const l2 = (await ok('/api/trains/lobby', {}, sim2)).lobby;
+  assert.equal(l2.riders, 2, 'both testers in one lobby');
   fakeVehicles = [];
 });
 

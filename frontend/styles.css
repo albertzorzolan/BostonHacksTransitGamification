@@ -757,3 +757,10 @@ html[data-line="Orange"] .msg.mine .msg-cap { color: var(--ink); }
 
 /* the map keeps its layers (and the card over it) inside itself, under the tab bar */
 .map-wrap { isolation: isolate; }
+
+.for-chips { display: flex; flex-wrap: wrap; gap: var(--space-2xs); margin: var(--space-2xs) 0 var(--space-xs); }
+.for-chip { display: grid; justify-items: start; min-height: 44px; padding: 4px var(--space-sm); border: 0; border-radius: 12px; background: var(--ticket); color: var(--ink); font: inherit; font-weight: 700; font-size: var(--text-sm); text-align: left; box-shadow: inset 0 0 0 1.5px var(--perf); cursor: pointer; }
+.for-chip small { color: var(--muted); font-weight: 600; font-size: var(--text-xs); }
+.for-chip.is-on { background: var(--ink); color: var(--ticket); box-shadow: none; }
+.for-chip.is-on small { color: var(--ticket); opacity: .8; }
+.for-chip:disabled { opacity: .5; cursor: default; }
