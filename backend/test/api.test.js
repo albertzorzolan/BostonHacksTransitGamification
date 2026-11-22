@@ -236,14 +236,14 @@ test('no match keeps the round open; time runs out', async () => {
   assert.equal(late.status, 'expired');
 });
 
-test('race-the-train timer uses the next train', async () => {
+test('there is no race-the-train mode: every round gets the 3-minute clock', async () => {
   const eve = await user('eve');
   const fay = await user('fay');
   await ok('/api/eggs', { stationId: 'place-pktrm', level: 4, image: IMG }, eve);
   const eggId = (await ok('/api/stations/place-pktrm')).slots[3].egg.id;
   const round = await ok('/api/attempts', { eggId, mode: 'train' }, fay);
-  assert.equal(round.attempt.limitSource, 'train');
-  assert.equal(round.attempt.limitSeconds, 240);
+  assert.equal(round.attempt.limitSeconds, 180);
+  assert.equal('limitSource' in round.attempt, false);
 });
 
 test('three reports retire an egg and the pool refills the slot', async () => {
@@ -534,13 +534,13 @@ test('progress: rider level, daily challenge, stamps, stations and lines', async
   const f1 = await ok(`/api/attempts/${r1.attempt.id}/find`, { image: IMG }, rae);
   assert.equal(f1.firstFind, true, 'first to find this egg');
 
-  const r2 = await ok('/api/attempts', { eggId: pk, mode: 'train' }, rae);
+  const r2 = await ok('/api/attempts', { eggId: pk }, rae);
   clock += 60_000;
   await ok(`/api/attempts/${r2.attempt.id}/find`, { image: IMG }, rae);
 
   const p = await ok('/api/me/progress', null, rae);
   const earned = new Set(p.stamps.filter((s) => s.earned).map((s) => s.id));
-  for (const id of ['first_find', 'transfer', 'beat_train', 'first_to_find', 'speedy', 'impossible']) {
+  for (const id of ['first_find', 'transfer', 'first_to_find', 'speedy', 'impossible']) {
     assert.ok(earned.has(id), `${id} should be earned`);
   }
   assert.equal(earned.has('all_lines'), false);
@@ -549,10 +549,11 @@ test('progress: rider level, daily challenge, stamps, stations and lines', async
   assert.deepEqual(p.lines.find((l) => l.line === 'Green'), { line: 'Green', stations: 2 });
   assert.deepEqual(p.lines.find((l) => l.line === 'Red'), { line: 'Red', stations: 1 });
   assert.deepEqual(new Set(p.today.lines), new Set(['Green', 'Red']));
-  // 60 + 27 bonus (20 s of 3 min) at Kenmore, 60 + 23 bonus racing the train = 170 -> level 3 (150 to 300)
-  assert.equal(p.level.points, 170);
+  // 60 + 27 bonus (20 s of 3 min) at Kenmore, 60 + 20 bonus (60 s of 3 min) = 167 -> level 3 (150 to 300)
+  assert.equal(p.level.points, 167);
   assert.deepEqual([p.level.level, p.level.floor, p.level.next], [3, 150, 300]);
-  assert.ok(['transfer', 'racer', 'climber', 'triple'].includes(p.today.id));
+  assert.ok(['transfer', 'climber', 'triple'].includes(p.today.id));
+  assert.equal(p.stamps.some((st) => st.id === 'beat_train'), false, 'no train stamp');
   assert.equal(p.today.target >= p.today.progress, true);
 });
 
@@ -659,9 +660,9 @@ test('one clock per egg: coming back resumes it; a retry after a miss gets a fre
   clock += 70_000;
   assert.deepEqual((await ok('/api/stations/test-clock', null, sam)).slots[2].egg.clock, { secondsLeft: 110 });
   assert.equal((await ok('/api/stations/test-clock', null, pal)).slots[2].egg.clock, null, "pal's clock hasn't started");
-  const back = await ok('/api/attempts', { eggId, mode: 'train' }, sam);
+  const back = await ok('/api/attempts', { eggId }, sam);
   assert.equal(back.attempt.id, first.attempt.id, 'resumed, not restarted');
-  assert.deepEqual([back.attempt.secondsLeft, back.attempt.resumed, back.attempt.limitSource], [110, true, 'fixed']);
+  assert.deepEqual([back.attempt.secondsLeft, back.attempt.resumed], [110, true]);
   assert.equal(await db.col.attempts.countDocuments({ userId: sam.id, eggId }), 1);
 
   // Two taps (or two phones) at once open one clock, not two.

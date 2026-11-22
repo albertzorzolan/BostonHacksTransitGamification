@@ -718,22 +718,7 @@ export async function createApp({
       let clock = clockState(round, t);
       let resumed = clock.state === 'running';
       if (!resumed) {
-        let limitSeconds = info.seconds;
-        let limitSource = 'fixed';
-        let train = null;
-        if (body?.mode === 'train') {
-          // Outside the transaction: it may run more than once, so no MBTA calls inside it.
-          try {
-            const trains = await mbta.predictions(egg.stationId);
-            train = trains.find((x) => x.seconds >= game.TRAIN_MIN_SECONDS && x.seconds <= game.TRAIN_MAX_SECONDS) ?? null;
-            if (train) {
-              limitSeconds = train.seconds;
-              limitSource = 'train';
-            }
-          } catch {
-            /* fall back to the fixed timer */
-          }
-        }
+        const limitSeconds = info.seconds; // every level: 3 minutes
         round = await tx(async (session) => {
           // Serializes this player's starts, so two taps (or two phones) can't open two clocks.
           await lockUser(session, user._id);
@@ -747,8 +732,6 @@ export async function createApp({
             eggId: egg._id,
             startedAt: t,
             limitSeconds,
-            limitSource,
-            ...(train && { train }),
             ...(state.state === 'retry' && { retry: true }),
             status: 'open',
           };
@@ -763,9 +746,7 @@ export async function createApp({
         attempt: {
           id: round._id,
           limitSeconds: round.limitSeconds,
-          limitSource: round.limitSource,
           secondsLeft: Math.round(clock.secondsLeft),
-          train: round.train ?? null,
           resumed,
           retry: Boolean(round.retry), // no time bonus on this round
         },
@@ -1029,16 +1010,8 @@ export async function createApp({
           ])
           .toArray()).map((r) => [r._id, r.first]),
       );
-      // Finds made while racing a train.
-      const raced = new Set(
-        (await col.attempts
-          // A retry doesn't count: you already knew where to look.
-          .find({ userId: user._id, status: 'found', limitSource: 'train', retry: { $ne: true } }, { projection: { eggId: 1 } })
-          .toArray()).map((a) => a.eggId),
-      );
       const hidden = await col.eggs.countDocuments({ createdBy: user._id });
       const isFirst = (f) => firstByEgg.get(f.eggId) === f._id;
-      const isRaced = (f) => raced.has(f.eggId);
 
       const families = (stationId) => [...new Set((stationById.get(stationId)?.lines ?? []).map((l) => game.lineFamily(l.id)))];
       const allLines = new Set();
@@ -1065,7 +1038,6 @@ export async function createApp({
       const stamps = [
         stamp('first_find', 'First find', 'Find your first egg.', 1, finds.length),
         stamp('transfer', 'Transfer', 'Find eggs on 2 lines in one day.', 2, mostLinesInADay),
-        stamp('beat_train', 'Beat the train', 'Find an egg while racing a train.', 1, finds.filter(isRaced).length),
         stamp('first_to_find', 'First', 'Be the first to find an egg.', 1, finds.filter(isFirst).length),
         stamp('speedy', '30 s', 'Find an egg in 30 seconds or less.', 1, finds.filter((f) => f.secondsTaken <= 30 && !f.retry).length),
         stamp('impossible', 'Impossible', 'Find a level 5 egg.', 1, finds.filter((f) => f.level === 5).length),
@@ -1078,7 +1050,6 @@ export async function createApp({
       const todayLines = [...new Set(todays.flatMap((f) => families(f.stationId)))];
       const measure = {
         transfer: todayLines.length,
-        racer: todays.filter(isRaced).length,
         climber: todays.filter((f) => f.level >= 3).length,
         triple: todays.length,
       }[ch.id];

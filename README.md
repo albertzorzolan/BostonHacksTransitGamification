@@ -86,9 +86,8 @@ To host `frontend/` somewhere else, set `window.EGG_API_BASE` in `frontend/confi
 
 - Each station has one egg slot per level.
 - **Time bonus:** up to +50% of the level's points, depending on how much of the 3 minutes is left.
-- **One clock per egg:** your clock on an egg starts the first time you play it and keeps running in real time. Leaving and coming back resumes it with the time it has left; it never resets. When it runs out, or you tap "Give up", you can retry right away with a fresh clock, but a retry earns no time bonus (and doesn't count for the 30 s or Beat the train stamps), because you've already had a look around.
+- **One clock per egg:** your clock on an egg starts the first time you play it and keeps running in real time. Leaving and coming back resumes it with the time it has left; it never resets. When it runs out, or you tap "Give up", you can retry right away with a fresh clock, but a retry earns no time bonus (and doesn't count for the 30 s stamp), because you've already had a look around.
 - **Bounty:** every player an egg beats (their clock ran out, or they gave up) adds 25% of its base points to the egg's bounty, up to 2× base. Whoever finds it takes the bounty on top of their points, and the egg's hider gets half of it. The hider is paid only when the egg is found, so an egg nobody finds earns them nothing: hide something hard but findable. After a find the bounty starts again from zero. A miss counts only if the player already had a find when they missed (so new throwaway accounts can't pump a bounty, and a first find doesn't make earlier misses count later). Each player counts once per bounty however many times they retry, and you never win a bounty built from your own misses.
-- **Race the next train:** the timer becomes the minutes until the next train, from MBTA `/predictions`. It's used only when the next train is 1.5–15 minutes away; otherwise you get the level timer.
 - **After a find**, the finder can hide the next egg at the same level within 30 minutes. If they skip, an older egg from that slot's pool rotates in. If the pool is empty, the found egg stays up.
 - **Empty slots** can be filled by anyone, which is how you seed a station.
 - **Rules:**
@@ -107,7 +106,7 @@ To host `frontend/` somewhere else, set `window.EGG_API_BASE` in `frontend/confi
 ## Progress
 
 - **Rider level:** grows with all-time points.
-- **Daily challenge:** one per day, the same for everyone (Transfer, Beat the train, Go hard, Hat trick).
+- **Daily challenge:** one per day, the same for everyone (Transfer, Go hard, Hat trick).
 - **Stamps:** 9 of them, for things like a first find, beating the train, finding an egg in 30 seconds, finding on all 4 lines, or hiding 5 eggs.
 - **Station cards:** one per station you've found eggs at.
 

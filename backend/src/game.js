@@ -17,9 +17,6 @@ export const MAX_TIME_BONUS = 0.5; // up to +50% of the level's points
 export const RETIRE_AFTER_DAYS = 7;
 export const REPORTS_TO_RETIRE = 3;
 export const HIDE_WINDOW_MINUTES = 30; // how long after a find you can hide the next egg
-// "Race the next train" mode uses the next train only if it's in this range.
-export const TRAIN_MIN_SECONDS = 90;
-export const TRAIN_MAX_SECONDS = 900;
 
 // One clock per player per egg. It runs in real time from the first start, so leaving and coming
 // back resumes it instead of resetting it. Once it runs out (or you give up) you can retry right
@@ -57,7 +54,7 @@ export function roundEndsAt(attempt) {
 }
 
 // The longest a round can last, so queries can skip rounds that started too early to matter.
-export const MAX_ROUND_MS = (Math.max(ROUND_SECONDS, TRAIN_MAX_SECONDS) + GRACE_SECONDS) * 1000;
+export const MAX_ROUND_MS = (ROUND_SECONDS + GRACE_SECONDS) * 1000;
 
 // "2026-11" in Boston time, so the monthly board flips at local midnight.
 export function monthKey(date, timeZone = 'America/New_York') {
@@ -121,7 +118,6 @@ export function dayKey(date, timeZone = 'America/New_York') {
 // One challenge a day, the same for everyone, rotating through this list.
 export const CHALLENGES = [
   { id: 'transfer', title: 'Transfer', description: 'Find eggs on 2 different lines today.', target: 2 },
-  { id: 'racer', title: 'Beat the train', description: 'Find an egg while racing a train today.', target: 1 },
   { id: 'climber', title: 'Go hard', description: 'Find a Hard egg or harder today.', target: 1 },
   { id: 'triple', title: 'Hat trick', description: 'Find 3 eggs today.', target: 3 },
 ];
