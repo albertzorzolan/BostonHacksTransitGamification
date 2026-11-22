@@ -152,68 +152,16 @@ export async function createApp({
     return { state: 'retry' };
   }
 
-  // ---------- bounty ----------
-  // For each egg, the players it has beaten since its bounty was last claimed: their clock on it
-  // ran out, or they gave up. A miss counts only if the player already had a find when it
-  // happened, so brand-new throwaway accounts can't pump a friend's bounty, and a first find
-  // doesn't make earlier misses count after the fact. Returns Map eggId -> Set of userIds.
-  async function playersBeaten(eggs, t, session) {
-    const out = new Map(eggs.map((e) => [e._id, new Set()]));
-    if (!eggs.length) return out;
-    const since = (e) => e.bountyFrom ?? e.createdAt;
-    const rounds = await col.attempts
-      .find(
-        {
-          status: { $ne: 'found' },
-          $or: eggs.map((e) => ({ eggId: e._id, startedAt: { $gt: new Date(since(e).getTime() - game.MAX_ROUND_MS) } })),
-        },
-        { session, projection: { eggId: 1, userId: 1, startedAt: 1, limitSeconds: 1, endedAt: 1 } },
-      )
-      .toArray();
-    const eggById = new Map(eggs.map((e) => [e._id, e]));
-    const over = rounds.filter((r) => {
-      const egg = eggById.get(r.eggId);
-      const endsAt = game.roundEndsAt(r);
-      return r.userId !== egg.createdBy && endsAt <= t && endsAt > since(egg);
-    });
-    const ids = [...new Set(over.map((r) => r.userId))];
-    // Each player's first ever find.
-    const firstFind = new Map(
-      ids.length
-        ? (await col.finds
-            .aggregate([{ $match: { userId: { $in: ids } } }, { $group: { _id: '$userId', at: { $min: '$foundAt' } } }], { session })
-            .toArray()).map((f) => [f._id, f.at])
-        : [],
-    );
-    for (const r of over) {
-      const first = firstFind.get(r.userId);
-      if (first && first < game.roundEndsAt(r)) out.get(r.eggId).add(r.userId);
-    }
-    return out;
-  }
-
-  // What a player would win by finding `egg` now: a pot from the *other* players it has beaten.
-  function potFor(egg, beaten, userId) {
-    const n = [...beaten].filter((u) => u !== userId).length;
-    return { beaten: n, bounty: game.bountyFor(egg.level, n) };
-  }
-
-  // A player's points from payouts (their share of bounties on eggs they hid).
+  // A player's points from payouts: train lobby bonuses. (Payouts of kind 'bounty' are from the
+  // removed bounty system and no longer count.)
   async function payoutPoints(userId, month = null) {
     const [r] = await col.payouts
       .aggregate([
-        { $match: { userId } },
-        {
-          $group: {
-            _id: null,
-            allTime: { $sum: '$points' },
-            month: { $sum: { $cond: [{ $eq: ['$month', month] }, '$points', 0] } },
-            hider: { $sum: { $cond: [{ $in: ['$kind', ['lobby', 'lobby_donor']] }, 0, '$points'] } }, // bounty shares only
-          },
-        },
+        { $match: { userId, kind: { $ne: 'bounty' } } },
+        { $group: { _id: null, allTime: { $sum: '$points' }, month: { $sum: { $cond: [{ $eq: ['$month', month] }, '$points', 0] } } } },
       ])
       .toArray();
-    return { allTime: r?.allTime ?? 0, month: r?.month ?? 0, hider: r?.hider ?? 0 };
+    return { allTime: r?.allTime ?? 0, month: r?.month ?? 0 };
   }
 
   // ---------- sessions ----------
@@ -292,7 +240,7 @@ export async function createApp({
   const emailTaken = async (email, exceptId = null) =>
     Boolean(await col.users.findOne({ emailLower: email.toLowerCase(), ...(exceptId && { _id: { $ne: exceptId } }) }, { projection: { _id: 1 } }));
 
-  // Finds plus payouts (a hider's bounty share) matching `match`, as { userId, stationId, points, find }.
+  // Finds plus payouts (train lobby bonuses) matching `match`, as { userId, stationId, points, find }.
   // Payout docs carry the same month/stationId/userId fields as finds, so one match fits both.
   const scoredPoints = (match) => [
     { $match: match },
@@ -300,7 +248,7 @@ export async function createApp({
     {
       $unionWith: {
         coll: col.payouts.collectionName,
-        pipeline: [{ $match: match }, { $project: { userId: 1, stationId: 1, points: 1, find: { $literal: 0 } } }],
+        pipeline: [{ $match: { ...match, kind: { $ne: 'bounty' } } }, { $project: { userId: 1, stationId: 1, points: 1, find: { $literal: 0 } } }],
       },
     },
   ];
@@ -563,9 +511,6 @@ export async function createApp({
         gemini: Boolean(geminiKey),
         graceSeconds: game.GRACE_SECONDS,
         maxTimeBonus: game.MAX_TIME_BONUS,
-        bountyPerPlayer: game.BOUNTY_PER_PLAYER,
-        bountyCap: game.BOUNTY_CAP,
-        hiderShare: game.HIDER_SHARE,
         passwordMin: auth.PASSWORD_MIN,
         trainSim,
         stickers: game.STICKERS,
@@ -984,7 +929,6 @@ export async function createApp({
           : [],
       );
       const t = now();
-      const beatenBy = await playersBeaten(eggs, t);
       // The viewer's clock on each egg: their latest round there.
       const myRounds = new Map();
       if (user) {
@@ -1007,7 +951,6 @@ export async function createApp({
             createdBy: creators.get(egg.createdBy) ?? 'someone',
             mine: egg.createdBy === user?._id,
             foundByMe: foundByMe.has(egg._id),
-            ...potFor(egg, beatenBy.get(egg._id), user?._id), // { bounty, beaten }
             clock: clock.state === 'running' ? { secondsLeft: Math.max(0, Math.round(clock.secondsLeft)) } : null,
             retry: clock.state === 'retry', // it beat you before: playing again earns no time bonus
           },
@@ -1068,8 +1011,7 @@ export async function createApp({
         ...(viewerId === id && { activity: await activityFor(user, myEggIds) }),
         monthPoints: (totals?.month ?? 0) + paid.month,
         allTimePoints: (totals?.allTime ?? 0) + paid.allTime,
-        hiderPoints: paid.hider, // all-time points from bounties on eggs this player hid
-        lobbyPoints: paid.allTime - paid.hider, // train lobby bonuses
+        lobbyPoints: paid.allTime, // train lobby bonuses
         monthRank: rankIndex >= 0 ? rankIndex + 1 : null,
         findsByLevel,
         eggsHidden: myEggIds.length,
@@ -1105,7 +1047,7 @@ export async function createApp({
       let clock = clockState(round, t);
       let resumed = clock.state === 'running';
       if (!resumed) {
-        const limitSeconds = info.seconds; // every level: 3 minutes
+        const limitSeconds = info.seconds; // the level's timer (game.LEVELS)
         round = await tx(async (session) => {
           // Serializes this player's starts, so two taps (or two phones) can't open two clocks.
           await lockUser(session, user._id);
@@ -1128,7 +1070,6 @@ export async function createApp({
         clock = clockState(round, t);
       }
 
-      const pot = potFor(egg, (await playersBeaten([egg], t)).get(egg._id), user._id);
       return {
         attempt: {
           id: round._id,
@@ -1138,8 +1079,6 @@ export async function createApp({
           retry: Boolean(round.retry), // no time bonus on this round
         },
         egg: {
-          bounty: pot.bounty,
-          beaten: pot.beaten,
           id: egg._id,
           level: egg.level,
           levelName: info.name,
@@ -1192,8 +1131,6 @@ export async function createApp({
       const t = now();
       let firstFind = false;
       let score;
-      let beaten = 0;
-      let hiderPoints = 0;
       await tx(async (session) => {
         await slots.lockSlot(col, session, egg.stationId, egg.level);
         // Closing the round atomically means a round submitted twice (two tabs) scores once.
@@ -1204,12 +1141,7 @@ export async function createApp({
         );
         if (!closed) fail(409, 'This round is already finished.');
         const fresh = await col.eggs.findOne({ _id: egg._id }, { session });
-        // Claim the bounty: other players this egg beat since it was last claimed. Read under the
-        // slot lock, so two players finding it at once can't both take the same pot.
-        const pot = potFor(fresh, (await playersBeaten([fresh], t, session)).get(fresh._id), user._id);
-        beaten = pot.beaten;
-        score = game.scoreFind(egg.level, secondsTaken, attempt.limitSeconds, { bounty: pot.bounty, retry: Boolean(attempt.retry) });
-        hiderPoints = game.hiderShare(pot.bounty);
+        score = game.scoreFind(egg.level, secondsTaken, attempt.limitSeconds, { retry: Boolean(attempt.retry) });
         const photoId = await savePhoto(session, candidate);
         try {
           await col.finds.insertOne(
@@ -1225,7 +1157,6 @@ export async function createApp({
               points: score.total,
               base: score.base,
               bonus: score.bonus,
-              bounty: score.bounty,
               ...(attempt.retry && { retry: true }), // found on a retry: no speed stamp
               photoId,
               verified: verification.method === 'gemini',
@@ -1238,37 +1169,14 @@ export async function createApp({
           throw err;
         }
         const avg = Math.round(((fresh.avgFindSeconds ?? 0) * fresh.timesFound + Math.round(secondsTaken)) / (fresh.timesFound + 1));
-        // bountyFrom: the pot is claimed, so the next one only counts players beaten from now on.
-        await col.eggs.updateOne({ _id: egg._id }, { $set: { avgFindSeconds: avg, bountyFrom: t }, $inc: { timesFound: 1 } }, { session });
-        // The hider is paid only when their egg is found: a share of the pot it built up.
-        if (hiderPoints) {
-          await col.payouts.insertOne(
-            {
-              _id: crypto.randomUUID(),
-              userId: fresh.createdBy,
-              kind: 'bounty',
-              eggId: egg._id,
-              findId,
-              finderId: user._id,
-              stationId: egg.stationId,
-              level: egg.level,
-              month: game.monthKey(t),
-              points: hiderPoints,
-              createdAt: t,
-            },
-            { session },
-          );
-        }
+        await col.eggs.updateOne({ _id: egg._id }, { $set: { avgFindSeconds: avg }, $inc: { timesFound: 1 } }, { session });
         firstFind = fresh.timesFound === 0; // read under the slot lock, before this find was counted
         if (fresh.status === 'active') await slots.rotateAfterFind(col, session, fresh, user._id, t);
       });
-      const hider = hiderPoints ? await col.users.findOne({ _id: egg.createdBy }, { projection: { username: 1 } }) : null;
       return {
         status: 'found',
         findId,
-        points: score, // { base, bonus, bounty, total }
-        beaten, // how many other players this egg beat before you (what built the bounty)
-        hider: hider ? { username: hider.username, points: hiderPoints } : null,
+        points: score, // { base, bonus, total }
         secondsTaken: Math.round(secondsTaken),
         verification,
         stationId: egg.stationId,
@@ -1280,8 +1188,7 @@ export async function createApp({
     },
 
     // Ends a round that won't be found: the player gave up, or their clock ran out (the app calls
-    // this when its timer hits zero). If they count, they've added to the egg's bounty. They can
-    // retry right away, but a retry earns no time bonus.
+    // this when its timer hits zero). They can retry right away, but a retry earns no time bonus.
     async endRound(ctx) {
       const user = requireUser(ctx);
       const [attemptId] = ctx.params;
@@ -1299,14 +1206,7 @@ export async function createApp({
       }
       const round = await col.attempts.findOne({ _id: attempt._id });
       if (round.status === 'found') fail(409, 'You found this one.');
-      const egg = (await col.eggs.findOne({ _id: round.eggId })) ?? fail(404, 'Egg not found');
-      const beaten = (await playersBeaten([egg], t)).get(egg._id);
-      return {
-        status: round.status, // 'given_up' | 'expired'
-        counted: beaten.has(user._id), // whether this miss added to the bounty
-        bounty: game.bountyFor(egg.level, beaten.size), // what the next finder takes now
-        beaten: beaten.size,
-      };
+      return { status: round.status }; // 'given_up' | 'expired'
     },
 
     async createEgg(ctx) {
@@ -1527,7 +1427,7 @@ export async function createApp({
       }[ch.id];
 
       return {
-        // Rider level counts bounty shares from eggs you hid, too.
+        // Rider level counts train lobby bonuses, too.
         level: game.riderLevel(allTime + (await payoutPoints(user._id)).allTime),
         today: { day: today, ...ch, progress: Math.min(ch.target, measure), done: measure >= ch.target, lines: todayLines },
         stamps,
