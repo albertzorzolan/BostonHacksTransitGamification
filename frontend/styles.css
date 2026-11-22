@@ -769,3 +769,8 @@ html[data-line="Orange"] .msg.mine .msg-cap { color: var(--ink); }
 .pledge-rules { list-style: none; display: flex; flex-wrap: wrap; gap: 6px; margin: var(--space-xs) 0 0; padding: 0; }
 .pledge-rules li { padding: 2px 10px; border-radius: 999px; background: var(--paper-3); font-size: var(--text-xs); font-weight: 700; }
 .pledge-rules .is-wait { background: #fff4d6; }
+
+/* Profile activity: a fixed-height box that scrolls on its own, with a fade at the edge. */
+.activity-scroll { max-height: min(46dvh, 360px); overflow-y: auto; overscroll-behavior: contain; border-radius: var(--radius);
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent); padding-bottom: 20px; }
+.activity-scroll:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
