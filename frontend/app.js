@@ -1419,6 +1419,7 @@ function viewPlay() {
         return;
       }
       play.result = result;
+      play.myPhoto = image; // the "after" photo on the result screen
       renderResult();
     } catch (err) {
       status.innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
@@ -1482,6 +1483,10 @@ async function renderResult() {
         <p class="win-pts">+<span id="count">${points.total}</span></p>
         <p class="win-sub">Image approved, good job!</p>
       </div>
+    </section>
+    <section class="match-pair" aria-label="Before and after">
+      <figure class="m"><img src="${apiUrl(result.revealUrl || egg.imageUrl)}" alt="The egg when it was hidden" /><figcaption>Before</figcaption></figure>
+      ${play.myPhoto ? `<figure class="m"><img src="${play.myPhoto}" alt="Your photo of it" /><figcaption>After</figcaption></figure>` : ''}
     </section>
     <section class="next-egg">
       <button id="hide" class="btn btn-primary btn-block btn-l" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>Hide the next ${esc(egg.levelName)} egg</button>
