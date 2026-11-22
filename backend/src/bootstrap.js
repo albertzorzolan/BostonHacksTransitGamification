@@ -45,6 +45,9 @@ async function build({ frontendDir = null } = {}) {
     geminiModel: env.GEMINI_MODEL || 'gemini-3.1-flash-lite,gemini-3-flash-preview',
     frontendDir,
     corsOrigins: (env.CORS_ORIGINS || '*').split(',').map((s) => s.trim()).filter(Boolean),
+    seedToken: env.SEED_TOKEN ?? '',
+    // On locally; on Vercel only when TRAIN_SIM=1 (it skips the on-train GPS check).
+    trainSim: env.TRAIN_SIM ? env.TRAIN_SIM === '1' : !env.VERCEL,
   });
   return {
     ...app,

@@ -356,10 +356,334 @@ async function checkArrival() {
   else notifyPlayer(`${s.name}:`, 'no eggs yet. Hide the first.', href);
 }
 
+// ---------- trains ----------
+// About every 20 s the phone's position is compared with the live trains. Two matching checks
+// that moved together with the same train verify you're on it, and you can join its lobby.
+const TRAIN_CHECK_MS = 20_000;
+const trainFam = (routeId) => String(routeId ?? '').split('-')[0];
+async function checkTrain() {
+  if (!state.user || loc.status !== 'ok' || !loc.pos || document.visibilityState === 'hidden') return;
+  try {
+    const r = await api('/api/trains/check', { lat: loc.pos.lat, lng: loc.pos.lng, accuracy: loc.pos.accuracy ?? 0 });
+    state.train = r;
+    drawTrainBar();
+    const t = r.onTrain;
+    if (t?.verified && !(r.lobby && r.lobby.tripId === t.tripId)) {
+      const told = readStored('egg-train-told');
+      if (told !== t.tripId) {
+        store('egg-train-told', t.tripId);
+        notifyPlayer(`You're on a ${t.line} train.`, `Join the lobby for this ride and pledge eggs with the other riders.`, '#/train');
+      }
+    }
+  } catch {
+    /* extra: try again next time */
+  }
+}
+
+// A slim bar under the HUD while you're on a train or in a lobby.
+function drawTrainBar() {
+  const hud = $('#hud');
+  if (!hud || hud.hidden) return;
+  hud.querySelector('.train-bar')?.remove();
+  const { onTrain, lobby } = state.train ?? {};
+  let html = '';
+  if (lobby) {
+    html = `<a class="train-bar" href="#/lobby/${encodeURIComponent(lobby.id)}" style="--ln:${LINE_VAR[trainFam(lobby.routeId)] ?? 'var(--ink)'}"><span aria-hidden="true">🚇</span><b>Train lobby</b><span>${lobby.status === 'reached' ? 'Goal reached' : `${lobby.atTarget}/${lobby.riders} at ${lobby.target} pts`}</span></a>`;
+  } else if (onTrain?.verified) {
+    html = `<a class="train-bar" href="#/train" style="--ln:${LINE_VAR[trainFam(onTrain.routeId)] ?? 'var(--ink)'}"><span aria-hidden="true">🚇</span><b>${esc(onTrain.line)}${onTrain.headsign ? ` to ${esc(onTrain.headsign)}` : ''}</b><span>Join the lobby</span></a>`;
+  } else if ((state.config?.trainSim || state.user?.tester) && !/^#\/(train|lobby)/.test(location.hash)) {
+    // Testing only: a way into the train lobby without riding a train.
+    html = '<a class="train-bar train-sim" href="#/train"><span aria-hidden="true">🧪</span><b>Test: simulate a train ride</b><span>Open</span></a>';
+  }
+  if (html) hud.insertAdjacentHTML('beforeend', html);
+}
+
+async function viewTrain() {
+  loading();
+  await checkTrain();
+  const { lobby } = state.train ?? {};
+  let onTrain = state.train?.onTrain;
+  // A simulated ride has no matching GPS, so checkTrain may not report it: keep it while it lasts.
+  if (!onTrain?.verified && state.simTrain) onTrain = state.simTrain;
+  if (lobby) return location.replace(`#/lobby/${encodeURIComponent(lobby.id)}`);
+  const fam = trainFam(onTrain?.routeId);
+  app.innerHTML = `
+    <section class="tk" style="--ln:${LINE_VAR[fam] ?? 'var(--ink)'}">
+      <div class="band train-band"><span>${onTrain ? esc(onTrain.line) : 'Train lobby'}</span></div>
+      <div class="tk-top">
+        <p class="here">${onTrain?.verified ? "You're riding" : 'Train lobby'}</p>
+        <h1 class="page-h">${onTrain ? esc(onTrain.headsign ? `To ${onTrain.headsign}` : onTrain.line) : 'Not on a train'}</h1>
+        <p class="page-sub">${onTrain?.verified
+          ? `Every rider on this train can join one lobby for the ride. ${onTrain.lobby ? `${plural(onTrain.lobby.riders, 'rider')} already in.` : 'Be the first in.'}`
+          : onTrain
+            ? "You're next to a train. Keep the app open: once it moves and you move with it, you're verified."
+            : 'Board a train with the app open. We match your GPS with the live trains; after a minute of riding you can join the lobby. It works best above ground: phones lose GPS in tunnels.'}</p>
+      </div>
+      <div class="tk-perf" aria-hidden="true"></div>
+      <div class="tk-bottom stack">
+        ${onTrain?.verified ? '<button id="joinLobby" class="btn btn-ink btn-block btn-l" type="button">Join the train lobby</button>' : '<button id="recheck" class="btn btn-ghost btn-block" type="button">Check again</button>'}
+        ${!onTrain?.verified && (state.config?.trainSim || state.user?.tester) ? '<button id="simulate" class="btn btn-primary btn-block" type="button">🧪 Simulate a train ride (test)</button><p class="field-hint">Testing only: puts you on a real live train without the GPS check, so you can try the lobby and the pledge.</p>' : ''}
+        ${onTrain?.simulated ? '<p class="field-hint">🧪 Simulated ride (testing).</p>' : ''}
+        <p class="field-hint">In the lobby, riders donate eggs they've found. When the pledges reach the lobby's limit (2 per rider), every donor gets +50. If the ride ends first, your eggs come back.</p>
+        <div id="err"></div>
+      </div>
+    </section>`;
+  $('#recheck')?.addEventListener('click', () => render());
+  $('#simulate')?.addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    try {
+      const r = await api('/api/trains/simulate', loc.pos ? { lat: loc.pos.lat, lng: loc.pos.lng } : {});
+      state.train = { ...(state.train ?? {}), onTrain: r.onTrain, lobby: null };
+      state.simTrain = r.onTrain;
+      drawTrainBar();
+      render();
+    } catch (err) {
+      $('#err').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+      e.target.disabled = false;
+    }
+  });
+  $('#joinLobby')?.addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    try {
+      const { lobby: joined } = await api('/api/trains/lobby', { tripId: onTrain.tripId });
+      state.train = { ...state.train, lobby: joined };
+      drawTrainBar();
+      location.hash = `#/lobby/${encodeURIComponent(joined.id)}`;
+    } catch (err) {
+      $('#err').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+      e.target.disabled = false;
+    }
+  });
+}
+
+async function viewLobby(id) {
+  loading();
+  const lid = encodeURIComponent(id);
+  let { lobby } = await api(`/api/lobbies/${lid}`);
+  const chat = { messages: (await api(`/api/lobbies/${lid}/messages`)).messages, lastSeq: 0 };
+  chat.lastSeq = chat.messages.at(-1)?.seq ?? 0;
+  const fam = trainFam(lobby.routeId);
+
+  // Help requests show as a card with a Help button (or "Covered" once that rider has 100).
+  const riderById = (rid) => lobby.ridersList?.find((r) => r.id === rid);
+  const msgHtml = (m) => {
+    if (m.help) {
+      const r = riderById(m.help.riderId);
+      const need = r ? r.need : m.help.need;
+      return `<div class="msg msg-help ${m.mine ? 'mine' : ''}" data-id="${esc(m.id)}">
+        <p class="help-card"><span aria-hidden="true">🙋</span> <b>${m.mine ? 'You' : esc(m.name)}</b> ${need > 0 ? `${m.mine ? 'need' : 'needs'} <b>${need} pts</b> to reach ${lobby.target}` : 'reached 100. Covered ✓'}
+        ${need > 0 && !m.mine && lobby.status === 'open' ? `<button class="btn btn-primary help-btn" type="button" data-help="${esc(m.help.riderId)}">Help</button>` : ''}</p>
+        <p class="msg-meta">${fmtTime(m.createdAt)}</p>
+      </div>`;
+    }
+    return `<div class="msg ${m.mine ? 'mine' : ''}" data-id="${esc(m.id)}">
+      ${m.text != null ? `<p class="msg-text">${esc(m.text)}</p>` : `<span class="msg-emoji" aria-hidden="true">${esc(m.emoji)}</span><p class="msg-cap">${esc(m.label)}</p>`}
+      <p class="msg-meta">${m.mine ? 'You' : esc(m.name)} · ${fmtTime(m.createdAt)}${m.mine ? '' : ` <button class="link msg-report" type="button" data-report="${esc(m.id)}" aria-label="Report this message">Report</button>`}</p>
+    </div>`;
+  };
+
+  // The pledge: every rider needs `target` pts of found eggs in their name. You pick eggs from
+  // your stash by level and pledge them for yourself or for another rider.
+  const pick = {}; // level -> count chosen
+  let forRider = null; // rider id you're donating to, or null for yourself
+  const pickedPts = () => Object.entries(pick).reduce((n, [lv, c]) => n + (lobby.stash.levels.find((l) => l.level === Number(lv))?.points ?? 0) * c, 0);
+  const pledgeHtml = () => {
+    const me = lobby.ridersList.find((r) => r.you);
+    const status = lobby.status === 'reached' ? '<p class="stamp">Goal reached</p>'
+      : lobby.status === 'ended' ? `<p class="stamp stamp-quiet">${lobby.outcome === 'reached' ? 'Goal reached' : 'Ride over'}</p>` : '';
+    const target = forRider ? riderById(forRider) : me;
+    if (forRider && (!target || target.need <= 0)) forRider = null;
+    const recipient = forRider ? riderById(forRider) : me;
+    const pts = pickedPts();
+    const riders = lobby.ridersList
+      .map((r) => `<li class="${r.you ? 'is-me' : ''} ${r.need ? '' : 'is-done'}">
+        <span class="rd-name">${r.you ? 'You' : esc(r.name)}</span>
+        <span class="rd-bar" aria-hidden="true"><i style="--p:${Math.min(100, Math.round((r.pledged / lobby.target) * 100))}%"></i></span>
+        <span class="rd-n">${r.need ? `${r.pledged}/${lobby.target}` : '✓ 100'}</span>
+        ${!r.you && r.need && lobby.status === 'open' ? `<button class="link rd-help" type="button" data-help="${esc(r.id)}">Help</button>` : ''}
+      </li>`)
+      .join('');
+    return `
+      <div class="pledge-head"><p class="next-label">Egg pledge</p>${status}</div>
+      <p class="pledge-n"><b>${lobby.atTarget}</b> of ${plural(lobby.riders, 'rider')} at ${lobby.target} pts</p>
+      <p class="field-hint">${lobby.status === 'open'
+        ? `${lobby.riders < lobby.minRiders ? `<b>Waiting for another rider:</b> the goal needs at least ${lobby.minRiders}. ` : ''}Everyone needs <b>${lobby.target} pts</b> of found eggs pledged (Easy 10 · Medium 20 · Hard 30 · Extreme 40 · Impossible 60). When every rider gets there, all riders get <b>+${lobby.bonus}</b>, and donors <b>+${lobby.donorBonus}</b> for each egg they gave. A pledged egg can't be pledged again, even if the ride ends first; it stays in your collection.`
+        : lobby.status === 'reached' ? `Every rider got +${lobby.bonus}, and donors +${lobby.donorBonus} per egg given.` : lobby.outcome === 'missed' ? "The ride ended before everyone reached 100. Pledged eggs stay used." : ''}</p>
+      <ol class="riders">${riders}</ol>
+      ${lobby.status === 'open' ? `
+      <div class="pledge-box">
+        <p class="pledge-for">${forRider ? `Donating to <b>${esc(recipient.name)}</b> (needs ${recipient.need}) <button class="link" type="button" id="forMe">Pledge for me instead</button>` : me.need ? `Pledging for <b>you</b> (you need ${me.need})` : 'You have 100. Help someone above.'}</p>
+        <ul class="stash">${lobby.stash.levels
+          .map((l) => {
+            const c = pick[l.level] ?? 0;
+            return `<li class="${l.count ? '' : 'is-none'}">
+              ${eggSvg(l.level, { size: 26, title: `${l.name} egg` })}
+              <span class="st-lv">${esc(l.name)}<small>${l.points} pts · ${l.count} left</small></span>
+              <span class="st-pick"><button type="button" class="st-b" data-dec="${l.level}" ${c ? '' : 'disabled'} aria-label="One fewer ${esc(l.name)}">−</button><b>${c}</b><button type="button" class="st-b" data-inc="${l.level}" ${c < l.count ? '' : 'disabled'} aria-label="One more ${esc(l.name)}">+</button></span>
+            </li>`;
+          })
+          .join('')}</ul>
+        <div class="pledge-actions">
+          <button id="doPledge" class="btn btn-ink" type="button" ${pts && (forRider || me.need) ? '' : 'disabled'}>${forRider ? `Donate ${pts} pts` : `Pledge ${pts} pts`}</button>
+          ${me.need && !forRider ? `<button id="askHelp" class="btn btn-ghost" type="button">🙋 Ask for help</button>` : ''}
+        </div>
+        ${lobby.stash.points ? '' : '<p class="field-hint">You have no unpledged eggs. Find eggs at stations, or ask the others for help.</p>'}
+      </div>` : ''}
+      <div id="pledgeErr"></div>`;
+  };
+
+  app.innerHTML = `
+    <section class="tk lobby-tk" style="--ln:${LINE_VAR[fam] ?? 'var(--ink)'}">
+      <div class="band train-band"><span>${esc(lobby.line)}</span><span>${plural(lobby.riders, 'rider')}</span></div>
+      <div class="tk-top">
+        <p class="here">Train lobby</p>
+        <h1 class="page-h">${esc(lobby.headsign ? `To ${lobby.headsign}` : lobby.line)}</h1>
+        <p class="page-sub">Only for this ride. Everyone shows by their anonymous chat name. You're <b>${esc(state.user.chatName ?? 'anonymous')}</b>.</p>
+      </div>
+      <div class="tk-perf" aria-hidden="true"></div>
+      <div class="tk-bottom" id="pledge">${pledgeHtml()}</div>
+    </section>
+    <section class="tk"><div id="feed" class="feed" aria-live="polite">${chat.messages.length ? chat.messages.map(msgHtml).join('') : '<div class="empty"><p>Say hi to your fellow riders.</p></div>'}</div></section>
+    ${lobby.status === 'ended' ? '' : `<form id="say" class="say"><input id="sayText" class="input" maxlength="140" placeholder="Message the train" autocomplete="off" /><button class="btn btn-ink" type="submit">Send</button></form>
+    <div id="sayErr"></div>
+    <div class="stickers">${(state.config?.stickers ?? []).map((st) => `<button class="stk" type="button" data-sticker="${esc(st.id)}" aria-label="Send ${esc(st.label)}"><span aria-hidden="true">${esc(st.emoji)}</span><small>${esc(st.label)}</small></button>`).join('')}</div>`}`;
+
+  const feed = $('#feed');
+  feed.scrollTop = feed.scrollHeight;
+  if (lobby.status !== 'ended') {
+    state.train = { ...(state.train ?? {}), lobby };
+    drawTrainBar();
+  }
+  const append = (messages) => {
+    const fresh = messages.filter((m) => m.seq > chat.lastSeq);
+    if (!fresh.length) return;
+    chat.lastSeq = fresh.at(-1).seq;
+    chat.messages.push(...fresh);
+    feed.querySelector('.empty')?.remove();
+    const near = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80;
+    feed.insertAdjacentHTML('beforeend', fresh.map(msgHtml).join(''));
+    if (near || fresh.some((m) => m.mine)) feed.scrollTop = feed.scrollHeight;
+  };
+  const drawPledge = () => {
+    $('#pledge').innerHTML = pledgeHtml();
+    wirePledge();
+    // Keep the train bar under the header in step with the meter.
+    state.train = { ...(state.train ?? {}), lobby: lobby.status === 'ended' ? null : lobby };
+    drawTrainBar();
+  };
+  const help = (rid) => {
+    forRider = rid;
+    for (const k of Object.keys(pick)) delete pick[k];
+    drawPledge();
+    $('#pledge').scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'start' });
+  };
+  function wirePledge() {
+    app.querySelectorAll('[data-inc]').forEach((b) => b.addEventListener('click', () => { pick[b.dataset.inc] = (pick[b.dataset.inc] ?? 0) + 1; drawPledge(); }));
+    app.querySelectorAll('[data-dec]').forEach((b) => b.addEventListener('click', () => { pick[b.dataset.dec] = Math.max(0, (pick[b.dataset.dec] ?? 0) - 1); drawPledge(); }));
+    $('#pledge').querySelectorAll('[data-help]').forEach((b) => b.addEventListener('click', () => help(b.dataset.help)));
+    $('#forMe')?.addEventListener('click', () => { forRider = null; drawPledge(); });
+    $('#askHelp')?.addEventListener('click', async (e) => {
+      e.target.disabled = true;
+      try {
+        append([(await api(`/api/lobbies/${lid}/help`, {})).message]);
+        toast('Asked the train for help.');
+      } catch (err) {
+        $('#pledgeErr').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+      }
+      e.target.disabled = false;
+    });
+    $('#doPledge')?.addEventListener('click', async (e) => {
+      e.target.disabled = true;
+      try {
+        const eggs = Object.fromEntries(Object.entries(pick).filter(([, c]) => c > 0));
+        const r = await api(`/api/lobbies/${lid}/pledge`, { eggs, ...(forRider && { for: forRider }) });
+        lobby = r.lobby;
+        for (const k of Object.keys(pick)) delete pick[k];
+        if (r.reached) notifyPlayer('Train goal reached!', `Every rider gets +${lobby.bonus}${lobby.ridersList.find((x) => x.you)?.donatedEggs ? `, plus +${lobby.donorBonus} for each egg you gave` : ''}.`, `#/lobby/${lid}`);
+        else toast(r.donated ? `Donated ${r.points} pts. Nice.` : `Pledged ${r.points} pts.`);
+        forRider = null;
+        drawPledge();
+        redrawHelpCards();
+        refreshHud(true);
+      } catch (err) {
+        drawPledge();
+        $('#pledgeErr').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+      }
+    });
+  }
+  wirePledge();
+  // Help cards in the chat follow the riders' current totals.
+  const redrawHelpCards = () => {
+    for (const m of chat.messages.filter((x) => x.help)) {
+      const el = feed.querySelector(`[data-id="${CSS.escape(m.id)}"]`);
+      if (el) el.outerHTML = msgHtml(m);
+    }
+  };
+  feed.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-help]');
+    if (b) help(b.dataset.help);
+  });
+
+  const send = async (body) => {
+    try {
+      append([(await api(`/api/lobbies/${lid}/messages`, body)).message]);
+      $('#sayErr').innerHTML = '';
+      return true;
+    } catch (err) {
+      $('#sayErr').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+      return false;
+    }
+  };
+  $('#say')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const input = $('#sayText');
+    if (!input.value.trim()) return;
+    if (await send({ text: input.value })) input.value = '';
+  });
+  app.querySelectorAll('[data-sticker]').forEach((b) => b.addEventListener('click', () => send({ sticker: b.dataset.sticker })));
+  feed.addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-report]');
+    if (!b || !confirm('Report this message? It disappears for you now, and for everyone after 3 reports.')) return;
+    try {
+      await api(`/api/lobbies/${lid}/messages/${encodeURIComponent(b.dataset.report)}/report`, {});
+      b.closest('.msg')?.remove();
+      toast('Reported. Thanks.');
+    } catch (err) {
+      toast(err.message);
+    }
+  });
+
+  // Poll: new messages every 4 s, the pledge meter every 8 s.
+  let tick = 0;
+  every(4000, async () => {
+    if (document.visibilityState !== 'visible') return;
+    try {
+      append((await api(`/api/lobbies/${lid}/messages?after=${chat.lastSeq}`)).messages);
+      if (++tick % 2 === 0) {
+        const fresh = (await api(`/api/lobbies/${lid}`)).lobby;
+        const sig = (l) => JSON.stringify([l.status, l.ridersList.map((r) => [r.id, r.pledged]), l.stash.points]);
+        const changed = sig(fresh) !== sig(lobby);
+        const justReached = fresh.status === 'reached' && lobby.status === 'open';
+        lobby = fresh;
+        if (changed) {
+          drawPledge();
+          redrawHelpCards();
+        }
+        if (justReached) notifyPlayer('Train goal reached!', `Every rider gets +${lobby.bonus}.`, `#/lobby/${lid}`);
+        if (fresh.status === 'ended') render();
+      }
+    } catch {
+      /* next tick */
+    }
+  });
+}
+
 function startAlerts() {
   if (state.alerting) return;
   state.alerting = true;
   loc.subs.add(checkArrival); // stays on for the whole visit, not just one page
+  setInterval(checkTrain, TRAIN_CHECK_MS);
+  setTimeout(checkTrain, 3000);
   setInterval(checkNotifications, ALERT_POLL_MS);
   document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && checkNotifications());
   checkNotifications();
@@ -423,6 +747,7 @@ function drawHud() {
     </div>
     <a class="rival" href="#/leaderboard">${rival}</a>`;
   drawBell();
+  drawTrainBar();
 }
 
 async function refreshProgress() {
@@ -444,6 +769,8 @@ const routes = [
   [/^#\/leaderboard$/, viewLeaderboard],
   [/^#\/profile$/, viewProfile],
   [/^#\/notifications$/, viewNotifications],
+  [/^#\/train$/, viewTrain],
+  [/^#\/lobby\/([^/]+)$/, (id) => viewLobby(id)],
   [/^#\/user\/([^/]+)$/, viewPlayer],
   [/^#\/map$/, viewMap],
   [/^#\/groups$/, viewGroups],
@@ -1444,6 +1771,89 @@ async function viewLeaderboard() {
   await draw();
 }
 
+// ---------- egg art ----------
+// One egg per level, more attractive as the level goes up: Easy a plain sky-blue egg, Medium a
+// speckled mint one, Hard a painted violet one, Extreme gold, Impossible platinum (the finest).
+// Inline SVG (no image files). Gradient ids get a unique prefix so many eggs can share a page.
+const EGG_PATH = 'M50 5C26 5 9 47 9 76c0 27 18 44 41 44s41-17 41-44C91 47 74 5 50 5z';
+let eggSeq = 0;
+function eggSvg(level, { size = 64, title = '' } = {}) {
+  const u = `eg${++eggSeq}`;
+  const wrap = (defs, body) =>
+    `<svg class="egg-art" viewBox="0 0 100 125" width="${size}" height="${size * 1.25}" role="img" aria-label="${esc(title)}"><defs>${defs}</defs>${body}</svg>`;
+  const shine = `<ellipse cx="34" cy="38" rx="9" ry="17" fill="#fff" opacity=".55" transform="rotate(-18 34 38)"/>`;
+  switch (level) {
+    case 1: // Easy: a plain, soft sky-blue egg
+      return wrap(
+        `<radialGradient id="${u}a" cx="38%" cy="32%" r="78%"><stop offset="0" stop-color="#eaf6ff"/><stop offset=".6" stop-color="#9fd3f5"/><stop offset="1" stop-color="#5fa8d8"/></radialGradient>`,
+        `<path d="${EGG_PATH}" fill="url(#${u}a)" stroke="#4a8fbf" stroke-width="2"/>${shine}`,
+      );
+    case 2: // Medium: a mint-green egg with speckles
+      return wrap(
+        `<radialGradient id="${u}a" cx="38%" cy="32%" r="78%"><stop offset="0" stop-color="#eefcf3"/><stop offset=".6" stop-color="#8fdcae"/><stop offset="1" stop-color="#3fae73"/></radialGradient>`,
+        `<path d="${EGG_PATH}" fill="url(#${u}a)" stroke="#2f8f5b" stroke-width="2"/>
+         ${[[60, 40, 2.6], [42, 60, 2.2], [67, 72, 3], [35, 86, 2.4], [57, 98, 2.1], [73, 52, 1.8], [47, 30, 1.7], [29, 70, 1.6], [50, 80, 1.9], [70, 92, 1.6]].map(([x, y, r]) => `<circle cx="${x}" cy="${y}" r="${r}" fill="#1f6f45" opacity=".55"/>`).join('')}
+         ${shine}`,
+      );
+    case 3: // Hard: a painted violet egg with a zigzag band and polka dots
+      return wrap(
+        `<radialGradient id="${u}a" cx="38%" cy="32%" r="78%"><stop offset="0" stop-color="#f4ecff"/><stop offset=".55" stop-color="#b58cf0"/><stop offset="1" stop-color="#7448c2"/></radialGradient>`,
+        `<path d="${EGG_PATH}" fill="url(#${u}a)" stroke="#5b34a6" stroke-width="2"/>
+         <path d="M11 70l8-7 8 7 8-7 8 7 7-7 8 7 8-7 8 7 8-7 8 7 9-7" fill="none" stroke="#ffd43b" stroke-width="5" stroke-linejoin="round"/>
+         <path d="M12 82l8-7 8 7 8-7 8 7 7-7 8 7 8-7 8 7 8-7 8 7 8-7" fill="none" stroke="#fff" stroke-width="3" stroke-linejoin="round" opacity=".85"/>
+         ${[[40, 36], [60, 32], [50, 50], [30, 54], [70, 54], [38, 100], [62, 100], [50, 110]].map(([x, y]) => `<circle cx="${x}" cy="${y}" r="3.6" fill="#ffd43b" stroke="#fff" stroke-width="1"/>`).join('')}
+         ${shine}`,
+      );
+    case 4: // Extreme: gold, with a jewelled band
+      return wrap(
+        `<linearGradient id="${u}a" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fff3b8"/><stop offset=".35" stop-color="#f0c33c"/><stop offset=".65" stop-color="#b8860b"/><stop offset="1" stop-color="#f5d469"/></linearGradient>
+         <linearGradient id="${u}b" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#8a6205"/><stop offset=".5" stop-color="#fff0a8"/><stop offset="1" stop-color="#8a6205"/></linearGradient>`,
+        `<path d="${EGG_PATH}" fill="url(#${u}a)" stroke="#7a5604" stroke-width="2"/>
+         <path d="M11 68c25 9 53 9 78 0v8c-25 9-53 9-78 0z" fill="url(#${u}b)"/>
+         ${[[30, 73], [50, 76], [70, 73]].map(([x, y]) => `<circle cx="${x}" cy="${y}" r="2.6" fill="#d7263d" stroke="#fff3b8" stroke-width=".8"/>`).join('')}
+         ${shine}
+         <path class="egg-spark" d="M80 18l1.6 4.4L86 24l-4.4 1.6L80 30l-1.6-4.4L74 24l4.4-1.6z" fill="#fff"/>`,
+      );
+    default: // Impossible: platinum, the finest egg: twin bands, a diamond, sparkles and a glow
+      return wrap(
+        `<linearGradient id="${u}a" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ffffff"/><stop offset=".3" stop-color="#e3e8ee"/><stop offset=".55" stop-color="#9aa5b3"/><stop offset=".75" stop-color="#f2f5f8"/><stop offset="1" stop-color="#b9c2ce"/></linearGradient>
+         <linearGradient id="${u}b" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#7d8794"/><stop offset=".5" stop-color="#ffffff"/><stop offset="1" stop-color="#7d8794"/></linearGradient>
+         <linearGradient id="${u}d" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#e9fbff"/><stop offset=".5" stop-color="#8fd8ff"/><stop offset="1" stop-color="#c7b6ff"/></linearGradient>
+         <radialGradient id="${u}g" cx="50%" cy="55%" r="55%"><stop offset=".62" stop-color="#cfe4ff" stop-opacity=".7"/><stop offset="1" stop-color="#cfe4ff" stop-opacity="0"/></radialGradient>`,
+        `<ellipse cx="50" cy="68" rx="49" ry="58" fill="url(#${u}g)"/>
+         <path d="${EGG_PATH}" fill="url(#${u}a)" stroke="#6b7480" stroke-width="2"/>
+         <path d="M12 62c25 8 51 8 76 0v5c-25 8-51 8-76 0zM10 84c26 9 54 9 80 0v5c-26 9-54 9-80 0z" fill="url(#${u}b)" opacity=".95"/>
+         <path d="M50 64l7 9-7 10-7-10z" fill="url(#${u}d)" stroke="#6b7480" stroke-width="1"/><path d="M43 73h14M50 64v19" stroke="#fff" stroke-width=".6" opacity=".8"/>
+         ${shine}<ellipse cx="66" cy="100" rx="5" ry="9" fill="#fff" opacity=".35" transform="rotate(-25 66 100)"/>
+         ${[[80, 20, 6], [20, 28, 4], [88, 58, 4], [14, 100, 3]].map(([x, y, r]) => `<path class="egg-spark" d="M${x} ${y - r}L${x + r * 0.28} ${y - r * 0.28} ${x + r} ${y} ${x + r * 0.28} ${y + r * 0.28} ${x} ${y + r} ${x - r * 0.28} ${y + r * 0.28} ${x - r} ${y} ${x - r * 0.28} ${y - r * 0.28}z" fill="#fff" stroke="#c5ccd6" stroke-width=".6"/>`).join('')}`,
+      );
+  }
+}
+
+// The egg collection: every level's egg with how many you've found. Unfound ones are shadows.
+function eggShelf(findsByLevel, { mine = true } = {}) {
+  const levels = state.config?.levels ?? [];
+  if (!levels.length || !findsByLevel) return '';
+  const total = levels.reduce((n, l) => n + (findsByLevel[l.name] ?? 0), 0);
+  return `<section class="tk egg-shelf" aria-label="Egg collection">
+    <div class="tk-top shelf-top">
+      <div><p class="here">Egg collection</p><p class="shelf-total"><b>${total}</b> ${total === 1 ? 'egg' : 'eggs'} found</p></div>
+      ${eggSvg(Math.max(1, ...levels.filter((l) => findsByLevel[l.name]).map((l) => l.level)), { size: 40, title: 'Best egg found' })}
+    </div>
+    <div class="tk-perf" aria-hidden="true"></div>
+    <ol class="shelf">${levels
+      .map((l) => {
+        const n = findsByLevel[l.name] ?? 0;
+        return `<li class="shelf-egg lv-${l.level} ${n ? '' : 'is-none'}">
+          <div class="shelf-pic">${eggSvg(l.level, { size: 52, title: `${l.name} egg` })}${n ? `<span class="shelf-n">×${n}</span>` : ''}</div>
+          <p class="shelf-name">${esc(l.name)}</p>
+          <p class="shelf-sub">${n ? plural(n, 'find') : mine ? 'Not yet' : '–'}</p>
+        </li>`;
+      })
+      .join('')}</ol>
+  </section>`;
+}
+
 // ---------- profile ----------
 // Each find is a little punched ticket.
 function ticketsGrid(finds) {
@@ -1592,6 +2002,7 @@ async function viewProfile() {
         </dl>
       </div>
     </section>
+    ${eggShelf(p.findsByLevel)}
     ${namesCard({ ...p.user, chatName: p.user.chatName ?? state.user.chatName })}
     ${p.activity?.length ? `<div class="eggs-head"><h2 class="sec-h">Activity</h2><p class="eggs-count">Latest first</p></div>${activityList(p.activity)}` : ''}
     ${challengeTicket(progress?.today)}
@@ -1638,6 +2049,7 @@ async function viewPlayer(id) {
         <div><dt>Found by others</dt><dd>${p.timesYourEggsWereFound}</dd></div>
       </dl>
     </section>
+    ${eggShelf(p.findsByLevel, { mine: false })}
     <div class="eggs-head"><h2 class="sec-h">Recent finds</h2></div>
     ${ticketsGrid(p.recentFinds)}`;
 }
@@ -1772,8 +2184,8 @@ async function viewGroup(id) {
   const stickerHtml = (m) => {
     const r = m.mine ? myRank() : null;
     return `<div class="msg ${m.mine ? 'mine' : ''}">
-      <span class="msg-emoji" aria-hidden="true">${esc(m.emoji)}</span>
-      <p class="msg-cap">${esc(m.label)}</p>
+      ${m.text != null ? `<p class="msg-text">${esc(m.text)}</p>` : `<span class="msg-emoji" aria-hidden="true">${esc(m.emoji)}</span>
+      <p class="msg-cap">${esc(m.label)}</p>`}
       <p class="msg-meta">${m.mine ? 'You' : esc(m.name)}${r ? `<span class="rank-chip">${r === 1 ? '👑 ' : ''}${ordinal(r)}</span>` : ''} · ${fmtTime(m.createdAt)}</p>
     </div>`;
   };
@@ -1798,8 +2210,10 @@ async function viewGroup(id) {
   const chatHtml = () => `
     <section class="tk"><div id="feed" class="feed" aria-live="polite">${chat.messages.length
       ? chat.messages.map(stickerHtml).join('')
-      : '<div class="empty"><p>No stickers yet. Start the trash talk.</p></div>'}</div></section>
-    <p class="chat-hint">You're <b>${esc(state.user.chatName ?? 'anonymous')}</b> here (<a href="#/profile">change</a>). Tap a sticker to send it.</p>
+      : '<div class="empty"><p>Nothing yet. Start the trash talk.</p></div>'}</div></section>
+    <form id="say" class="say"><input id="sayText" class="input" maxlength="140" placeholder="Message the group 😎" autocomplete="off" /><button class="btn btn-ink" type="submit">Send</button></form>
+    <div id="sayErr"></div>
+    <p class="chat-hint">You're <b>${esc(state.user.chatName ?? 'anonymous')}</b> here (<a href="#/profile">change</a>). Type a message or tap a sticker.</p>
     <div class="stickers">${(state.config?.stickers ?? [])
       .map((st) => `<button class="stk" type="button" data-sticker="${esc(st.id)}" aria-label="Send ${esc(st.label)}"><span aria-hidden="true">${esc(st.emoji)}</span><small>${esc(st.label)}</small></button>`)
       .join('')}</div>`;
@@ -1905,14 +2319,17 @@ async function viewGroup(id) {
         }
       }),
     );
+    const sendMessage = async (body) => {
+      const { message } = await api(`/api/groups/${gid}/messages`, body);
+      // Pick up anything others sent meanwhile, then ours, in order.
+      const { messages } = await api(`/api/groups/${gid}/messages?after=${chat.lastSeq}`);
+      appendMessages(messages.length ? messages : [message]);
+    };
     app.querySelectorAll('[data-sticker]').forEach((b) =>
       b.addEventListener('click', async () => {
         b.disabled = true;
         try {
-          const { message } = await api(`/api/groups/${gid}/messages`, { sticker: b.dataset.sticker });
-          // Pick up anything others sent meanwhile, then ours, in order.
-          const { messages } = await api(`/api/groups/${gid}/messages?after=${chat.lastSeq}`);
-          appendMessages(messages.length ? messages : [message]);
+          await sendMessage({ sticker: b.dataset.sticker });
         } catch (err) {
           toast(err.message);
         } finally {
@@ -1920,6 +2337,23 @@ async function viewGroup(id) {
         }
       }),
     );
+    $('#say')?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const input = $('#sayText');
+      if (!input.value.trim()) return;
+      const btn = e.target.querySelector('button');
+      btn.disabled = true;
+      try {
+        await sendMessage({ text: input.value });
+        input.value = '';
+        $('#sayErr').innerHTML = '';
+      } catch (err) {
+        $('#sayErr').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+      } finally {
+        btn.disabled = false;
+        input.focus();
+      }
+    });
     $('#rename')?.addEventListener('click', async () => {
       const name = prompt('New group name', group.name);
       if (!name || name.trim() === group.name) return;
@@ -2283,7 +2717,7 @@ async function viewMap() {
   app.innerHTML = `
     <h1 class="page-h">Map</h1>
     <p class="page-sub">Every station, every egg, and every train running right now.</p>
-    <div class="map-tally" aria-label="Eggs on the T right now">
+    <div class="map-tally map-totals" aria-label="Eggs on the T right now">
       <p><b>${totals.eggs}</b>${totals.eggs === 1 ? 'egg' : 'eggs'} hidden</p>
       <p><b>${totals.stationsWithEggs}</b>of ${totals.stations} stations</p>
       <p><b>${totals.playable ?? totals.eggs}</b>left for you</p>

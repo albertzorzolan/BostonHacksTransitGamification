@@ -23,11 +23,14 @@ const STATIONS = [
   { id: 'test-count', name: 'Test Count', lat: 42.39, lng: -71.1, lines: [{ id: 'Blue', name: 'Blue Line', color: '#003DA5' }] },
   { id: 'test-activity', name: 'Test Activity', lat: 42.4, lng: -71.11, lines: [{ id: 'Red', name: 'Red Line', color: '#DA291C' }] },
   { id: 'test-clock', name: 'Test Clock', lat: 42.37, lng: -71.08, lines: [{ id: 'Blue', name: 'Blue Line', color: '#003DA5' }] },
+  { id: 'test-map', name: 'Test Map', lat: 42.41, lng: -71.12, lines: [{ id: 'Green-B', name: 'Green Line B', color: '#00843D' }] },
   { id: 'test-bounty', name: 'Test Bounty', lat: 42.38, lng: -71.09, lines: [{ id: 'Blue', name: 'Blue Line', color: '#003DA5' }] },
   { id: 'test-screen', name: 'Test Screen', lat: 42.43, lng: -71.14, lines: [{ id: 'Red', name: 'Red Line', color: '#DA291C' }] },
   { id: 'test-map', name: 'Test Map', lat: 42.41, lng: -71.12, lines: [{ id: 'Orange', name: 'Orange Line', color: '#ED8B00' }] },
 ];
+let fakeVehicles = []; // live trains, for the train lobby tests
 const fakeMbta = {
+  vehicles: async () => fakeVehicles,
   loadStations: async () => STATIONS,
   predictions: async () => [{ routeId: 'Green-B', line: 'Green Line B', color: '#00843D', headsign: 'Boston College', seconds: 240 }],
 };
@@ -373,17 +376,23 @@ test('group sticker chat: members only, stickers only, polling, rate limit', asy
 
   assert.equal((await call(chat, { sticker: 'crown' }, nosy)).status, 403, 'non-members cannot send');
   assert.equal((await call(chat, null, nosy)).status, 403, 'or read');
-  assert.equal((await call(chat, { text: 'hello' }, kai)).status, 400, 'no typed messages');
+  assert.equal((await call(chat, { text: 'see www.spam.com' }, kai)).status, 400, 'no links');
+  assert.equal((await call(chat, { text: 'x'.repeat(141) }, kai)).status, 400, 'short messages only');
   assert.equal((await call(chat, { sticker: '<img src=x>' }, kai)).status, 400, 'unknown sticker');
 
   const first = await ok(chat, { sticker: 'crown' }, kai);
   assert.deepEqual([first.message.emoji, first.message.label, first.message.name, first.message.mine, first.message.seq], ['👑', "Who's the king now", kai.chatName, true, 1]);
   await ok(chat, { sticker: 'snail' }, lou);
+  // Text with emojis is fine too (a separate group, so the sequence checks below stay simple).
+  const { group: g2 } = await ok('/api/groups', { name: 'Text Squad' }, kai);
+  const said = await ok(`/api/groups/${g2.id}/messages`, { text: '  gg   😂🔥 ' }, kai);
+  assert.deepEqual([said.message.text, said.message.mine, 'sticker' in said.message], ['gg 😂🔥', true, false]);
+  await ok(`/api/groups/${g2.id}/leave`, {}, kai);
 
   // Anonymous: senders show by chat name only, with no username or user id.
   const all = await ok(chat, null, lou);
   assert.deepEqual(all.messages.map((m) => [m.name, m.mine, m.sticker]), [[kai.chatName, false, 'crown'], [lou.chatName, true, 'snail']]);
-  assert.equal(all.messages.some((m) => 'text' in m || 'username' in m || 'userId' in m), false);
+  assert.equal(all.messages.some((m) => 'username' in m || 'userId' in m), false);
   assert.equal(JSON.stringify(all).includes(kai.id), false);
   // A new chat name shows on old messages too.
   await ok('/api/me/names', { chatName: 'Masked Crown' }, kai);
@@ -798,7 +807,7 @@ test('map: per-station stats, keeper and hunting now; lines and trains degrade t
   const eggId = (await ok('/api/stations/test-map')).slots[2].egg.id;
 
   // tia starts a round: she's hunting there now, then finds it.
-  const round = await ok('/api/attempts', { eggId, mode: 'fixed' }, tia);
+  const round = await ok('/api/attempts', { eggId }, tia);
   let m = await ok('/api/map/stations', null, tia);
   let ken = m.stations.find((s) => s.id === 'test-map');
   assert.ok(ken.huntingNow >= 1, 'a round started just now counts as hunting');
@@ -822,6 +831,155 @@ test('map: per-station stats, keeper and hunting now; lines and trains degrade t
   // The fake MBTA has no shapes or vehicles: the endpoints answer with empty lists instead of failing.
   assert.deepEqual(await ok('/api/map/lines'), { lines: [] });
   assert.deepEqual((await ok('/api/map/vehicles')).vehicles, []);
+});
+
+test('train lobbies: verified riders join one lobby per journey, everyone pledges 100 pts of eggs, helpers donate', async () => {
+  const at = (lat, lng = -71.1) => ({ lat, lng, accuracy: 20 });
+  const train = (tripId, lat, lng = -71.1) => ({ id: `v-${tripId}`, tripId, routeId: 'Green-B', line: 'Green Line', headsign: 'Boston College', lat, lng });
+  const check = (who, fix) => ok('/api/trains/check', fix, who);
+  const [ann, ben, cat] = [await user('ride_ann'), await user('ride_ben'), await user('ride_cat')];
+  // Found eggs, by level (worth 10/20/30/40/60): ann 2 Impossible + 1 Medium + 2 Easy = 160,
+  // ben 3 Hard + 1 Easy + 1 Medium = 120, cat 1 Medium = 20.
+  let fid = 0;
+  const found = (u, levels) => db.col.finds.insertMany(levels.map((level) => ({ _id: `rf-${++fid}`, userId: u.id, eggId: `re-${fid}`, stationId: 'test-map', level, points: 10, month: '2001-01', foundAt: new Date(Date.UTC(2001, 0, 1, 0, fid)) })));
+  await found(ann, [5, 5, 2, 1, 1]);
+  await found(ben, [3, 3, 3, 1, 2]);
+  await found(cat, [2]);
+
+  // First fix next to the train: seen, not yet verified.
+  fakeVehicles = [train('trip-1', 42.35)];
+  let r = await check(ann, at(42.3501));
+  assert.deepEqual([r.onTrain.tripId, r.onTrain.verified, r.onTrain.lobby], ['trip-1', false, null]);
+  assert.equal((await call('/api/trains/lobby', { tripId: 'trip-1' }, ann)).status, 403, 'not verified yet');
+  await check(ben, at(42.3501)); // ben is on the platform...
+  await check(cat, at(42.3501));
+  assert.equal((await check(ann, at(42.40))).onTrain, null, 'far from every train');
+
+  // 30 s later the train has moved ~330 m. ann and cat moved with it; ben stayed on the platform.
+  clock += 30_000;
+  fakeVehicles = [train('trip-1', 42.353)];
+  assert.equal((await check(ann, at(42.3531))).onTrain.verified, true);
+  assert.equal((await check(cat, at(42.3529))).onTrain.verified, true);
+  assert.equal((await check(ben, at(42.3502))).onTrain, null, 'standing still while the train leaves is not riding');
+  assert.equal((await call('/api/trains/lobby', {}, ben)).status, 403);
+  // ann's GPS drops out (a tunnel): she stays verified on that train for a while.
+  const tunnel = await check(ann, at(42.30));
+  assert.deepEqual([tunnel.onTrain.tripId, tunnel.onTrain.verified], ['trip-1', true]);
+
+  // ann opens the lobby; cat joins the same one (one lobby per journey).
+  const { lobby } = await ok('/api/trains/lobby', { tripId: 'trip-1' }, ann);
+  assert.deepEqual([lobby.riders, lobby.target, lobby.yourPledged, lobby.stash.points, lobby.status], [1, 100, 0, 160, 'open']);
+  assert.equal(lobby.stash.levels.find((l) => l.name === 'Impossible').count, 2);
+  assert.equal((await ok('/api/trains/lobby', {}, cat)).lobby.id, lobby.id);
+  assert.equal((await ok('/api/trains/lobby', {}, cat)).lobby.riders, 2, 'joining twice counts once');
+  assert.equal((await call(`/api/lobbies/${lobby.id}`, null, ben)).status, 403, 'members only');
+
+  // ben gets on at the next stop and rides along: verified, joins.
+  clock += 30_000;
+  fakeVehicles = [train('trip-1', 42.356)];
+  await check(ben, at(42.356));
+  clock += 30_000;
+  fakeVehicles = [train('trip-1', 42.36)];
+  assert.equal((await check(ben, at(42.3601))).onTrain.verified, true);
+  await ok('/api/trains/lobby', {}, ben);
+  const L = `/api/lobbies/${lobby.id}`;
+  const riders = (await ok(L, null, ann)).lobby.ridersList;
+  const byName = (rows) => rows.map((r) => [r.name, r.you, r.need]).sort((a, b) => a[0].localeCompare(b[0]));
+  assert.deepEqual(byName(riders), byName([{ name: ann.chatName, you: true, need: 100 }, { name: cat.chatName, you: false, need: 100 }, { name: ben.chatName, you: false, need: 100 }]));
+  assert.equal(JSON.stringify(riders).includes(cat.id), false, 'riders by chat name and lobby id only');
+  const riderId = (u) => riders.find((r) => r.name === u.chatName).id;
+
+  // Each rider needs 100 pts in their name. Eggs count their level's points.
+  assert.equal((await call(`${L}/pledge`, { eggs: { 1: 1 } }, cat)).status, 400, 'cat has no Easy eggs');
+  assert.equal((await call(`${L}/pledge`, { eggs: {} }, cat)).status, 400);
+  let p = await ok(`${L}/pledge`, { eggs: { 2: 1 } }, cat);
+  assert.deepEqual([p.points, p.donated, p.reached, p.lobby.yourPledged, p.lobby.stash.points], [20, false, false, 20, 0]);
+  // cat asks for help: a help request lands in the chat.
+  const ask = await ok(`${L}/help`, {}, cat);
+  assert.deepEqual(ask.message.help, { riderId: riderId(cat), need: 80 });
+  assert.equal((await call(`${L}/help`, {}, cat)).status, 429, 'one ask a minute');
+  // ann fills her own 100, then donates an Impossible to cat.
+  p = await ok(`${L}/pledge`, { eggs: { 5: 1, 1: 2 } }, ann);
+  assert.equal(p.lobby.yourPledged, 80);
+  p = await ok(`${L}/pledge`, { eggs: { 2: 1 } }, ann);
+  assert.equal(p.lobby.yourPledged, 100);
+  assert.equal((await call(`${L}/pledge`, { eggs: { 5: 1 } }, ann)).status, 409, 'already at 100');
+  p = await ok(`${L}/pledge`, { eggs: { 5: 1 }, for: riderId(cat) }, ann);
+  assert.deepEqual([p.points, p.donated, p.lobby.ridersList.find((r) => r.name === cat.chatName).pledged], [60, true, 80]);
+  // An egg is pledged once, ever: ann has nothing left.
+  assert.equal((await call(`${L}/pledge`, { eggs: { 5: 1 }, for: riderId(ben) }, ann)).status, 400);
+  assert.equal((await call(`${L}/pledge`, { eggs: { 1: 1 }, for: 'not-a-rider' }, ben)).status, 404);
+  // ben fills his own and gives cat the last 20: every rider at 100 -> goal reached.
+  p = await ok(`${L}/pledge`, { eggs: { 3: 3, 1: 1 } }, ben);
+  assert.equal(p.reached, false, 'cat is still short');
+  p = await ok(`${L}/pledge`, { eggs: { 2: 1 }, for: riderId(cat) }, ben);
+  assert.deepEqual([p.reached, p.lobby.status, p.lobby.atTarget], [true, 'reached', 3]);
+  assert.equal((await call(`${L}/pledge`, { eggs: { 1: 1 } }, ben)).status, 409, 'goal already reached');
+  // Every rider +50; donors +10 per egg they gave someone else.
+  const bonus = async (u) => (await db.col.payouts.find({ userId: u.id, kind: { $in: ['lobby', 'lobby_donor'] } }).toArray()).reduce((n, x) => n + x.points, 0);
+  assert.deepEqual([await bonus(ann), await bonus(ben), await bonus(cat)], [60, 60, 50]);
+  const annProfile = await ok(`/api/users/${ann.id}`, null, ann);
+  assert.equal(annProfile.lobbyPoints, 60);
+  assert.equal(annProfile.findsByLevel.Impossible, 2, 'pledged eggs stay in the collection');
+  assert.equal(await db.col.finds.countDocuments({ userId: ann.id, pledgedIn: lobby.id }), 5, 'every egg ann used is marked pledged');
+
+  // Anonymous chat: stickers and short text, filtered, reportable.
+  const chat = `${L}/messages`;
+  const hello = await ok(chat, { text: '  hi   train friends ' }, ann);
+  assert.deepEqual([hello.message.text, hello.message.name, hello.message.mine], ['hi train friends', ann.chatName, true]);
+  await ok(chat, { sticker: 'crown' }, cat);
+  assert.equal((await call(chat, { text: 'visit www.spam.com' }, cat)).status, 400, 'no links');
+  assert.equal((await call(chat, { text: 'you are a b.i.t.c.h' }, cat)).status, 400, 'word filter');
+  assert.equal((await call(chat, { text: 'x'.repeat(141) }, cat)).status, 400, 'too long');
+  assert.equal((await call(chat, { text: '' }, cat)).status, 400);
+  const seen = await ok(chat, null, ben);
+  assert.deepEqual(seen.messages.map((m) => m.text ?? m.emoji ?? (m.help && `needs ${m.help.need}`)), ['needs 80', 'hi train friends', '👑']);
+  assert.equal(JSON.stringify(seen).includes(ann.id) || JSON.stringify(seen).includes('ride_ann'), false, 'anonymous');
+  assert.equal((await call(`${chat}/${hello.message.id}/report`, {}, ann)).status, 400, "can't report yourself");
+  await ok(`${chat}/${hello.message.id}/report`, {}, ben);
+  assert.equal((await ok(chat, null, ben)).messages.length, 2, 'hidden for the reporter at once');
+  assert.equal((await ok(chat, null, cat)).messages.length, 3, 'still shown to others below the threshold');
+
+  // The journey ends (the trip leaves the live feed): the lobby ends. A second trip is a new lobby.
+  clock += 30_000;
+  fakeVehicles = [train('trip-2', 42.37)];
+  await check(cat, at(42.37));
+  clock += 30_000;
+  fakeVehicles = [train('trip-2', 42.374)];
+  assert.equal((await check(cat, at(42.374))).onTrain.verified, true);
+  const second = (await ok('/api/trains/lobby', {}, cat)).lobby;
+  assert.notEqual(second.id, lobby.id, 'one lobby per journey');
+  await found(cat, [4, 5, 5]);
+  const solo = await ok(`/api/lobbies/${second.id}/pledge`, { eggs: { 4: 1, 5: 2 } }, cat);
+  assert.deepEqual([solo.points, solo.reached], [160, false], 'one rider alone never reaches the goal');
+  assert.equal((await ok(`/api/lobbies/${second.id}`, null, cat)).lobby.stash.points, 0);
+  clock += 4 * 60_000;
+  fakeVehicles = [];
+  const ended = (await ok(`/api/lobbies/${second.id}`, null, cat)).lobby;
+  assert.deepEqual([ended.status, ended.outcome, ended.stash.points], ['ended', 'missed', 0], 'missed goal: pledged eggs stay pledged');
+  assert.equal((await ok(`/api/users/${cat.id}`, null, cat)).findsByLevel.Extreme, 1, 'but stay in the collection');
+  assert.equal((await call(`/api/lobbies/${second.id}/messages`, { sticker: 'wave' }, cat)).status, 409);
+  assert.equal((await ok(L, null, ann)).lobby.outcome, 'reached');
+  fakeVehicles = [];
+});
+
+test('admin seed endpoint is off unless a token is configured', async () => {
+  assert.equal((await call('/api/admin/seed', {}, null, { 'x-seed-token': 'x'.repeat(32) })).status, 404);
+});
+
+test('train simulation: off by default; when on, puts a player on a live train for the real lobby flow', async () => {
+  const sim = await user('sim_rider');
+  assert.equal((await call('/api/trains/simulate', {}, sim)).status, 404, 'off unless enabled');
+  assert.equal((await ok('/api/config')).trainSim, false);
+  // A tester account may simulate even with it off, and only sees its own flag.
+  await db.col.users.updateOne({ _id: sim.id }, { $set: { tester: true } });
+  assert.equal((await ok('/api/auth/me', null, sim)).user.tester, true);
+  fakeVehicles = [{ id: 'v-sim', tripId: 'trip-sim', routeId: 'Red', line: 'Red Line', headsign: 'Ashmont', status: 'IN_TRANSIT_TO', lat: 42.35, lng: -71.06 }];
+  const r = await ok('/api/trains/simulate', { lat: 42.35, lng: -71.06 }, sim);
+  assert.deepEqual([r.onTrain.tripId, r.onTrain.verified], ['trip-sim', true]);
+  assert.equal((await ok('/api/trains/lobby', {}, sim)).lobby.riders, 1, 'then the real lobby flow');
+  assert.equal('tester' in (await ok(`/api/users/${sim.id}`, null, await user('sim_other'))).user, false);
+  fakeVehicles = [];
 });
 
 test('email: required at sign-up, unique, private, usable to sign in, and addable later', async () => {

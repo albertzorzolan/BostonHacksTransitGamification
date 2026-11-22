@@ -97,11 +97,10 @@ To host `frontend/` somewhere else, set `window.EGG_API_BASE` in `frontend/confi
 
 ## Map
 
-- **Every station's egg count:** a badge in its line colour when it has eggs.
-- **Faded badges:** shown once you've found (or hidden) every egg there.
-- **Empty stations:** a grey "0" when zoomed in, and a small dot when zoomed out to city level, so the map stays readable.
-- **Totals above the map:** eggs hidden, stations with eggs, and how many are left for you.
-- **Fresh counts:** `/api/stations` returns `activeEggs` for every station and `totals`. When you're signed in, it also returns `playable`, the eggs that aren't yours and that you haven't found yet.
+- **Lines drawn like the T map** from MBTA route shapes (`/api/map/lines`, cached in `backend/data/shapes.json`), with line filter chips and a find-me button.
+- **Live trains** (`/api/map/vehicles`, cached 15 s) drawn as cars gliding along the real track, about 25 s behind their reports. Tap a train for its destination, current stop, direction, car numbers and crowding; Follow keeps it centred.
+- **Stations:** a badge with the egg count where eggs are up, a dot when you've found eggs there, a pulsing ring when someone is hunting now. Tap one for its card: eggs up, your finds, players hunting now, finds this month and the station's Keeper (most finds this month) (`/api/map/stations`).
+- **Totals above the map:** eggs hidden, stations with eggs, and how many are left for you. `/api/stations` returns `activeEggs` for every station and `totals`; signed in, it also returns `playable` (eggs that aren't yours and you haven't found).
 
 ## Progress
 
@@ -114,7 +113,17 @@ All of it is computed from your finds, so nothing extra is stored. It's shown on
 
 ## Profile
 
-The Profile tab has your level and points, your username and anonymous chat name (both changeable), and an **activity** feed: eggs you found and hid, other players finding your eggs, groups you joined and when you signed up. Activity is private to you. Below that are today's challenge, lines, stamps, recent finds and your signed-in devices.
+The Profile tab opens with your **egg collection**: one egg per level, each more attractive than the last (Easy a plain sky-blue egg, Medium speckled mint, Hard a painted violet egg with a zigzag band, Extreme gold with jewels, Impossible platinum with a diamond), with how many of each you've found and your total. Levels you haven't found yet show as shadows. Other players' profiles show their collection too. Below that are your level and points, your username and anonymous chat name (both changeable), and an **activity** feed: eggs you found and hid, other players finding your eggs, groups you joined and when you signed up. Activity is private to you. Below that are today's challenge, lines, stamps, recent finds and your signed-in devices.
+
+## Train lobbies
+
+Ride a train with the app open and you can join that train's lobby: one lobby per train journey, for everyone on board.
+
+- **Am I on a train?** About every 20 s the app sends your GPS position, and the server compares it with the MBTA's live train positions. One fix next to a train isn't enough (you could be on the platform beside it), so you're verified when two fixes 20 s to 5 min apart both sit within ~150 m of the same trip, and the train moved at least 120 m between them, with you moving about the same distance. Once verified you stay verified for 10 minutes, so a tunnel doesn't drop you. Phones lose GPS underground, so verification works best on surface and elevated track.
+- **The lobby** lasts for that journey only. It ends when the trip leaves the live feed for 3 minutes (or after 3 hours at most). Riders chat with stickers or short text (140 characters, no links, a word filter), shown only by their anonymous chat names. Any rider can report a message: it disappears for them right away, and for everyone after 3 reports.
+- **The pledge:** every rider needs **100 pts of found eggs** pledged in their name. Each egg counts its level's points (Easy 10, Medium 20, Hard 30, Extreme 40, Impossible 60). Pick eggs from your unpledged finds and pledge them for yourself, or donate them to another rider. Anyone short can tap **Ask for help**: a help card appears in the chat with a Help button for the others. An egg can only ever be pledged once, win or lose, but it stays in your egg collection. When every rider (at least 2) has 100 pts, **every rider gets +50**, and donors get **+10 for each egg they gave someone else**.
+
+**Testing without a train:** with `TRAIN_SIM=1` (the default locally, off on Vercel), a striped "🧪 Test: simulate a train ride" bar appears under the header. It puts you on the live train nearest you without the GPS check (`POST /api/trains/simulate`), so you can try the lobby, the chat and the pledge. Leave it off in production: it would let anyone fake a ride and collect pledge bonuses.
 
 ## Notifications
 
@@ -132,7 +141,25 @@ The bell at the top opens **Notifications**:
 - Each group has its own leaderboard covering only its members, for this month or all time. Members with no points are listed unranked.
 - When the owner leaves, the longest-standing member becomes the owner. The last member to leave deletes the group.
 - Limits: 20 groups per player and 50 players per group. Both hold even when people join at the same moment.
-- **Sticker chat:** each group has a chat for trash talk, using stickers only (no typed messages). There are 20 competitive stickers such as 👑 "Who's the king now", 🐌 "Too slow" and ⚔️ "Bring it on". The chat is anonymous: senders show only by their chat name, and messages carry no user id, so they can't be matched to the group's leaderboard. New stickers appear within about 4 seconds (the app checks for new ones while the chat is open). The limit is 8 stickers per 10 seconds per player, and stickers are deleted after 30 days.
+- **Group chat:** each group has a chat for trash talk: short text messages with emojis (140 characters, no links, a word filter) and 20 competitive stickers such as 👑 "Who's the king now", 🐌 "Too slow" and ⚔️ "Bring it on". The chat is anonymous: senders show only by their chat name, and messages carry no user id, so they can't be matched to the group's leaderboard. New stickers appear within about 4 seconds (the app checks for new ones while the chat is open). The limit is 8 messages per 10 seconds per player, and messages are deleted after 30 days.
+
+## Demo filler data
+
+`backend/scripts/seed.js` adds a little filler so the app doesn't look empty, in batches (`BATCHES` in `backend/src/seed.js`). Each batch has:
+- 6 demo players with random passwords, so nobody can sign in as them
+- 10–12 live eggs spread over the Red, Orange, Blue and Green lines, only in empty slots
+- 11–16 past finds across every level, for leaderboards, profiles and egg collections
+- one friend group with stickers and messages
+
+Batch 3 is eggs only: 24 more live eggs, 6 per line, hidden by the demo players already in. Each egg's picture is a drawing of the object its hint describes (a plaque, clock, mosaic, sticker, graffiti, lamp, railing or small trinket) on a subway-tile wall, marked DEMO (`backend/src/seedArt.js`). Finds get a closer angle of the same object.
+
+Every document it writes is tagged `seed: true`. Put the Atlas connection string in a git-ignored `.env.seed` file (`MONGODB_URI=...`), then:
+
+```bash
+node --env-file=.env.seed backend/scripts/seed.js           # add the next batch that isn't in yet
+node --env-file=.env.seed backend/scripts/seed.js --refresh-photos  # redraw seeded eggs' pictures
+node --env-file=.env.seed backend/scripts/seed.js --remove  # remove every batch
+```
 
 ## Code map
 
