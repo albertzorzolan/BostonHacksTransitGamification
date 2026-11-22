@@ -28,7 +28,6 @@ const state = {
   config: null,
   stations: null,
   lastStationId: readStored('egg-last-station'),
-  raceTrain: readStored('egg-race-train') ?? false,
   line: readStored('egg-line'), // colour family the app is wearing: Red | Orange | Blue | Green | null
   play: null, // current round
   pendingHide: null, // { stationId, stationName, level, findId }
@@ -267,6 +266,110 @@ function nearestStation(stations) {
 }
 const isInRange = (n) => Boolean(n && n.m <= RANGE_METERS + Math.min(loc.pos?.accuracy ?? 0, ACCURACY_CAP));
 
+// ---------- alerts ----------
+// Two kinds, both shown as a toast, and as a phone/desktop notification when the player allowed it:
+//  - someone found one of your eggs (polled from /api/me/notifications?summary=1)
+//  - GPS puts you at a station: how many eggs are waiting for you there today
+const ALERT_POLL_MS = 30_000;
+const ARRIVAL_COOLDOWN_MS = 30 * 60_000; // per station, so walking around a platform doesn't repeat it
+const canNotify = () => 'Notification' in window && Notification.permission === 'granted';
+
+// Alerts queue up so two at once (say, arriving at a station just as your egg is found)
+// don't overwrite each other.
+const alertQueue = [];
+function showNextAlert() {
+  if (showNextAlert.busy || !alertQueue.length) return;
+  showNextAlert.busy = true;
+  toast(alertQueue.shift(), 5000);
+  setTimeout(() => {
+    showNextAlert.busy = false;
+    showNextAlert();
+  }, 5200);
+}
+function notifyPlayer(title, body, href) {
+  alertQueue.push(`${title} ${body}`);
+  showNextAlert();
+  if (!canNotify()) return;
+  try {
+    const n = new Notification(title, { body, icon: 'icon.svg', tag: href });
+    n.onclick = () => {
+      window.focus();
+      location.hash = href;
+      n.close();
+    };
+  } catch {
+    /* some mobile browsers only allow notifications from a service worker: the toast is enough */
+  }
+}
+
+async function checkNotifications() {
+  if (!state.user || document.visibilityState === 'hidden' && !canNotify()) return;
+  try {
+    const { unseen, latest } = await api('/api/me/notifications?summary=1');
+    state.unseen = unseen;
+    drawBell();
+    // Alert once per find: remember the newest one already announced.
+    const key = `egg-told:${state.user.id}`;
+    const told = readStored(key) ?? 0;
+    const fresh = latest.filter((n) => Date.parse(n.at) > told);
+    if (fresh.length) {
+      const n = fresh[0];
+      const more = fresh.length > 1 ? ` (+${fresh.length - 1} more)` : '';
+      notifyPlayer('Your egg was found!', `${n.by} found your ${n.levelName} egg at ${n.stationName}.${more}`, '#/notifications');
+    }
+    if (latest.length) store(key, Math.max(told, ...latest.map((n) => Date.parse(n.at))));
+  } catch {
+    /* extra: try again next time */
+  }
+}
+
+async function checkArrival() {
+  if (!state.user || loc.status !== 'ok') return;
+  const stations = state.stations ?? (await getStations().catch(() => null));
+  const near = stations && nearestStation(stations);
+  if (!isInRange(near)) {
+    state.arrivedAt = null; // left the station: arriving again later can alert again
+    return;
+  }
+  const st = near.station;
+  if (state.arrivedAt === st.id) return;
+  state.arrivedAt = st.id;
+  const seen = readStored('egg-arrivals') ?? {};
+  if (Date.now() - (seen[st.id] ?? 0) < ARRIVAL_COOLDOWN_MS) return;
+  store('egg-arrivals', { ...seen, [st.id]: Date.now() });
+  let fresh;
+  try {
+    fresh = (await api('/api/stations')).stations;
+    state.stations = fresh;
+  } catch {
+    return;
+  }
+  const s = fresh.find((x) => x.id === st.id) ?? st;
+  const left = s.playable ?? 0;
+  const href = `#/station/${encodeURIComponent(s.id)}`;
+  if (left) notifyPlayer(`You're at ${s.name}.`, `Find your eggs today: ${plural(left, 'egg')} waiting for you here.`, href);
+  else if (s.activeEggs) notifyPlayer(`You're at ${s.name}.`, "You've cleared every egg here today. Hide a new one!", href);
+  else notifyPlayer(`You're at ${s.name}.`, 'No eggs here yet. Hide the first one today!', href);
+}
+
+function startAlerts() {
+  if (state.alerting) return;
+  state.alerting = true;
+  loc.subs.add(checkArrival); // stays on for the whole visit, not just one page
+  setInterval(checkNotifications, ALERT_POLL_MS);
+  document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && checkNotifications());
+  checkNotifications();
+}
+
+function drawBell() {
+  const b = $('#bell');
+  if (!b) return;
+  const n = state.unseen ?? 0;
+  b.querySelector('.bell-n')?.remove();
+  if (n) b.insertAdjacentHTML('beforeend', `<span class="bell-n">${n > 9 ? '9+' : n}</span>`);
+  b.setAttribute('aria-label', n ? `Notifications, ${n} new` : 'Notifications');
+}
+
 // ---------- the HUD: rank, points and the rival just above you ----------
 async function refreshHud(force = false) {
   if (!state.user) return;
@@ -309,9 +412,13 @@ function drawHud() {
   el.innerHTML = `
     <div class="hud-top">
       <a href="#/" class="brand"><img src="icon.svg" alt="" width="28" height="28" />Lookout</a>
-      <a class="mypts" href="#/leaderboard">${chip}<b>${h?.points ?? 0}</b> pts</a>
+      <div class="hud-right">
+        <a id="bell" class="bell" href="#/notifications" aria-label="Notifications"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z" /><path d="M10 20.5a2 2 0 0 0 4 0" /></svg></a>
+        <a class="mypts" href="#/leaderboard">${chip}<b>${h?.points ?? 0}</b> pts</a>
+      </div>
     </div>
     <a class="rival" href="#/leaderboard">${rival}</a>`;
+  drawBell();
 }
 
 async function refreshProgress() {
@@ -332,8 +439,12 @@ const routes = [
   [/^#\/hide$/, viewHide],
   [/^#\/leaderboard$/, viewLeaderboard],
   [/^#\/profile$/, viewProfile],
+  [/^#\/notifications$/, viewNotifications],
   [/^#\/user\/([^/]+)$/, viewPlayer],
   [/^#\/map$/, viewMap],
+  [/^#\/groups$/, viewGroups],
+  [/^#\/group\/([^/]+)$/, viewGroup],
+  [/^#\/join\/([^/]+)$/, viewJoin],
 ];
 
 async function render() {
@@ -356,9 +467,11 @@ async function render() {
     ? 'map'
     : hash.startsWith('#/leaderboard') || hash.startsWith('#/user/')
       ? 'leaderboard'
-      : hash.startsWith('#/profile')
+      : hash.startsWith('#/profile') || hash.startsWith('#/notifications')
         ? 'profile'
-        : 'here';
+        : /^#\/(groups|group\/|join\/)/.test(hash)
+          ? 'groups'
+          : 'here';
   document.querySelectorAll('#tabs a').forEach((a) => {
     if (a.dataset.tab === tab) a.setAttribute('aria-current', 'page');
     else a.removeAttribute('aria-current');
@@ -383,6 +496,7 @@ function setSession(data) {
   state.user = data?.user ?? null;
   state.token = data?.token ?? null;
   store('egg-session', data ? { user: data.user, token: data.token } : null);
+  if (state.user) startAlerts();
 }
 
 // Forget this device's session. `everywhere` signs out every device on the account.
@@ -437,6 +551,7 @@ function viewSignup(mode = 'register') {
         </div>
         <label class="field-label" for="username">Username</label>
         <input id="username" class="input" maxlength="20" autocomplete="username" autocapitalize="none" placeholder="e.g. kenmore_kid" required />
+        ${registering ? '<p class="field-hint">Shown on leaderboards. Group chats use a separate anonymous name.</p>' : ''}
         <label class="field-label" for="password">Password ${registering ? `<span class="opt">(at least ${min} characters)</span>` : ''}</label>
         <input id="password" class="input" type="password" maxlength="200" ${registering ? `minlength="${min}"` : ''} autocomplete="${registering ? 'new-password' : 'current-password'}" required />
         <button class="btn btn-ink btn-block btn-l">${registering ? 'Start playing' : 'Sign in'}</button>
@@ -456,7 +571,8 @@ function viewSignup(mode = 'register') {
       });
       setSession(data);
       startLocation();
-      if (location.hash && location.hash !== '#/') location.hash = '#/';
+      if (registering && data.user.chatName) toast(`In group chats you're "${data.user.chatName}". Change it in Profile.`, 4200);
+      if (location.hash && location.hash !== '#/' && !location.hash.startsWith('#/join/')) location.hash = '#/';
       else render();
     } catch (err) {
       $('#err').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
@@ -610,7 +726,6 @@ async function showStation(id, { here = false, distance = null } = {}) {
     : distance != null
       ? `<p class="stamp stamp-corner stamp-quiet">${fmtDist(distance)} away</p>`
       : '';
-  const raceNote = (on) => (on ? 'On. Your timer is the time until the next train (1.5 to 15 min).' : 'Off. Each level has its own timer.');
 
   app.innerHTML = `
     ${here ? '' : '<a class="back" href="#/stations"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>All stations</a>'}
@@ -624,10 +739,6 @@ async function showStation(id, { here = false, distance = null } = {}) {
       <div class="tk-perf" aria-hidden="true"></div>
       <div class="tk-bottom">
         <div id="next" class="next-row"><span class="route" aria-hidden="true"></span><div><p class="next-label">Next train</p><p class="next-to next-none">Loading live times</p></div></div>
-        <label class="race">
-          <span class="race-text"><b>Race the next train</b><small id="raceNote">${raceNote(state.raceTrain)}</small></span>
-          <input id="race" type="checkbox" role="switch" class="race-input" ${state.raceTrain ? 'checked' : ''} />
-        </label>
       </div>
     </section>
     ${challengeTicket(state.progress?.today)}
@@ -642,12 +753,6 @@ async function showStation(id, { here = false, distance = null } = {}) {
     </div>
     <ol class="stubs">${slots.map((s) => stubRow(s)).join('')}</ol>`;
 
-  $('#race').addEventListener('change', (e) => {
-    state.raceTrain = e.target.checked;
-    store('egg-race-train', state.raceTrain);
-    $('#raceNote').textContent = raceNote(state.raceTrain);
-  });
-
   app.querySelectorAll('[data-play]').forEach((btn) =>
     btn.addEventListener('click', async () => {
       if (btn.getAttribute('aria-disabled') === 'true') return;
@@ -655,8 +760,9 @@ async function showStation(id, { here = false, distance = null } = {}) {
       const slot = slots.find((s) => s.egg?.id === btn.dataset.play);
       const before = { hud: state.hud, progress: state.progress, card };
       try {
-        const round = await api('/api/attempts', { eggId: btn.dataset.play, mode: state.raceTrain ? 'train' : 'fixed' });
+        const round = await api('/api/attempts', { eggId: btn.dataset.play });
         state.play = { ...round, station, receivedAt: performance.now(), result: null, firstChance: slot?.egg?.timesFound === 0, before };
+        if (round.attempt.resumed) toast(`Your clock kept running: ${fmtClock(round.attempt.secondsLeft)} left.`);
         location.hash = '#/play';
       } catch (err) {
         toast(err.message);
@@ -688,12 +794,24 @@ async function showStation(id, { here = false, distance = null } = {}) {
   };
   loadTrains();
   every(30_000, loadTrains);
+
+  // Running clocks on this page keep counting down; when one hits zero, reload to show the lock.
+  const running = [...app.querySelectorAll('[data-ends]')];
+  if (running.length) {
+    every(1000, () => {
+      for (const el of running) {
+        const left = (Number(el.dataset.ends) - Date.now()) / 1000;
+        el.textContent = fmtClock(left);
+        if (left < -(state.config?.graceSeconds ?? 15)) return render();
+      }
+    });
+  }
 }
 
 function stubRow(slot) {
   const { egg } = slot;
   const pips = `<span class="pips" aria-label="Difficulty ${slot.level} of 5">${[1, 2, 3, 4, 5].map((i) => `<i class="${i <= slot.level ? 'on' : ''}"></i>`).join('')}</span>`;
-  const mins = `${Math.round(slot.seconds / 60)} min`;
+  const mins = `${Math.round(slot.seconds / 60)} min${slot.blur ? (slot.blur >= 12 ? ', very blurry photo' : ', blurred photo') : ''}`;
   if (!egg) {
     return `<li class="stub is-empty">
       <span class="punch" aria-hidden="true">${slot.level}</span>
@@ -716,10 +834,17 @@ function stubRow(slot) {
     </li>`;
   }
   const hot = egg.timesFound === 0;
-  return `<li class="stub is-open ${hot ? 'is-hot' : ''}">
+  const bounty = egg.bounty ? `Bounty +${egg.bounty}, beat ${plural(egg.beaten, 'player')}. ` : '';
+  // A running clock keeps ticking here too: leaving the round doesn't pause it.
+  const meta = egg.clock
+    ? `Your clock is running: <span data-ends="${Date.now() + egg.clock.secondsLeft * 1000}">${fmtClock(egg.clock.secondsLeft)}</span> left.`
+    : egg.retry
+      ? `${bounty}It beat you last time. A retry earns no time bonus.`
+      : `${bounty}${hot ? `${mins}. Nobody's found it yet.` : `${mins}, found ${plural(egg.timesFound, 'time')}`}`;
+  return `<li class="stub is-open ${hot || egg.bounty || egg.clock ? 'is-hot' : ''}">
     <span class="punch" aria-hidden="true">${slot.level}</span>
-    <div class="stub-body"><p class="stub-name">${esc(slot.name)}</p>${pips}<p class="stub-meta">${hot ? `${mins}. Nobody's found it yet.` : `${mins}, found ${plural(egg.timesFound, 'time')}`}</p></div>
-    <button class="stub-act" type="button" data-play="${egg.id}"><b>${slot.points}</b><span>Play</span></button>
+    <div class="stub-body"><p class="stub-name">${esc(slot.name)}</p>${pips}<p class="stub-meta">${meta}</p></div>
+    <button class="stub-act" type="button" data-play="${egg.id}"><b>${slot.points + (egg.bounty ?? 0)}</b><span>${egg.clock ? 'Resume' : egg.retry ? 'Retry' : 'Play'}</span></button>
   </li>`;
 }
 
@@ -755,18 +880,22 @@ function viewPlay() {
   const graceLeft = () => secondsLeft() + (state.config?.graceSeconds ?? 15);
   const maxBonus = state.config?.maxTimeBonus ?? 0.5;
   const perHole = attempt.limitSeconds / PUNCH_HOLES;
+  const tag = [play.firstChance && 'Nobody has found this yet', egg.bounty && `Bounty +${egg.bounty}: beat ${plural(egg.beaten, 'player')}`]
+    .filter(Boolean)
+    .join(' · ');
 
   app.innerHTML = `
     <div class="play-bar">
-      <a class="icon-btn" href="#/station/${encodeURIComponent(egg.stationId)}" id="quitX" aria-label="Give up and go back"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></a>
+      <a class="icon-btn" href="#/station/${encodeURIComponent(egg.stationId)}" id="quitX" aria-label="Leave for now. Your clock keeps running."><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></a>
       <p class="play-title"><b>${esc(egg.levelName)}</b> at ${esc(egg.stationName)}</p>
-      <p class="mypts mypts-here"><b>${egg.points}</b> pts</p>
+      <p class="mypts mypts-here"><b>${egg.points + (egg.bounty ?? 0)}</b> pts</p>
     </div>
     <section class="tk play-tk">
       <div class="tk-top">
         <div class="egg-photo">
           <img src="${apiUrl(egg.imageUrl)}" alt="The egg to find: a photo of something in this station" />
-          ${play.firstChance ? '<p class="first-tag">Nobody has found this yet</p>' : ''}
+          ${tag ? `<p class="first-tag">${esc(tag)}</p>` : ''}
+          ${egg.blur ? `<p class="blur-tag">${egg.blur === 'heavy' ? 'Heavily blurred' : 'Blurred'}: ${esc(egg.levelName)}</p>` : ''}
         </div>
         ${egg.hint ? `<p class="hint"><b>Hint</b> ${esc(egg.hint)}</p>` : ''}
       </div>
@@ -774,10 +903,10 @@ function viewPlay() {
       <div class="tk-bottom">
         <div class="clock-row">
           <p id="clock" class="clock">${fmtClock(secondsLeft())}</p>
-          <div class="bonus"><p class="bonus-label">Bonus right now</p><p class="bonus-val">+<span id="bonus">0</span></p></div>
+          <div class="bonus"><p class="bonus-label">${attempt.retry ? 'Retry: no bonus' : 'Bonus right now'}</p><p class="bonus-val">+<span id="bonus">0</span></p></div>
         </div>
         <ol id="holes" class="punchclock" aria-hidden="true">${'<li></li>'.repeat(PUNCH_HOLES)}</ol>
-        <p class="clock-ctx">${attempt.limitSource === 'train' ? `Racing the ${esc(attempt.train?.headsign || 'next')} train. ` : ''}Each hole is ${Math.round(perHole)} seconds. The bonus drains as they go.</p>
+        <p class="clock-ctx">${attempt.retry ? "This is a retry, so there's no time bonus. " : `Each hole is ${Math.round(perHole)} seconds. The bonus drains as they go. `}Leaving doesn't stop your clock.</p>
       </div>
     </section>
     <div id="status"></div>
@@ -798,7 +927,7 @@ function viewPlay() {
     if (!clock) return;
     clock.textContent = fmtClock(s);
     clock.classList.toggle('is-low', s <= 20);
-    $('#bonus').textContent = Math.round(egg.points * maxBonus * Math.max(0, Math.min(1, s / attempt.limitSeconds)));
+    $('#bonus').textContent = attempt.retry ? 0 : Math.round(egg.points * maxBonus * Math.max(0, Math.min(1, s / attempt.limitSeconds)));
     const punched = Math.floor((attempt.limitSeconds - Math.max(0, s)) / perHole);
     holes.forEach((h, i) => h.classList.toggle('p', i < punched));
     if (graceLeft() <= 0) {
@@ -814,12 +943,14 @@ function viewPlay() {
     if (!file) return;
     const status = $('#status');
     $('#snap').hidden = true;
-    status.innerHTML = `<div class="notice row"><div class="spin" aria-hidden="true"></div>${state.config?.gemini ? 'Checking your photo against the egg' : 'Saving your find'}</div>`;
+    status.innerHTML = `<div class="notice row"><div class="spin" aria-hidden="true"></div>${state.config?.gemini ? 'Checking it is the same object as the egg' : 'Saving your find'}</div>`;
     try {
       const image = await photoToJpeg(file);
       const result = await api(`/api/attempts/${attempt.id}/find`, { image });
       if (result.status === 'no_match') {
-        status.innerHTML = `<div class="notice bad"><b>Not a match.</b> ${esc(result.reason)} Keep looking.</div>`;
+        status.innerHTML = result.unavailable
+          ? `<div class="notice bad"><b>Photo check failed.</b> ${esc(result.reason)} Your timer is still running.</div>`
+          : `<div class="notice bad"><b>Failed: not the same object.</b> ${esc(result.reason)} Keep looking.</div>`;
         $('#snap').hidden = false;
         e.target.value = '';
         return;
@@ -845,12 +976,13 @@ function viewPlay() {
       }
     }),
   );
-  const quit = () => (state.play = null);
+  // Giving up ends the round now (and locks the egg); the X just leaves, with the clock still running.
   $('#quit').addEventListener('click', () => {
-    quit();
-    location.hash = `#/station/${encodeURIComponent(egg.stationId)}`;
+    if (!confirm('Give up on this egg? You can retry, but a retry earns no time bonus.')) return;
+    play.result = { status: 'given_up' };
+    renderResult();
   });
-  $('#quitX').addEventListener('click', quit);
+  $('#quitX').addEventListener('click', () => (state.play = null));
 }
 
 // The round stamp shown when a station is cleared.
@@ -871,17 +1003,30 @@ async function renderResult() {
   const { result, egg } = play;
   const back = `#/station/${encodeURIComponent(egg.stationId)}`;
 
-  if (result.status === 'expired') {
+  if (result.status === 'expired' || result.status === 'given_up') {
+    const gaveUp = result.status === 'given_up';
     app.innerHTML = `
       <section class="tk win">
         ${play.station ? lineBand(play.station, esc(egg.levelName)) : ''}
         <div class="tk-top">
-          <h1 class="win-head">Time's up</h1>
-          <p class="win-sub">The ${esc(egg.levelName)} egg at ${esc(egg.stationName)} stays hidden for now. Every hole is punched.</p>
+          <h1 class="win-head">${gaveUp ? 'You gave up' : "Time's up"}</h1>
+          <p class="win-sub">The ${esc(egg.levelName)} egg at ${esc(egg.stationName)} beat you.${gaveUp ? '' : ' Every hole is punched.'} You can retry it, but a retry earns no time bonus.</p>
+          <p class="win-sub" id="bountyNote"></p>
         </div>
       </section>
       <a class="btn btn-ink btn-block btn-l" href="${back}">Try another level</a>`;
     state.play = null;
+    // Tell the server the round is over: it locks the egg for you and counts your miss toward the
+    // bounty. If this fails, the round still runs out on its own a moment later.
+    try {
+      const end = await api(`/api/attempts/${play.attempt.id}/end`, {});
+      const note = $('#bountyNote');
+      if (note && end.counted) {
+        note.innerHTML = `<b>You added to its bounty.</b> Whoever finds it now gets +${end.bounty}, and its hider gets half.`;
+      }
+    } catch {
+      /* nothing to show */
+    }
     return;
   }
 
@@ -902,20 +1047,20 @@ async function renderResult() {
       <dl class="tk-bottom win-math">
         <div><dt>${esc(egg.levelName)}</dt><dd>${points.base}</dd></div>
         <div><dt>Time bonus</dt><dd>+${points.bonus}</dd></div>
-        <div><dt>Took</dt><dd>${fmtClock(result.secondsTaken)}</dd></div>
+        ${points.bounty ? `<div><dt>Bounty</dt><dd>+${points.bounty}</dd></div>` : `<div><dt>Took</dt><dd>${fmtClock(result.secondsTaken)}</dd></div>`}
       </dl>
     </section>
     <section class="match" aria-label="Photo check">
       <div class="match-pair">
-        <figure class="m"><img src="${apiUrl(egg.imageUrl)}" alt="The egg photo" /><figcaption>The egg</figcaption></figure>
+        <figure class="m"><img src="${apiUrl(result.revealUrl || egg.imageUrl)}" alt="The egg photo" /><figcaption>${egg.blur && result.revealUrl ? 'The egg, unblurred' : 'The egg'}</figcaption></figure>
         ${play.myPhoto ? `<figure class="m"><img src="${play.myPhoto}" alt="Your photo" /><figcaption>Your photo</figcaption></figure>` : ''}
       </div>
-      <p class="match-verdict ${verification.method === 'gemini' ? 'is-ok' : ''}">${verification.method === 'gemini' ? `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>Photos match${verification.reason ? `: ${esc(verification.reason)}` : ''}` : esc(verification.reason)}</p>
+      <p class="match-verdict ${verification.method === 'gemini' ? 'is-ok' : ''}">${verification.method === 'gemini' ? `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg><b>Cleared.</b> Same object${verification.reason ? `: ${esc(verification.reason)}` : ''}` : esc(verification.reason)}</p>
     </section>
     <ul id="gains" class="gains" aria-live="polite"></ul>
     <section class="next-egg">
       <h2 class="sec-h">Hide the next one</h2>
-      <p class="next-egg-copy">Your photo becomes the new ${esc(egg.levelName)} egg at ${esc(egg.stationName)}.</p>
+      <p class="next-egg-copy">Your photo becomes the new ${esc(egg.levelName)} egg at ${esc(egg.stationName)}. Every player it beats grows its bounty, and you get half when someone finally finds it.</p>
       <button id="hide" class="btn btn-primary btn-block btn-l" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>Hide the next ${esc(egg.levelName)} egg</button>
       <a id="skip" class="btn btn-ghost btn-block" href="${back}">Skip</a>
     </section>`;
@@ -949,6 +1094,10 @@ async function renderResult() {
     api(`/api/stations/${encodeURIComponent(egg.stationId)}`).catch(() => null),
   ]);
   const gains = [];
+  if (points.bounty) {
+    const hider = result.hider ? ` ${esc(result.hider.username)} gets +${result.hider.points} for hiding it.` : '';
+    gains.push(['stamp', `<b>Bounty +${points.bounty}.</b> This egg beat ${plural(result.beaten, 'player')} before you.${hider}`]);
+  }
   const h = state.hud;
   if (h?.rank) {
     const was = before.hud?.rank ?? null;
@@ -1016,7 +1165,7 @@ function viewHide() {
     <section class="tk hide-tk">
       <div class="tk-top">
         <div id="preview" class="egg-photo egg-photo-empty">
-          <p class="photo-empty">Photograph something small in ${esc(hide.stationName)}. Easy should take a minute to find. Impossible should take real searching.</p>
+          <p class="photo-empty">Photograph something small in ${esc(hide.stationName)}. Easy should take a minute to find. Impossible should take real searching.${level.blur ? ` Finders will see this photo ${level.blur >= 12 ? 'heavily blurred' : 'blurred'}, so pick something they can still recognise up close.` : ''}</p>
         </div>
         <label class="btn btn-ghost btn-block" id="pick">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
@@ -1028,6 +1177,7 @@ function viewHide() {
       <div class="tk-bottom">
         <label class="field-label" for="hint">Hint <span class="opt">(optional, one line)</span></label>
         <input id="hint" class="input" maxlength="80" placeholder="e.g. near the stairs to outbound" />
+        <p class="clock-ctx">You score when your egg beats people. Each player who runs out of time adds to its bounty, and you get half when someone finally finds it. An egg nobody finds pays nothing, so make it hard but findable.</p>
       </div>
     </section>
     <ul class="rules">
@@ -1077,18 +1227,26 @@ async function viewLeaderboard() {
   loading();
   const stations = await getStations();
   let { mode } = state.board;
+  let period = state.board.period ?? 'month'; // 'month' | 'all'
   let stationId = state.board.stationId || state.lastStationId || stations.find((s) => s.activeEggs)?.id || stations[0]?.id;
   const monthLabel = new Date().toLocaleString('en-US', { month: 'long', timeZone: 'America/New_York' });
   const nextMonth = new Date();
   nextMonth.setMonth(nextMonth.getMonth() + 1, 1);
   const resetLabel = nextMonth.toLocaleString('en-US', { month: 'long', day: 'numeric', timeZone: 'America/New_York' });
 
+  const heading = () => (period === 'month'
+    ? `<h1 class="page-h">${esc(monthLabel)}</h1><p class="page-sub">Everything resets on ${esc(resetLabel)}. Tap a player to see their profile.</p>`
+    : '<h1 class="page-h">All time</h1><p class="page-sub">Every point since the game began. Tap a player to see their profile.</p>');
+
   app.innerHTML = `
-    <h1 class="page-h">${esc(monthLabel)}</h1>
-    <p class="page-sub">Everything resets on ${esc(resetLabel)}. Tap a player to see their tickets.</p>
+    <div class="seg" id="periodSeg" role="tablist" aria-label="Period">
+      <button type="button" role="tab" data-period="month" aria-selected="${period === 'month'}">This month</button>
+      <button type="button" role="tab" data-period="all" aria-selected="${period === 'all'}">All time</button>
+    </div>
+    <div id="lbHead">${heading()}</div>
     <div id="versus"></div>
     <div id="war"></div>
-    <div class="seg" role="tablist" aria-label="Players">
+    <div class="seg" id="modeSeg" role="tablist" aria-label="Players">
       <button type="button" role="tab" data-mode="all" aria-selected="${mode === 'all'}">Everyone</button>
       <button type="button" role="tab" data-mode="station" aria-selected="${mode === 'station'}">One station</button>
     </div>
@@ -1103,10 +1261,10 @@ async function viewLeaderboard() {
   const draw = async () => {
     const box = $('#board');
     box.innerHTML = '<div class="empty"><div class="spin" aria-hidden="true"></div></div>';
-    const q = mode === 'station' ? `?stationId=${encodeURIComponent(stationId)}` : '';
-    const data = await api(`/api/leaderboard${q}`);
+    const q = new URLSearchParams({ period, ...(mode === 'station' && { stationId }) });
+    const data = await api(`/api/leaderboard?${q}`);
     if (mode === 'all') {
-      $('#war').innerHTML = data.lines.length ? lineWar(data.lines) : '';
+      $('#war').innerHTML = data.lines.length ? lineWar(data.lines, period === 'all' ? { sub: "Points at each line's stations, all time" } : {}) : '';
       const mine = data.rows.find((r) => r.userId === state.user.id);
       const rival = mine && data.rows.find((r) => r.rank === mine.rank - 1);
       $('#versus').innerHTML = mine && rival
@@ -1117,7 +1275,7 @@ async function viewLeaderboard() {
             <div class="vs-bar" aria-hidden="true"><span style="--p:${Math.round((mine.points / Math.max(1, rival.points)) * 100)}%"></span></div>
           </section>`
         : mine?.rank === 1
-          ? `<section class="tk versus versus-top"><p class="vs-top"><b>You're 1st this month</b> with ${mine.points} points.</p></section>`
+          ? `<section class="tk versus versus-top"><p class="vs-top"><b>You're 1st ${period === 'month' ? 'this month' : 'of all time'}</b> with ${mine.points} points.</p></section>`
           : '';
     }
     if (!data.rows.length) {
@@ -1139,10 +1297,18 @@ async function viewLeaderboard() {
       .join('')}</ol>`;
   };
 
-  app.querySelectorAll('.seg button').forEach((b) =>
+  app.querySelectorAll('#periodSeg button').forEach((b) =>
+    b.addEventListener('click', () => {
+      period = state.board.period = b.dataset.period;
+      app.querySelectorAll('#periodSeg button').forEach((x) => x.setAttribute('aria-selected', String(x === b)));
+      $('#lbHead').innerHTML = heading();
+      draw();
+    }),
+  );
+  app.querySelectorAll('#modeSeg button').forEach((b) =>
     b.addEventListener('click', () => {
       mode = state.board.mode = b.dataset.mode;
-      app.querySelectorAll('.seg button').forEach((x) => x.setAttribute('aria-selected', String(x === b)));
+      app.querySelectorAll('#modeSeg button').forEach((x) => x.setAttribute('aria-selected', String(x === b)));
       $('#stationPick').hidden = mode !== 'station';
       draw();
     }),
@@ -1154,7 +1320,8 @@ async function viewLeaderboard() {
   await draw();
 }
 
-// ---------- tickets (your profile) ----------
+// ---------- profile ----------
+// Each find is a little punched ticket.
 function ticketsGrid(finds) {
   return finds.length
     ? `<ul class="book">${finds
@@ -1163,13 +1330,96 @@ function ticketsGrid(finds) {
           const fam = st ? familiesOf(st.lines)[0] : null;
           return `<li class="mini" style="--ln:${LINE_VAR[fam] ?? 'var(--ink)'}">
             <p class="mini-band ${fam === 'Orange' ? 'mini-band-dark' : ''}">${esc(f.stationName)}</p>
-            <div class="mini-pic"><img src="${apiUrl(f.photoUrl)}" alt="Find at ${esc(f.stationName)}" loading="lazy" /></div>
+            <div class="mini-pic">${f.photoUrl
+              ? `<img src="${apiUrl(f.photoUrl)}" alt="Find at ${esc(f.stationName)}" loading="lazy" />`
+              : '<p class="mini-hidden">Hidden until you find it</p>'}</div>
             <p class="mini-lv">${esc(f.levelName)} <b>+${f.points}</b></p>
             <span class="hole hole-s" aria-hidden="true"></span>
           </li>`;
         })
         .join('')}</ul>`
-    : '<div class="empty"><p>No punched tickets yet. Find an egg and it lands here.</p></div>';
+    : '<div class="empty"><p>No finds yet. Find an egg and it lands here.</p></div>';
+}
+
+// Your recent activity, newest first (only ever sent for your own profile).
+const fmtWhen = (iso) => {
+  const mins = (Date.now() - new Date(iso).getTime()) / 60_000;
+  if (mins < 1) return 'just now';
+  if (mins < 60) return relTime.format(-Math.floor(mins), 'minute');
+  if (mins < 24 * 60) return relTime.format(-Math.floor(mins / 60), 'hour');
+  if (mins < 7 * 24 * 60) return relTime.format(-Math.floor(mins / 1440), 'day');
+  return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+};
+function activityList(items) {
+  if (!items?.length) return '';
+  const at = (a) => `<a href="#/station/${encodeURIComponent(a.stationId)}">${esc(a.stationName)}</a>`;
+  const row = (a) => {
+    const [icon, text, pts] =
+      a.type === 'found' ? ['🥚', `Found the ${esc(a.levelName)} egg at ${at(a)}`, `+${a.points}`]
+      : a.type === 'hid' ? ['📍', `Hid a ${esc(a.levelName)} egg at ${at(a)}`]
+      : a.type === 'egg_found' ? ['👀', `<b>${esc(a.by)}</b> found your ${esc(a.levelName)} egg at ${at(a)}`]
+      : a.type === 'joined_group' ? ['👥', `Joined <a href="#/group/${encodeURIComponent(a.groupId)}">${esc(a.groupName)}</a>`]
+      : ['🎟️', 'Joined Lookout'];
+    return `<li><span class="act-ic" aria-hidden="true">${icon}</span><p>${text}<small>${fmtWhen(a.at)}</small></p>${pts ? `<b class="act-pts">${pts}</b>` : ''}</li>`;
+  };
+  return `<ol class="activity">${items.map(row).join('')}</ol>`;
+}
+
+// Username (public: leaderboards, profile) and chat name (anonymous: group chats only).
+function namesCard(user) {
+  return `<section class="tk names">
+    <div class="name-row">
+      <div><p class="next-label">Username</p><p class="name-val">${esc(user.username)}</p><small>On leaderboards and your profile. You sign in with it.</small></div>
+      <button class="link" type="button" data-edit="username">Change</button>
+    </div>
+    <div class="tk-perf" aria-hidden="true"></div>
+    <div class="name-row">
+      <div><p class="next-label">Anonymous chat name</p><p class="name-val">${esc(user.chatName ?? '')}</p><small>All group chats show this name instead of your username. Only you can see it's yours.</small></div>
+      <button class="link" type="button" data-edit="chatName">Change</button>
+    </div>
+    <form id="nameForm" class="name-form" hidden>
+      <label class="field-label" for="nameInput"></label>
+      <div class="name-edit"><input id="nameInput" class="input" maxlength="20" autocapitalize="none" autocomplete="off" required /><button class="btn btn-ink" type="submit">Save</button></div>
+      <div class="name-tools"><button id="dice" class="link" type="button" hidden>Random name</button><button id="nameCancel" class="link" type="button">Cancel</button></div>
+      <div id="nameErr"></div>
+    </form>
+  </section>`;
+}
+
+const CHAT_WORDS = [['Sleepy', 'Speedy', 'Sneaky', 'Lucky', 'Rusty', 'Shiny', 'Grumpy', 'Jolly', 'Cosmic', 'Salty', 'Mystic', 'Stealthy'], ['Turnstile', 'Trolley', 'Pigeon', 'Conductor', 'Railcar', 'Signal', 'Token', 'Tunnel', 'Caboose', 'Owl', 'Raccoon', 'Otter']];
+const randomChatName = () => `${CHAT_WORDS.map((w) => w[Math.floor(Math.random() * w.length)]).join(' ')} ${10 + Math.floor(Math.random() * 90)}`;
+
+function wireNames(onSaved) {
+  const form = $('#nameForm');
+  let field = null;
+  app.querySelectorAll('[data-edit]').forEach((b) =>
+    b.addEventListener('click', () => {
+      field = b.dataset.edit;
+      form.hidden = false;
+      form.querySelector('label').textContent = field === 'username' ? 'New username' : 'New chat name';
+      $('#dice').hidden = field !== 'chatName';
+      $('#nameErr').innerHTML = '';
+      $('#nameInput').value = state.user[field] ?? '';
+      $('#nameInput').focus();
+      $('#nameInput').select();
+    }),
+  );
+  $('#dice').addEventListener('click', () => ($('#nameInput').value = randomChatName()));
+  $('#nameCancel').addEventListener('click', () => (form.hidden = true));
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = form.querySelector('.btn');
+    btn.disabled = true;
+    try {
+      const { user } = await api('/api/me/names', { [field]: $('#nameInput').value });
+      setSession({ user, token: state.token });
+      toast(field === 'username' ? 'Username changed. Sign in with the new one from now on.' : `You're now "${user.chatName}" in group chats.`, 3600);
+      onSaved();
+    } catch (err) {
+      $('#nameErr').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+      btn.disabled = false;
+    }
+  });
 }
 
 function deviceList(sessions) {
@@ -1203,7 +1453,7 @@ async function viewProfile() {
       <div class="tk-top level-top">
         <div>
           <h1 class="page-h">${esc(p.user.username)}</h1>
-          <p class="page-sub">${p.monthRank ? `${ordinal(p.monthRank)} this month. ` : ''}${lv ? `Rider level ${lv.level}${lv.next ? `, ${lv.next - lv.points} pts to level ${lv.level + 1}.` : '.'}` : ''}</p>
+          <p class="page-sub">${p.monthRank ? `${ordinal(p.monthRank)} this month. ` : ''}${lv ? `Rider level ${lv.level}${lv.next ? `, ${lv.next - lv.points} pts to level ${lv.level + 1}.` : '.'}` : ''}${p.hiderPoints ? ` Your eggs have earned you ${p.hiderPoints} pts in bounties.` : ''}</p>
         </div>
         ${lv ? `<span class="level-badge" aria-hidden="true">${lv.level}</span>` : ''}
       </div>
@@ -1218,6 +1468,8 @@ async function viewProfile() {
         </dl>
       </div>
     </section>
+    ${namesCard({ ...p.user, chatName: p.user.chatName ?? state.user.chatName })}
+    ${p.activity?.length ? `<div class="eggs-head"><h2 class="sec-h">Activity</h2><p class="eggs-count">Latest first</p></div>${activityList(p.activity)}` : ''}
     ${challengeTicket(progress?.today)}
     ${progress ? `
     <div class="eggs-head"><h2 class="sec-h">Lines punched</h2><p class="eggs-count">${progress.lines.filter((l) => l.stations).length} of 4</p></div>
@@ -1230,7 +1482,7 @@ async function viewProfile() {
       .join('')}${progress.stations
       .map((s) => `<li class="st is-got"><span class="st-seal st-station" style="--ln:${LINE_VAR[s.lines[0]] ?? 'var(--stamp)'}">${esc(s.name)}</span><p>${plural(s.finds, 'find')} here</p></li>`)
       .join('')}</ul>` : ''}
-    <div class="eggs-head"><h2 class="sec-h">Punched tickets</h2><p class="eggs-count">${plural(p.recentFinds.length, 'recent find')}</p></div>
+    <div class="eggs-head"><h2 class="sec-h">Recent finds</h2><p class="eggs-count">${plural(p.recentFinds.length, 'find')}</p></div>
     ${ticketsGrid(p.recentFinds)}
     <h2 class="sec-h">Signed-in devices</h2>
     ${deviceList(sessions)}
@@ -1238,6 +1490,7 @@ async function viewProfile() {
       <button id="out" class="btn btn-ghost" type="button">Sign out</button>
       <button id="outAll" class="link" type="button">Sign out on all devices</button>
     </div>`;
+  wireNames(viewProfile);
   $('#out').addEventListener('click', () => signOut({ remote: true }));
   $('#outAll').addEventListener('click', () => {
     if (confirm('Sign out on every phone and computer using this account?')) signOut({ remote: true, everywhere: true });
@@ -1252,7 +1505,7 @@ async function viewPlayer(id) {
   app.innerHTML = `
     <a class="back" href="#/leaderboard"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>Ranks</a>
     <section class="tk level-tk">
-      <div class="tk-top"><h1 class="page-h">${esc(p.user.username)}</h1><p class="page-sub">${p.monthRank ? `${ordinal(p.monthRank)} this month` : 'Not on the board yet this month'}</p></div>
+      <div class="tk-top"><h1 class="page-h">${esc(p.user.username)}</h1><p class="page-sub">${p.monthRank ? `${ordinal(p.monthRank)} this month` : 'Not on the board yet this month'}${p.hiderPoints ? `. Their eggs have earned ${p.hiderPoints} pts in bounties` : ''}</p></div>
       <div class="tk-perf" aria-hidden="true"></div>
       <dl class="tk-bottom mini-stats">
         <div><dt>This month</dt><dd>${p.monthPoints}</dd></div>
@@ -1261,8 +1514,352 @@ async function viewPlayer(id) {
         <div><dt>Found by others</dt><dd>${p.timesYourEggsWereFound}</dd></div>
       </dl>
     </section>
-    <div class="eggs-head"><h2 class="sec-h">Punched tickets</h2></div>
+    <div class="eggs-head"><h2 class="sec-h">Recent finds</h2></div>
     ${ticketsGrid(p.recentFinds)}`;
+}
+
+// ---------- notifications ----------
+// Your eggs, and every time someone found one. Opening the page marks them seen.
+const EGG_STATUS = { active: 'Live now', pool: 'Waiting in the pool', retired: 'Retired' };
+async function viewNotifications() {
+  loading();
+  const [data] = await Promise.all([api('/api/me/notifications'), getStations()]);
+  const c = data.counts;
+  const at = (n) => `<a href="#/station/${encodeURIComponent(n.stationId)}">${esc(n.stationName)}</a>`;
+  const row = (n) =>
+    n.type === 'egg_found'
+      ? `<li class="${n.unseen ? 'is-new' : ''}"><span class="act-ic" aria-hidden="true">🎉</span><p><b>${esc(n.by)}</b> found your ${esc(n.levelName)} egg at ${at(n)}<small>${fmtWhen(n.at)}${n.unseen ? ' · New' : ''}</small></p><b class="act-pts">+${n.points}</b></li>`
+      : `<li class="nt-egg"><img src="${apiUrl(n.photoUrl)}" alt="Your egg at ${esc(n.stationName)}" loading="lazy" /><p>You hid a ${esc(n.levelName)} egg at ${at(n)}${n.hint ? `<small>Hint: ${esc(n.hint)}</small>` : ''}<small>${fmtWhen(n.at)} · ${EGG_STATUS[n.status] ?? esc(n.status)} · ${n.timesFound ? `found ${plural(n.timesFound, 'time')}` : 'not found yet'}</small></p></li>`;
+  const ask = 'Notification' in window && Notification.permission === 'default';
+  app.innerHTML = `
+    <h1 class="page-h">Notifications</h1>
+    <p class="page-sub">Your eggs, and every time someone finds one.</p>
+    <div class="map-tally nt-tally">
+      <p><b>${c.finds}</b>${c.finds === 1 ? 'egg' : 'eggs'} you found</p>
+      <p><b>${c.eggsHidden}</b>${c.eggsHidden === 1 ? 'egg' : 'eggs'} you hid</p>
+      <p><b>${c.foundByOthers}</b>${c.foundByOthers === 1 ? 'time' : 'times'} others found yours</p>
+    </div>
+    ${ask ? '<div class="notice nt-ask"><p>Get a heads-up when someone finds your egg, or when you reach a station with eggs waiting.</p><button id="allow" class="btn btn-ink" type="button">Turn on alerts</button></div>' : ''}
+    ${data.items.length
+      ? `<ol class="activity nt-list">${data.items.map(row).join('')}</ol>`
+      : '<div class="empty"><p>Nothing yet. Hide an egg at a station and you\'ll hear here when someone finds it.</p><a class="btn btn-ghost" href="#/">Find a station</a></div>'}`;
+  $('#allow')?.addEventListener('click', async () => {
+    const r = await Notification.requestPermission().catch(() => 'denied');
+    toast(r === 'granted' ? "Alerts on. We'll tell you when your eggs are found." : 'Alerts are off. You can still check this page.');
+    $('.nt-ask')?.remove();
+  });
+  if (data.unseen) {
+    api('/api/me/notifications/seen', {}).catch(() => {});
+    state.unseen = 0;
+    drawBell();
+  }
+}
+
+// ---------- friend groups ----------
+// Private leaderboards with friends, joined by invite code or link, plus a sticker-only chat.
+const CHAT_POLL_MS = 4000;
+const inviteLink = (code) => `${location.origin}${location.pathname}#/join/${code}`;
+const fmtTime = (iso) => new Date(iso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+
+async function shareInvite(group) {
+  const url = inviteLink(group.inviteCode);
+  const text = `Join my Lookout group "${group.name}" and see who finds the most eggs.`;
+  try {
+    if (navigator.share) return await navigator.share({ title: group.name, text, url });
+  } catch (err) {
+    if (err?.name === 'AbortError') return; // closed the share sheet
+  }
+  try {
+    await navigator.clipboard.writeText(url);
+    toast('Invite link copied.');
+  } catch {
+    prompt('Copy this invite link:', url);
+  }
+}
+
+async function viewGroups() {
+  loading();
+  const { groups, limits } = await api('/api/groups');
+  app.innerHTML = `
+    <h1 class="page-h">Groups</h1>
+    <p class="page-sub">Your own leaderboard with friends. Start a group, then send them the invite link.</p>
+    ${groups.length
+      ? `<ul class="st-list">${groups
+          .map((g) => `<li><a href="#/group/${encodeURIComponent(g.id)}">
+              <span class="st-lines"><i style="--ln:var(--stamp)"></i></span>
+              <span class="st-txt"><b>${esc(g.name)}</b><small>${plural(g.memberCount, 'member')}${g.isOwner ? ', you run it' : ''}</small></span>
+              <span class="st-count">${g.memberCount}</span>
+            </a></li>`)
+          .join('')}</ul>`
+      : '<div class="empty"><p>You\'re not in any groups yet.</p></div>'}
+    <section class="tk grp-forms">
+      ${BAND_LINES}
+      <form id="create" class="tk-top">
+        <h2 class="sec-h">Start a group</h2>
+        <label class="field-label" for="gname">Group name</label>
+        <input id="gname" class="input" maxlength="30" placeholder="e.g. Red Line Regulars" required />
+        <button class="btn btn-ink btn-block">Create group</button>
+        <div id="createErr"></div>
+      </form>
+      <div class="tk-perf" aria-hidden="true"></div>
+      <form id="join" class="tk-bottom">
+        <h2 class="sec-h">Join with a code</h2>
+        <label class="field-label" for="gcode">Invite code <span class="opt">(8 letters and numbers)</span></label>
+        <input id="gcode" class="input" maxlength="12" autocapitalize="characters" autocomplete="off" placeholder="e.g. K7PQ2MXR" required />
+        <button class="btn btn-ghost btn-block">Join group</button>
+        <div id="joinErr"></div>
+      </form>
+    </section>
+    <p class="page-sub">Up to ${limits.groups} groups each, ${limits.members} players per group.</p>`;
+
+  $('#create').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      const { group } = await api('/api/groups', { name: $('#gname').value });
+      location.hash = `#/group/${encodeURIComponent(group.id)}`;
+    } catch (err) {
+      $('#createErr').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+    }
+  });
+  $('#join').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      const { group } = await api('/api/groups/join', { code: $('#gcode').value });
+      toast(`You joined ${group.name}.`);
+      location.hash = `#/group/${encodeURIComponent(group.id)}`;
+    } catch (err) {
+      $('#joinErr').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+    }
+  });
+}
+
+async function viewGroup(id) {
+  loading();
+  const gid = encodeURIComponent(id);
+  let tab = 'board';
+  let period = 'month';
+  let data = await api(`/api/groups/${gid}`);
+  let chat = null; // { messages, lastSeq } once the chat has been opened
+  let stopPolling = null;
+  const monthLabel = new Date().toLocaleString('en-US', { month: 'long', timeZone: 'America/New_York' });
+
+  // The chat is anonymous: everyone shows by their chat name, never their username or rank.
+  const myRank = () => data.rows.find((r) => r.userId === state.user.id)?.rank ?? null;
+  const stickerHtml = (m) => {
+    const r = m.mine ? myRank() : null;
+    return `<div class="msg ${m.mine ? 'mine' : ''}">
+      <span class="msg-emoji" aria-hidden="true">${esc(m.emoji)}</span>
+      <p class="msg-cap">${esc(m.label)}</p>
+      <p class="msg-meta">${m.mine ? 'You' : esc(m.name)}${r ? `<span class="rank-chip">${r === 1 ? '👑 ' : ''}${ordinal(r)}</span>` : ''} · ${fmtTime(m.createdAt)}</p>
+    </div>`;
+  };
+
+  const boardHtml = () => {
+    const href = (r) => (r.userId === state.user.id ? '#/profile' : `#/user/${encodeURIComponent(r.userId)}`);
+    return `
+      <div class="seg" role="tablist" aria-label="Period">
+        <button type="button" role="tab" data-period="month" aria-selected="${period === 'month'}">${esc(monthLabel)}</button>
+        <button type="button" role="tab" data-period="all" aria-selected="${period === 'all'}">All time</button>
+      </div>
+      <ol class="ranks">${data.rows
+        .map((r) => `<li class="${r.userId === state.user.id ? 'is-me' : ''}"><a href="${href(r)}">
+            <span class="rk ${r.rank ? '' : 'rk-none'}">${r.rank ?? '–'}</span>
+            <span class="who"><b>${r.userId === state.user.id ? 'You' : esc(r.username)}${r.isOwner ? '<span class="tag">Owner</span>' : ''}</b><small>${r.finds ? plural(r.finds, 'find') : 'No finds yet'}</small></span>
+            <span class="sc">${r.points}</span>
+          </a></li>`)
+        .join('')}</ol>
+      ${data.rows.every((r) => !r.points) ? `<p class="page-sub">Nobody has scored ${period === 'month' ? 'this month' : 'yet'}. Find an egg to take the lead.</p>` : ''}`;
+  };
+
+  const chatHtml = () => `
+    <section class="tk"><div id="feed" class="feed" aria-live="polite">${chat.messages.length
+      ? chat.messages.map(stickerHtml).join('')
+      : '<div class="empty"><p>No stickers yet. Start the trash talk.</p></div>'}</div></section>
+    <p class="chat-hint">You're <b>${esc(state.user.chatName ?? 'anonymous')}</b> here (<a href="#/profile">change</a>). Tap a sticker to send it.</p>
+    <div class="stickers">${(state.config?.stickers ?? [])
+      .map((st) => `<button class="stk" type="button" data-sticker="${esc(st.id)}" aria-label="Send ${esc(st.label)}"><span aria-hidden="true">${esc(st.emoji)}</span><small>${esc(st.label)}</small></button>`)
+      .join('')}</div>`;
+
+  function scrollFeed(force) {
+    const feed = $('#feed');
+    if (!feed) return;
+    if (force || feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80) feed.scrollTop = feed.scrollHeight;
+  }
+
+  function appendMessages(messages) {
+    const fresh = messages.filter((m) => m.seq > chat.lastSeq);
+    if (!fresh.length) return;
+    chat.messages.push(...fresh);
+    chat.lastSeq = fresh.at(-1).seq;
+    const feed = $('#feed');
+    if (!feed) return;
+    feed.querySelector('.empty')?.remove();
+    feed.insertAdjacentHTML('beforeend', fresh.map(stickerHtml).join(''));
+    scrollFeed(fresh.some((m) => m.mine));
+  }
+
+  async function poll() {
+    if (document.visibilityState !== 'visible' || tab !== 'chat') return;
+    try {
+      appendMessages((await api(`/api/groups/${gid}/messages?after=${chat.lastSeq}`)).messages);
+    } catch {
+      /* try again next tick */
+    }
+  }
+
+  function startPolling() {
+    if (stopPolling) return;
+    const iv = setInterval(poll, CHAT_POLL_MS);
+    const onVisible = () => document.visibilityState === 'visible' && poll();
+    document.addEventListener('visibilitychange', onVisible);
+    stopPolling = () => {
+      clearInterval(iv);
+      document.removeEventListener('visibilitychange', onVisible);
+      stopPolling = null;
+    };
+    onCleanup(() => stopPolling?.()); // stops when leaving the page
+  }
+
+  const draw = () => {
+    const { group } = data;
+    app.innerHTML = `
+      <a class="back" href="#/groups"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>Groups</a>
+      <section class="tk">
+        ${BAND_LINES}
+        <div class="tk-top grp-head">
+          <div>
+            <p class="here">Group</p>
+            <h1 class="page-h">${esc(group.name)}</h1>
+            <p class="page-sub">${plural(group.memberCount, 'member')}${group.isOwner ? ', you run it' : ''}</p>
+          </div>
+          ${group.isOwner ? '<button id="rename" class="link" type="button">Rename</button>' : ''}
+        </div>
+        <div class="tk-perf" aria-hidden="true"></div>
+        <div class="tk-bottom invite-row">
+          <div><p class="next-label">Invite code</p><p class="invite-code">${esc(group.inviteCode)}</p></div>
+          <button id="share" class="btn btn-primary" type="button">Share invite</button>
+        </div>
+      </section>
+      <div class="seg" role="tablist" aria-label="Group">
+        <button type="button" role="tab" data-tab="board" aria-selected="${tab === 'board'}">Ranks</button>
+        <button type="button" role="tab" data-tab="chat" aria-selected="${tab === 'chat'}">Chat</button>
+      </div>
+      <div class="grp-pane">${tab === 'board' ? boardHtml() : chatHtml()}</div>
+      <div class="account"><button id="leave" class="link" type="button">Leave group</button></div>`;
+
+    $('#share').addEventListener('click', () => shareInvite(group));
+    app.querySelectorAll('[data-tab]').forEach((b) =>
+      b.addEventListener('click', async () => {
+        if (b.dataset.tab === tab) return;
+        tab = b.dataset.tab;
+        if (tab === 'chat' && !chat) {
+          try {
+            const { messages } = await api(`/api/groups/${gid}/messages`);
+            chat = { messages, lastSeq: messages.at(-1)?.seq ?? 0 };
+          } catch (err) {
+            tab = 'board';
+            return toast(err.message);
+          }
+        }
+        draw();
+        if (tab === 'chat') {
+          scrollFeed(true);
+          startPolling();
+          poll();
+        } else stopPolling?.();
+      }),
+    );
+    app.querySelectorAll('[data-period]').forEach((b) =>
+      b.addEventListener('click', async () => {
+        if (b.dataset.period === period) return;
+        period = b.dataset.period;
+        try {
+          data = await api(`/api/groups/${gid}${period === 'all' ? '?period=all' : ''}`);
+          draw();
+        } catch (err) {
+          toast(err.message);
+        }
+      }),
+    );
+    app.querySelectorAll('[data-sticker]').forEach((b) =>
+      b.addEventListener('click', async () => {
+        b.disabled = true;
+        try {
+          const { message } = await api(`/api/groups/${gid}/messages`, { sticker: b.dataset.sticker });
+          // Pick up anything others sent meanwhile, then ours, in order.
+          const { messages } = await api(`/api/groups/${gid}/messages?after=${chat.lastSeq}`);
+          appendMessages(messages.length ? messages : [message]);
+        } catch (err) {
+          toast(err.message);
+        } finally {
+          b.disabled = false;
+        }
+      }),
+    );
+    $('#rename')?.addEventListener('click', async () => {
+      const name = prompt('New group name', group.name);
+      if (!name || name.trim() === group.name) return;
+      try {
+        data.group = (await api(`/api/groups/${gid}/rename`, { name })).group;
+        draw();
+        toast('Group renamed.');
+      } catch (err) {
+        toast(err.message);
+      }
+    });
+    $('#leave').addEventListener('click', async () => {
+      const lastOne = group.memberCount === 1;
+      const msg = lastOne
+        ? `You're the only member. Leaving deletes "${group.name}" and its chat. Continue?`
+        : group.isOwner
+          ? `Leave "${group.name}"? The longest-standing member takes over.`
+          : `Leave "${group.name}"?`;
+      if (!confirm(msg)) return;
+      try {
+        await api(`/api/groups/${gid}/leave`, {});
+        toast(lastOne ? 'Group deleted.' : 'You left the group.');
+        location.hash = '#/groups';
+      } catch (err) {
+        toast(err.message);
+      }
+    });
+  };
+  draw();
+}
+
+// Opened from an invite link. Signing up first works too: the hash survives it.
+async function viewJoin(code) {
+  loading();
+  const { group, alreadyMember } = await api(`/api/groups/invite/${encodeURIComponent(code)}`);
+  if (alreadyMember) return location.replace(`#/group/${encodeURIComponent(group.id)}`);
+  app.innerHTML = `
+    <section class="tk">
+      ${BAND_LINES}
+      <div class="tk-top">
+        <p class="here">You're invited to a group</p>
+        <h1 class="page-h">${esc(group.name)}</h1>
+        <p class="page-sub">${plural(group.memberCount, 'member')}. Join to see the group's ranks and send stickers.</p>
+      </div>
+      <div class="tk-perf" aria-hidden="true"></div>
+      <div class="tk-bottom stack">
+        ${group.full
+          ? '<div class="notice bad">This group is full.</div><a class="btn btn-ghost btn-block" href="#/groups">Back to groups</a>'
+          : `<button id="joinBtn" class="btn btn-ink btn-block btn-l" type="button">Join ${esc(group.name)}</button>
+             <a class="btn btn-ghost btn-block" href="#/groups">Not now</a>
+             <div id="err"></div>`}
+      </div>
+    </section>`;
+  $('#joinBtn')?.addEventListener('click', async () => {
+    $('#joinBtn').disabled = true;
+    try {
+      const { group: joined } = await api('/api/groups/join', { code });
+      toast(`You joined ${joined.name}.`);
+      location.replace(`#/group/${encodeURIComponent(joined.id)}`);
+    } catch (err) {
+      $('#err').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+      $('#joinBtn').disabled = false;
+    }
+  });
 }
 
 // ---------- map ----------
@@ -1543,13 +2140,17 @@ function makeTrainLayer() {
 
 async function viewMap() {
   loading('Loading the map');
-  const [stations, , linesData, statsData] = await Promise.all([
-    getStations(),
+  const [{ stations, totals }, , linesData, statsData] = await Promise.all([
+    api('/api/stations'), // fresh counts, including how many eggs are still left for you
     loadLeaflet(),
     api('/api/map/lines').catch(() => ({ lines: [] })),
     api('/api/map/stations').catch(() => ({ stations: [] })),
   ]);
+  state.stations = stations;
   const stats = new Map(statsData.stations.map((s) => [s.id, s]));
+  // Eggs you can still find at each station (not yours, not already found). Only known when signed in.
+  const leftFor = new Map(stations.map((s) => [s.id, s.playable]));
+  const allFound = (id) => (stats.get(id)?.activeEggs ?? 0) > 0 && leftFor.get(id) === 0;
   const root = getComputedStyle(document.documentElement);
   const tok = (n) => root.getPropertyValue(n).trim();
   const motion = !reducedMotion();
@@ -1558,6 +2159,11 @@ async function viewMap() {
   app.innerHTML = `
     <h1 class="page-h">Map</h1>
     <p class="page-sub">Every station, every egg, and every train running right now.</p>
+    <div class="map-tally" aria-label="Eggs on the T right now">
+      <p><b>${totals.eggs}</b>${totals.eggs === 1 ? 'egg' : 'eggs'} hidden</p>
+      <p><b>${totals.stationsWithEggs}</b>of ${totals.stations} stations</p>
+      <p><b>${totals.playable ?? totals.eggs}</b>left for you</p>
+    </div>
     <section class="tk map-tk">
       ${BAND_LINES}
       <div class="map-bar">
@@ -1574,6 +2180,7 @@ async function viewMap() {
       <div class="tk-bottom map-key">
         <ul class="legend">
           <li><span class="lg-stn has-eggs" style="--ln:var(--line-green)"><b>3</b></span>Eggs up</li>
+          <li><span class="lg-stn has-eggs done" style="--ln:var(--line-blue)"><b>2</b></span>All found by you</li>
           <li><span class="lg-stn" style="--ln:var(--line-green)"></span>No eggs yet</li>
           <li><span class="lg-stn mine" style="--ln:var(--line-green)"></span>You found eggs here</li>
           <li><span class="lg-stn live" style="--ln:var(--line-green)"></span>Someone hunting now</li>
@@ -1698,7 +2305,7 @@ async function viewMap() {
     const st = stats.get(s.id);
     const fams = familiesOf(s.lines);
     const n = st?.activeEggs ?? 0;
-    const cls = ['stn', n ? 'has-eggs' : '', fams.length > 1 ? 'hub' : '', st?.huntingNow ? 'live' : '', st?.yourFinds ? 'mine' : '', selected ? 'sel' : ''].filter(Boolean).join(' ');
+    const cls = ['stn', n ? 'has-eggs' : '', fams.length > 1 ? 'hub' : '', st?.huntingNow ? 'live' : '', st?.yourFinds ? 'mine' : '', allFound(s.id) ? 'done' : '', selected ? 'sel' : ''].filter(Boolean).join(' ');
     const size = n ? 26 : 14;
     return L.divIcon({ className: 'stn-wrap', iconSize: [size, size], iconAnchor: [size / 2, size / 2], html: `<span class="${cls}" style="--ln:${LINE_VAR[fams[0]] ?? 'var(--ink)'}">${n ? `<b>${n}</b>` : ''}</span>` });
   };
@@ -1756,7 +2363,7 @@ async function viewMap() {
       </div>
       <div class="sheet-top">
         <h2 class="sheet-h">${esc(s.name)}</h2>
-        <p class="sheet-sub">${dist != null ? (dist <= RANGE_METERS ? "You're here." : `${fmtDist(dist)} from you.`) : ''}</p>
+        <p class="sheet-sub">${[dist != null ? (dist <= RANGE_METERS ? "You're here." : `${fmtDist(dist)} from you.`) : '', st.activeEggs && leftFor.get(s.id) != null ? (leftFor.get(s.id) ? `${plural(leftFor.get(s.id), 'egg')} left for you.` : "You've found every egg here.") : ''].filter(Boolean).join(' ')}</p>
         ${st.keeper ? `<p class="stamp sheet-keeper">Keeper: ${esc(st.keeper.username)}</p>` : ''}
       </div>
       <div class="tk-perf" aria-hidden="true"></div>

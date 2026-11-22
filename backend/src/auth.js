@@ -35,4 +35,4 @@ export async function verifyPassword(password, stored) {
 export const DUMMY_HASH = await hashPassword(crypto.randomBytes(16).toString('hex'));
 
 export const newToken = () => crypto.randomBytes(32).toString('base64url');
-export const hashToken = (token) => crypto.createHash('sha256').update(String(token)).digest();
+export const hashToken = (token) => crypto.createHash('sha256').update(String(token)).digest('hex');
