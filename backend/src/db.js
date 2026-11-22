@@ -15,6 +15,8 @@ export async function createDb({ uri, dbName = 'egghunt', maxPoolSize = 10 }) {
     eggs: db.collection('eggs'),
     attempts: db.collection('attempts'),
     finds: db.collection('finds'),
+    // Points that aren't a find: a hider's share of a bounty. Leaderboards add these to finds.
+    payouts: db.collection('payouts'),
     reports: db.collection('reports'),
     locks: db.collection('locks'),
     groups: db.collection('groups'),
@@ -38,6 +40,10 @@ export async function createDb({ uri, dbName = 'egghunt', maxPoolSize = 10 }) {
     col.eggs.createIndex({ createdBy: 1 }),
     col.eggs.createIndex({ status: 1, activatedAt: 1 }),
     col.attempts.createIndex({ userId: 1 }),
+    col.attempts.createIndex({ userId: 1, eggId: 1, startedAt: -1 }), // a player's clock on an egg
+    col.attempts.createIndex({ eggId: 1, startedAt: 1 }), // players an egg has beaten (bounty)
+    col.payouts.createIndex({ userId: 1, month: 1 }),
+    col.payouts.createIndex({ month: 1, stationId: 1 }),
     col.finds.createIndex({ userId: 1, eggId: 1 }, { unique: true }), // each egg scores once per player
     col.finds.createIndex({ month: 1, stationId: 1 }),
     col.finds.createIndex({ eggId: 1, foundAt: 1 }),

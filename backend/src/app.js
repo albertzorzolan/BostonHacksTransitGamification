@@ -127,6 +127,78 @@ export async function createApp({
     await slots.retireStale(db, t);
   }
 
+  // ---------- the per-egg clock ----------
+  // A player's latest round on an egg. Their clock on that egg is this round's clock.
+  const latestRound = (userId, eggId, session) =>
+    col.attempts.findOne({ userId, eggId }, { session, sort: { startedAt: -1, _id: -1 } });
+
+  // Where a player stands on an egg: 'running' (a round is live, so coming back resumes it),
+  // 'retry' (an earlier round ran out or was given up: a new one earns no time bonus) or 'new'.
+  function clockState(round, t) {
+    if (!round || round.status === 'found') return { state: 'new' };
+    if (round.status === 'open' && game.roundEndsAt(round) > t) {
+      return { state: 'running', secondsLeft: round.limitSeconds - (t - round.startedAt) / 1000 };
+    }
+    return { state: 'retry' };
+  }
+
+  // ---------- bounty ----------
+  // For each egg, the players it has beaten since its bounty was last claimed: their clock on it
+  // ran out, or they gave up. A miss counts only if the player already had a find when it
+  // happened, so brand-new throwaway accounts can't pump a friend's bounty, and a first find
+  // doesn't make earlier misses count after the fact. Returns Map eggId -> Set of userIds.
+  async function playersBeaten(eggs, t, session) {
+    const out = new Map(eggs.map((e) => [e._id, new Set()]));
+    if (!eggs.length) return out;
+    const since = (e) => e.bountyFrom ?? e.createdAt;
+    const rounds = await col.attempts
+      .find(
+        {
+          status: { $ne: 'found' },
+          $or: eggs.map((e) => ({ eggId: e._id, startedAt: { $gt: new Date(since(e).getTime() - game.MAX_ROUND_MS) } })),
+        },
+        { session, projection: { eggId: 1, userId: 1, startedAt: 1, limitSeconds: 1, endedAt: 1 } },
+      )
+      .toArray();
+    const eggById = new Map(eggs.map((e) => [e._id, e]));
+    const over = rounds.filter((r) => {
+      const egg = eggById.get(r.eggId);
+      const endsAt = game.roundEndsAt(r);
+      return r.userId !== egg.createdBy && endsAt <= t && endsAt > since(egg);
+    });
+    const ids = [...new Set(over.map((r) => r.userId))];
+    // Each player's first ever find.
+    const firstFind = new Map(
+      ids.length
+        ? (await col.finds
+            .aggregate([{ $match: { userId: { $in: ids } } }, { $group: { _id: '$userId', at: { $min: '$foundAt' } } }], { session })
+            .toArray()).map((f) => [f._id, f.at])
+        : [],
+    );
+    for (const r of over) {
+      const first = firstFind.get(r.userId);
+      if (first && first < game.roundEndsAt(r)) out.get(r.eggId).add(r.userId);
+    }
+    return out;
+  }
+
+  // What a player would win by finding `egg` now: a pot from the *other* players it has beaten.
+  function potFor(egg, beaten, userId) {
+    const n = [...beaten].filter((u) => u !== userId).length;
+    return { beaten: n, bounty: game.bountyFor(egg.level, n) };
+  }
+
+  // A player's points from payouts (their share of bounties on eggs they hid).
+  async function payoutPoints(userId, month = null) {
+    const [r] = await col.payouts
+      .aggregate([
+        { $match: { userId } },
+        { $group: { _id: null, allTime: { $sum: '$points' }, month: { $sum: { $cond: [{ $eq: ['$month', month] }, '$points', 0] } } } },
+      ])
+      .toArray();
+    return { allTime: r?.allTime ?? 0, month: r?.month ?? 0 };
+  }
+
   // ---------- sessions ----------
   async function startSession(user, req) {
     const token = auth.newToken();
@@ -162,12 +234,25 @@ export async function createApp({
 
   const credentials = (body) => ({ username: String(body?.username ?? '').trim(), password: String(body?.password ?? '') });
 
-  // Points per player for the finds matching `match`, best first. Ties: more finds, then username.
+  // Finds plus payouts (a hider's bounty share) matching `match`, as { userId, stationId, points, find }.
+  // Payout docs carry the same month/stationId/userId fields as finds, so one match fits both.
+  const scoredPoints = (match) => [
+    { $match: match },
+    { $project: { userId: 1, stationId: 1, points: 1, find: { $literal: 1 } } },
+    {
+      $unionWith: {
+        coll: col.payouts.collectionName,
+        pipeline: [{ $match: match }, { $project: { userId: 1, stationId: 1, points: 1, find: { $literal: 0 } } }],
+      },
+    },
+  ];
+
+  // Points per player for the finds and payouts matching `match`, best first. Ties: more finds, then username.
   function pointsBoard(match) {
     return col.finds
       .aggregate([
-        { $match: match },
-        { $group: { _id: '$userId', points: { $sum: '$points' }, finds: { $sum: 1 } } },
+        ...scoredPoints(match),
+        { $group: { _id: '$userId', points: { $sum: '$points' }, finds: { $sum: '$find' } } },
         { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'u' } },
         { $set: { username: { $first: '$u.username' } } },
         { $sort: { points: -1, finds: -1, username: 1 } },
@@ -240,6 +325,9 @@ export async function createApp({
         gemini: Boolean(geminiKey),
         graceSeconds: game.GRACE_SECONDS,
         maxTimeBonus: game.MAX_TIME_BONUS,
+        bountyPerPlayer: game.BOUNTY_PER_PLAYER,
+        bountyCap: game.BOUNTY_CAP,
+        hiderShare: game.HIDER_SHARE,
         passwordMin: auth.PASSWORD_MIN,
         stickers: game.STICKERS,
       };
@@ -341,20 +429,34 @@ export async function createApp({
             )
           : [],
       );
+      const t = now();
+      const beatenBy = await playersBeaten(eggs, t);
+      // The viewer's clock on each egg: their latest round there.
+      const myRounds = new Map();
+      if (user) {
+        const rounds = await col.attempts
+          .find({ userId: user._id, eggId: { $in: eggs.map((e) => e._id) } })
+          .sort({ startedAt: -1, _id: -1 })
+          .toArray();
+        for (const r of rounds) if (!myRounds.has(r.eggId)) myRounds.set(r.eggId, r);
+      }
       const byLevel = new Map(eggs.map((e) => [e.level, e]));
       const slotsOut = game.LEVELS.map((l) => {
         const egg = byLevel.get(l.level);
+        if (!egg) return { ...l, egg: null };
+        const clock = clockState(myRounds.get(egg._id), t);
         return {
           ...l,
-          egg: egg
-            ? {
-                id: egg._id,
-                timesFound: egg.timesFound,
-                createdBy: creators.get(egg.createdBy) ?? 'someone',
-                mine: egg.createdBy === user?._id,
-                foundByMe: foundByMe.has(egg._id),
-              }
-            : null,
+          egg: {
+            id: egg._id,
+            timesFound: egg.timesFound,
+            createdBy: creators.get(egg.createdBy) ?? 'someone',
+            mine: egg.createdBy === user?._id,
+            foundByMe: foundByMe.has(egg._id),
+            ...potFor(egg, beatenBy.get(egg._id), user?._id), // { bounty, beaten }
+            clock: clock.state === 'running' ? { secondsLeft: Math.max(0, Math.round(clock.secondsLeft)) } : null,
+            retry: clock.state === 'retry', // it beat you before: playing again earns no time bonus
+          },
         };
       });
       return { station: s, slots: slotsOut };
@@ -388,6 +490,7 @@ export async function createApp({
           },
         ])
         .toArray();
+      const paid = await payoutPoints(id, month);
       const board = await pointsBoard({ month });
       const rankIndex = board.findIndex((r) => r._id === id);
       const findsByLevel = Object.fromEntries(game.LEVELS.map((l) => [l.name, 0]));
@@ -408,8 +511,9 @@ export async function createApp({
       }
       return {
         user: publicUser(user),
-        monthPoints: totals?.month ?? 0,
-        allTimePoints: totals?.allTime ?? 0,
+        monthPoints: (totals?.month ?? 0) + paid.month,
+        allTimePoints: (totals?.allTime ?? 0) + paid.allTime,
+        hiderPoints: paid.allTime, // all-time points from bounties on eggs this player hid
         monthRank: rankIndex >= 0 ? rankIndex + 1 : null,
         findsByLevel,
         eggsHidden: myEggIds.length,
@@ -437,35 +541,68 @@ export async function createApp({
       if (await hasFound(user._id, egg._id)) fail(409, 'You already found this egg.');
 
       const info = game.levelInfo(egg.level);
-      let limitSeconds = info.seconds;
-      let limitSource = 'fixed';
-      let train = null;
-      if (body?.mode === 'train') {
-        try {
-          const trains = await mbta.predictions(egg.stationId);
-          train = trains.find((t) => t.seconds >= game.TRAIN_MIN_SECONDS && t.seconds <= game.TRAIN_MAX_SECONDS) ?? null;
-          if (train) {
-            limitSeconds = train.seconds;
-            limitSource = 'train';
+      const t = now();
+      // One clock per player per egg. If a round is already running on this egg, coming back
+      // resumes it with the time it has left, instead of starting a fresh clock. After a miss, a
+      // new round is a retry: a fresh clock, but no time bonus.
+      let round = await latestRound(user._id, egg._id);
+      let clock = clockState(round, t);
+      let resumed = clock.state === 'running';
+      if (!resumed) {
+        let limitSeconds = info.seconds;
+        let limitSource = 'fixed';
+        let train = null;
+        if (body?.mode === 'train') {
+          // Outside the transaction: it may run more than once, so no MBTA calls inside it.
+          try {
+            const trains = await mbta.predictions(egg.stationId);
+            train = trains.find((x) => x.seconds >= game.TRAIN_MIN_SECONDS && x.seconds <= game.TRAIN_MAX_SECONDS) ?? null;
+            if (train) {
+              limitSeconds = train.seconds;
+              limitSource = 'train';
+            }
+          } catch {
+            /* fall back to the fixed timer */
           }
-        } catch {
-          /* fall back to the fixed timer */
         }
+        round = await tx(async (session) => {
+          // Serializes this player's starts, so two taps (or two phones) can't open two clocks.
+          await lockUser(session, user._id);
+          const last = await latestRound(user._id, egg._id, session);
+          const state = clockState(last, t);
+          resumed = state.state === 'running';
+          if (resumed) return last;
+          const doc = {
+            _id: crypto.randomUUID(),
+            userId: user._id,
+            eggId: egg._id,
+            startedAt: t,
+            limitSeconds,
+            limitSource,
+            ...(train && { train }),
+            ...(state.state === 'retry' && { retry: true }),
+            status: 'open',
+          };
+          await col.attempts.insertOne(doc, { session });
+          return doc;
+        });
+        clock = clockState(round, t);
       }
 
-      const attemptId = crypto.randomUUID();
-      await col.attempts.insertOne({
-        _id: attemptId,
-        userId: user._id,
-        eggId: egg._id,
-        startedAt: now(),
-        limitSeconds,
-        limitSource,
-        status: 'open',
-      });
+      const pot = potFor(egg, (await playersBeaten([egg], t)).get(egg._id), user._id);
       return {
-        attempt: { id: attemptId, limitSeconds, limitSource, secondsLeft: limitSeconds, train },
+        attempt: {
+          id: round._id,
+          limitSeconds: round.limitSeconds,
+          limitSource: round.limitSource,
+          secondsLeft: Math.round(clock.secondsLeft),
+          train: round.train ?? null,
+          resumed,
+          retry: Boolean(round.retry), // no time bonus on this round
+        },
         egg: {
+          bounty: pot.bounty,
+          beaten: pot.beaten,
           id: egg._id,
           level: egg.level,
           levelName: info.name,
@@ -485,7 +622,7 @@ export async function createApp({
       if (!isUuid(attemptId)) fail(404, 'Round not found');
       const attempt = (await col.attempts.findOne({ _id: attemptId })) ?? fail(404, 'Round not found');
       if (attempt.userId !== user._id) fail(403, 'Not your round');
-      if (attempt.status !== 'open') fail(409, `This round is already ${attempt.status}.`);
+      if (attempt.status !== 'open') fail(409, attempt.status === 'found' ? 'This round is already finished.' : 'This round is over.');
       const egg = (await col.eggs.findOne({ _id: attempt.eggId })) ?? fail(404, 'Egg not found');
       if (await hasFound(user._id, egg._id)) fail(409, 'You already found this egg.');
 
@@ -513,10 +650,12 @@ export async function createApp({
       }
 
       const secondsTaken = Math.min(elapsed, attempt.limitSeconds);
-      const score = game.scoreFind(egg.level, secondsTaken, attempt.limitSeconds);
       const findId = crypto.randomUUID();
       const t = now();
       let firstFind = false;
+      let score;
+      let beaten = 0;
+      let hiderPoints = 0;
       await tx(async (session) => {
         await slots.lockSlot(col, session, egg.stationId, egg.level);
         // Closing the round atomically means a round submitted twice (two tabs) scores once.
@@ -526,6 +665,13 @@ export async function createApp({
           { session },
         );
         if (!closed) fail(409, 'This round is already finished.');
+        const fresh = await col.eggs.findOne({ _id: egg._id }, { session });
+        // Claim the bounty: other players this egg beat since it was last claimed. Read under the
+        // slot lock, so two players finding it at once can't both take the same pot.
+        const pot = potFor(fresh, (await playersBeaten([fresh], t, session)).get(fresh._id), user._id);
+        beaten = pot.beaten;
+        score = game.scoreFind(egg.level, secondsTaken, attempt.limitSeconds, { bounty: pot.bounty, retry: Boolean(attempt.retry) });
+        hiderPoints = game.hiderShare(pot.bounty);
         const photoId = await savePhoto(session, candidate);
         try {
           await col.finds.insertOne(
@@ -541,6 +687,8 @@ export async function createApp({
               points: score.total,
               base: score.base,
               bonus: score.bonus,
+              bounty: score.bounty,
+              ...(attempt.retry && { retry: true }), // found on a retry: no speed stamp
               photoId,
               verified: verification.method === 'gemini',
               canHide: true,
@@ -551,16 +699,38 @@ export async function createApp({
           if (isDuplicateKey(err)) fail(409, 'You already found this egg.');
           throw err;
         }
-        const fresh = await col.eggs.findOne({ _id: egg._id }, { session });
         const avg = Math.round(((fresh.avgFindSeconds ?? 0) * fresh.timesFound + Math.round(secondsTaken)) / (fresh.timesFound + 1));
-        await col.eggs.updateOne({ _id: egg._id }, { $set: { avgFindSeconds: avg }, $inc: { timesFound: 1 } }, { session });
+        // bountyFrom: the pot is claimed, so the next one only counts players beaten from now on.
+        await col.eggs.updateOne({ _id: egg._id }, { $set: { avgFindSeconds: avg, bountyFrom: t }, $inc: { timesFound: 1 } }, { session });
+        // The hider is paid only when their egg is found: a share of the pot it built up.
+        if (hiderPoints) {
+          await col.payouts.insertOne(
+            {
+              _id: crypto.randomUUID(),
+              userId: fresh.createdBy,
+              kind: 'bounty',
+              eggId: egg._id,
+              findId,
+              finderId: user._id,
+              stationId: egg.stationId,
+              level: egg.level,
+              month: game.monthKey(t),
+              points: hiderPoints,
+              createdAt: t,
+            },
+            { session },
+          );
+        }
         firstFind = fresh.timesFound === 0; // read under the slot lock, before this find was counted
         if (fresh.status === 'active') await slots.rotateAfterFind(col, session, fresh, user._id, t);
       });
+      const hider = hiderPoints ? await col.users.findOne({ _id: egg.createdBy }, { projection: { username: 1 } }) : null;
       return {
         status: 'found',
         findId,
-        points: score,
+        points: score, // { base, bonus, bounty, total }
+        beaten, // how many other players this egg beat before you (what built the bounty)
+        hider: hider ? { username: hider.username, points: hiderPoints } : null,
         secondsTaken: Math.round(secondsTaken),
         verification,
         stationId: egg.stationId,
@@ -568,6 +738,36 @@ export async function createApp({
         firstFind,
         // Earned: the sharp original of a blurred egg, shown on the result screen.
         revealUrl: photoUrl(egg.photoId),
+      };
+    },
+
+    // Ends a round that won't be found: the player gave up, or their clock ran out (the app calls
+    // this when its timer hits zero). If they count, they've added to the egg's bounty. They can
+    // retry right away, but a retry earns no time bonus.
+    async endRound(ctx) {
+      const user = requireUser(ctx);
+      const [attemptId] = ctx.params;
+      if (!isUuid(attemptId)) fail(404, 'Round not found');
+      const attempt = (await col.attempts.findOne({ _id: attemptId })) ?? fail(404, 'Round not found');
+      if (attempt.userId !== user._id) fail(403, 'Not your round');
+      const t = now();
+      if (attempt.status === 'open') {
+        const ranOut = game.roundEndsAt(attempt) <= t;
+        // Conditional on 'open', so a find that lands at the same moment wins cleanly.
+        await col.attempts.updateOne(
+          { _id: attempt._id, status: 'open' },
+          { $set: ranOut ? { status: 'expired' } : { status: 'given_up', endedAt: t } },
+        );
+      }
+      const round = await col.attempts.findOne({ _id: attempt._id });
+      if (round.status === 'found') fail(409, 'You found this one.');
+      const egg = (await col.eggs.findOne({ _id: round.eggId })) ?? fail(404, 'Egg not found');
+      const beaten = (await playersBeaten([egg], t)).get(egg._id);
+      return {
+        status: round.status, // 'given_up' | 'expired'
+        counted: beaten.has(user._id), // whether this miss added to the bounty
+        bounty: game.bountyFor(egg.level, beaten.size), // what the next finder takes now
+        beaten: beaten.size,
       };
     },
 
@@ -663,7 +863,8 @@ export async function createApp({
       // Finds made while racing a train.
       const raced = new Set(
         (await col.attempts
-          .find({ userId: user._id, status: 'found', limitSource: 'train' }, { projection: { eggId: 1 } })
+          // A retry doesn't count: you already knew where to look.
+          .find({ userId: user._id, status: 'found', limitSource: 'train', retry: { $ne: true } }, { projection: { eggId: 1 } })
           .toArray()).map((a) => a.eggId),
       );
       const hidden = await col.eggs.countDocuments({ createdBy: user._id });
@@ -697,7 +898,7 @@ export async function createApp({
         stamp('transfer', 'Transfer', 'Find eggs on 2 lines in one day.', 2, mostLinesInADay),
         stamp('beat_train', 'Beat the train', 'Find an egg while racing a train.', 1, finds.filter(isRaced).length),
         stamp('first_to_find', 'First', 'Be the first to find an egg.', 1, finds.filter(isFirst).length),
-        stamp('speedy', '30 s', 'Find an egg in 30 seconds or less.', 1, finds.filter((f) => f.secondsTaken <= 30).length),
+        stamp('speedy', '30 s', 'Find an egg in 30 seconds or less.', 1, finds.filter((f) => f.secondsTaken <= 30 && !f.retry).length),
         stamp('impossible', 'Impossible', 'Find a level 5 egg.', 1, finds.filter((f) => f.level === 5).length),
         stamp('all_lines', '4 lines', 'Find eggs on the Red, Orange, Blue and Green lines.', 4, mainLinesFound),
         stamp('hider', 'Hider', 'Hide 5 eggs.', 5, hidden),
@@ -714,7 +915,8 @@ export async function createApp({
       }[ch.id];
 
       return {
-        level: game.riderLevel(allTime),
+        // Rider level counts bounty shares from eggs you hid, too.
+        level: game.riderLevel(allTime + (await payoutPoints(user._id)).allTime),
         today: { day: today, ...ch, progress: Math.min(ch.target, measure), done: measure >= ch.target, lines: todayLines },
         stamps,
         stations: [...byStation]
@@ -883,7 +1085,7 @@ export async function createApp({
       const stationId = query.get('stationId') || null;
       const match = stationId ? { month, stationId } : { month };
       const board = await pointsBoard(match);
-      const byStation = await col.finds.aggregate([{ $match: match }, { $group: { _id: '$stationId', points: { $sum: '$points' } } }]).toArray();
+      const byStation = await col.finds.aggregate([...scoredPoints(match), { $group: { _id: '$stationId', points: { $sum: '$points' } } }]).toArray();
       const lineTotals = new Map();
       for (const r of byStation) {
         const families = new Set((stationById.get(r._id)?.lines ?? []).map((l) => game.lineFamily(l.id)));
@@ -915,6 +1117,7 @@ export async function createApp({
     ['GET', /^\/api\/users\/([^/]+)$/, api.profile, 'optional'],
     ['POST', /^\/api\/attempts$/, api.startAttempt, 'optional'],
     ['POST', /^\/api\/attempts\/([^/]+)\/find$/, api.submitFind, 'optional'],
+    ['POST', /^\/api\/attempts\/([^/]+)\/end$/, api.endRound, 'optional'],
     ['POST', /^\/api\/eggs$/, api.createEgg, 'optional'],
     ['POST', /^\/api\/eggs\/([^/]+)\/report$/, api.reportEgg, 'optional'],
     ['GET', /^\/api\/me\/progress$/, api.progress, 'optional'],
