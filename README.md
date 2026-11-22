@@ -88,7 +88,7 @@ To host `frontend/` somewhere else, set `window.EGG_API_BASE` in `frontend/confi
 - **Time bonus:** up to +50% of the level's points, depending on how much of the level's timer is left.
 - **One clock per egg:** your clock on an egg starts the first time you play it and keeps running in real time. Leaving and coming back resumes it with the time it has left; it never resets. When it runs out, or you tap "Give up", you can retry right away with a fresh clock, but a retry earns no time bonus (and doesn't count for the 30 s stamp), because you've already had a look around.
 - **After a find**, the finder can hide the next egg at the same level within 30 minutes. If they skip, an older egg from that slot's pool rotates in. If the pool is empty, the found egg stays up.
-- **Empty slots** can be filled by anyone, which is how you seed a station.
+- **Hide an egg any time:** the station page's **+ Hide an egg** button lets anyone hide at any level, no find needed. An empty slot goes live at once; a slot that already has a live egg puts yours in its queue, and it rotates in once the live egg is found. A player can have at most 3 eggs waiting at a time.
 - **Rules:**
   - You can't play your own egg, and each egg scores once per player.
   - An egg is retired after 3 reports, or after 7 days live with no finds.

@@ -16,6 +16,7 @@ export const GRACE_SECONDS = 15; // upload time allowance after the clock hits z
 export const MAX_TIME_BONUS = 0.5; // up to +50% of the level's points
 export const RETIRE_AFTER_DAYS = 7;
 export const REPORTS_TO_RETIRE = 3;
+export const MAX_QUEUED_EGGS = 3; // eggs one player can have waiting for a busy slot
 export const HIDE_WINDOW_MINUTES = 30; // how long after a find you can hide the next egg
 
 // One clock per player per egg. It runs in real time from the first start, so leaving and coming
