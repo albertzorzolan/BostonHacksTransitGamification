@@ -28,7 +28,6 @@ const state = {
   config: null,
   stations: null,
   lastStationId: readStored('egg-last-station'),
-  raceTrain: readStored('egg-race-train') ?? false,
   line: readStored('egg-line'), // colour family the app is wearing: Red | Orange | Blue | Green | null
   play: null, // current round
   pendingHide: null, // { stationId, stationName, level, findId }
@@ -727,7 +726,6 @@ async function showStation(id, { here = false, distance = null } = {}) {
     : distance != null
       ? `<p class="stamp stamp-corner stamp-quiet">${fmtDist(distance)} away</p>`
       : '';
-  const raceNote = (on) => (on ? 'On. Your timer is the time until the next train (1.5 to 15 min).' : 'Off. Each level has its own timer.');
 
   app.innerHTML = `
     ${here ? '' : '<a class="back" href="#/stations"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>All stations</a>'}
@@ -741,10 +739,6 @@ async function showStation(id, { here = false, distance = null } = {}) {
       <div class="tk-perf" aria-hidden="true"></div>
       <div class="tk-bottom">
         <div id="next" class="next-row"><span class="route" aria-hidden="true"></span><div><p class="next-label">Next train</p><p class="next-to next-none">Loading live times</p></div></div>
-        <label class="race">
-          <span class="race-text"><b>Race the next train</b><small id="raceNote">${raceNote(state.raceTrain)}</small></span>
-          <input id="race" type="checkbox" role="switch" class="race-input" ${state.raceTrain ? 'checked' : ''} />
-        </label>
       </div>
     </section>
     ${challengeTicket(state.progress?.today)}
@@ -759,12 +753,6 @@ async function showStation(id, { here = false, distance = null } = {}) {
     </div>
     <ol class="stubs">${slots.map((s) => stubRow(s)).join('')}</ol>`;
 
-  $('#race').addEventListener('change', (e) => {
-    state.raceTrain = e.target.checked;
-    store('egg-race-train', state.raceTrain);
-    $('#raceNote').textContent = raceNote(state.raceTrain);
-  });
-
   app.querySelectorAll('[data-play]').forEach((btn) =>
     btn.addEventListener('click', async () => {
       if (btn.getAttribute('aria-disabled') === 'true') return;
@@ -772,7 +760,7 @@ async function showStation(id, { here = false, distance = null } = {}) {
       const slot = slots.find((s) => s.egg?.id === btn.dataset.play);
       const before = { hud: state.hud, progress: state.progress, card };
       try {
-        const round = await api('/api/attempts', { eggId: btn.dataset.play, mode: state.raceTrain ? 'train' : 'fixed' });
+        const round = await api('/api/attempts', { eggId: btn.dataset.play });
         state.play = { ...round, station, receivedAt: performance.now(), result: null, firstChance: slot?.egg?.timesFound === 0, before };
         if (round.attempt.resumed) toast(`Your clock kept running: ${fmtClock(round.attempt.secondsLeft)} left.`);
         location.hash = '#/play';
@@ -918,7 +906,7 @@ function viewPlay() {
           <div class="bonus"><p class="bonus-label">${attempt.retry ? 'Retry: no bonus' : 'Bonus right now'}</p><p class="bonus-val">+<span id="bonus">0</span></p></div>
         </div>
         <ol id="holes" class="punchclock" aria-hidden="true">${'<li></li>'.repeat(PUNCH_HOLES)}</ol>
-        <p class="clock-ctx">${attempt.limitSource === 'train' ? `Racing the ${esc(attempt.train?.headsign || 'next')} train. ` : ''}${attempt.retry ? "This is a retry, so there's no time bonus. " : `Each hole is ${Math.round(perHole)} seconds. The bonus drains as they go. `}Leaving doesn't stop your clock.</p>
+        <p class="clock-ctx">${attempt.retry ? "This is a retry, so there's no time bonus. " : `Each hole is ${Math.round(perHole)} seconds. The bonus drains as they go. `}Leaving doesn't stop your clock.</p>
       </div>
     </section>
     <div id="status"></div>
