@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { verifyMatch, checkGemini } from './verify.js';
+import { verifyMatch, checkGemini, screenEggPhoto } from './verify.js';
 import { isDuplicateKey } from './db.js';
 import * as game from './game.js';
 import * as slots from './slots.js';
@@ -57,6 +57,7 @@ export async function createApp({
   db,
   mbta,
   verify = verifyMatch,
+  screen = screenEggPhoto, // checks a photo before it's hidden as an egg
   geminiKey = '',
   geminiModel = 'gemini-3.1-flash-lite,gemini-3-flash-preview',
   now = () => new Date(),
@@ -87,7 +88,7 @@ export async function createApp({
   const photoUrl = (id) => `/photos/${id}.jpg`;
   const publicUser = (u) => ({ id: u._id, username: u.username, createdAt: u.createdAt });
   // Only the player themself sees their chat name: it's what keeps the group chat anonymous.
-  const selfUser = (u) => ({ ...publicUser(u), chatName: u.chatName ?? null, ...(u.tester && { tester: true }) });
+  const selfUser = (u) => ({ ...publicUser(u), chatName: u.chatName ?? null, email: u.email ?? null, ...(u.tester && { tester: true }) });
   const requireUser = (ctx) => ctx.user ?? fail(401, 'Sign in to play.');
   const hasFound = (userId, eggId, session) => col.finds.findOne({ userId, eggId }, { session, projection: { _id: 1 } });
 
@@ -279,6 +280,16 @@ export async function createApp({
   }
 
   const credentials = (body) => ({ username: String(body?.username ?? '').trim(), password: String(body?.password ?? '') });
+  // Every account is linked to an email. It's private: only its owner ever sees it.
+  const EMAIL_RE = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]{2,}$/;
+  const cleanEmail = (v) => {
+    const email = String(v ?? '').trim();
+    if (!email) fail(400, 'Enter your email.');
+    if (email.length > 254 || !EMAIL_RE.test(email)) fail(400, "That doesn't look like an email address.");
+    return email;
+  };
+  const emailTaken = async (email, exceptId = null) =>
+    Boolean(await col.users.findOne({ emailLower: email.toLowerCase(), ...(exceptId && { _id: { $ne: exceptId } }) }, { projection: { _id: 1 } }));
 
   // Finds plus payouts (a hider's bounty share) matching `match`, as { userId, stationId, points, find }.
   // Payout docs carry the same month/stationId/userId fields as finds, so one match fits both.
@@ -397,7 +408,7 @@ export async function createApp({
   const NOTIFY_LIMIT = 40;
   async function notificationsFor(user, { summary = false } = {}) {
     const seenAt = user.notificationsSeenAt ?? user.createdAt;
-    const mine = await col.eggs.find({ createdBy: user._id }, { projection: { photoId: 1, stationId: 1, level: 1, status: 1, createdAt: 1, timesFound: 1, hint: 1 } }).sort({ createdAt: -1 }).toArray();
+    const mine = await col.eggs.find({ createdBy: user._id }, { projection: { photoId: 1, stationId: 1, level: 1, status: 1, createdAt: 1, timesFound: 1, hint: 1, name: 1 } }).sort({ createdAt: -1 }).toArray();
     const eggIds = mine.map((e) => e._id);
     const none = async () => [];
     const [unseenFinds, finds] = await Promise.all([
@@ -415,6 +426,7 @@ export async function createApp({
       type: 'egg_hidden',
       at: e.createdAt,
       ...where(e),
+      name: e.name ?? null,
       hint: e.hint ?? null,
       photoUrl: photoUrl(e.photoId),
       timesFound: e.timesFound ?? 0,
@@ -566,17 +578,21 @@ export async function createApp({
       if (password.length < auth.PASSWORD_MIN) fail(400, `Password must be at least ${auth.PASSWORD_MIN} characters.`);
       if (password.length > auth.PASSWORD_MAX) fail(400, 'Password is too long.');
       if (await nameTaken(username)) fail(409, 'That username is taken.');
+      const email = cleanEmail(body?.email);
+      if (await emailTaken(email)) fail(409, 'An account already uses that email. Sign in instead.');
       const user = {
         _id: crypto.randomUUID(),
         username,
         usernameLower: username.toLowerCase(),
+        email,
+        emailLower: email.toLowerCase(),
         passwordHash: await auth.hashPassword(password),
         createdAt: now(),
       };
       try {
         await col.users.insertOne(user);
       } catch (err) {
-        if (isDuplicateKey(err)) fail(409, 'That username is taken.');
+        if (isDuplicateKey(err)) fail(409, 'That username or email is taken.');
         throw err;
       }
       return startSession(await ensureChatName(user), req);
@@ -584,8 +600,10 @@ export async function createApp({
 
     async login({ body, req }) {
       const { username, password } = credentials(body);
-      if (!username || !password || password.length > auth.PASSWORD_MAX) fail(400, 'Enter your username and password.');
-      const user = await col.users.findOne({ usernameLower: username.toLowerCase() });
+      if (!username || !password || password.length > auth.PASSWORD_MAX) fail(400, 'Enter your username or email, and your password.');
+      // Sign in with either the username or the account's email.
+      const key = username.toLowerCase();
+      const user = await col.users.findOne(key.includes('@') ? { emailLower: key } : { usernameLower: key });
       const ok = await auth.verifyPassword(password, user?.passwordHash ?? auth.DUMMY_HASH);
       if (!user || !ok) fail(401, 'Wrong username or password.');
       return startSession(user, req);
@@ -605,6 +623,20 @@ export async function createApp({
 
     async me(ctx) {
       return { user: selfUser(await ensureChatName(requireUser(ctx))) };
+    },
+
+    // Add or change the account's email (accounts made before emails were required add one here).
+    async updateEmail(ctx) {
+      const user = requireUser(ctx);
+      const email = cleanEmail(ctx.body?.email);
+      if (await emailTaken(email, user._id)) fail(409, 'Another account already uses that email.');
+      try {
+        await col.users.updateOne({ _id: user._id }, { $set: { email, emailLower: email.toLowerCase() } });
+      } catch (err) {
+        if (isDuplicateKey(err)) fail(409, 'Another account already uses that email.');
+        throw err;
+      }
+      return { user: selfUser({ ...user, email }) };
     },
 
     // ?summary=1 is the cheap poll: just the unseen count and the newest unseen finds.
@@ -1111,6 +1143,7 @@ export async function createApp({
           level: egg.level,
           levelName: info.name,
           points: info.points,
+          name: egg.name ?? null,
           hint: egg.hint,
           imageUrl: photoUrl(await displayPhotoId(egg)),
           blur: info.blur ? (info.blur >= 12 ? 'heavy' : 'light') : null,
@@ -1293,6 +1326,18 @@ export async function createApp({
         }
       }
       const hint = String(body?.hint ?? '').trim().slice(0, 80);
+      // What the photo shows, in the hider's words ("sticker", "red sign"). Checked against the photo.
+      const name = String(body?.name ?? '').trim().replace(/\s+/g, ' ');
+      if (name.length < 2) fail(400, 'Say what it is, like "sticker" or "red sign".');
+      if (name.length > 40) fail(400, 'Keep what it is short: 40 characters at most.');
+      if (/[<>]/.test(name)) fail(400, 'What it is can only be plain words.');
+      // Screen the photo first: no faces, a real object to find, not a blank wall.
+      // Cheap checks (slot taken, find already used) still run before the Gemini call.
+      if (!body?.findId) {
+        if (await slots.activeEgg(col, undefined, s.id, level)) fail(409, 'This level already has an egg. Find it first to earn the right to hide the next one.');
+      }
+      const screening = await screen({ jpeg: image.data, type: image.contentType, name, apiKey: geminiKey, model: geminiModel });
+      if (!screening.ok) fail(screening.problem === 'unavailable' ? 503 : 422, screening.message);
       const t = now();
       const eggId = crypto.randomUUID();
 
@@ -1316,7 +1361,7 @@ export async function createApp({
         await slots.placeEgg(
           col,
           session,
-          { _id: eggId, stationId: s.id, level, photoId, ...(displayPhotoId && { displayPhotoId }), hint, createdBy: user._id },
+          { _id: eggId, stationId: s.id, level, photoId, ...(displayPhotoId && { displayPhotoId }), name, hint, createdBy: user._id },
           t,
         );
       });
@@ -1377,29 +1422,30 @@ export async function createApp({
       const t = now();
       const month = game.monthKey(t);
       const since = new Date(t.getTime() - HUNTING_NOW_MS);
-      const count = (c, match, key = '$stationId') => c.aggregate([{ $match: match }, { $group: { _id: key, n: { $sum: 1 } } }]).toArray();
+      const count = (match, key = '$stationId') => [{ $match: match }, { $group: { _id: key, n: { $sum: 1 } } }];
       const [eggs, hunting, monthFinds, mine, keepers] = await Promise.all([
-        count(col.eggs, { status: 'active' }),
-        // Players who started a round in the last 15 minutes, per station (attempts only know the egg).
+        col.eggs.aggregate(count({ status: 'active' })).toArray(),
+        // distinct players with a round started recently, per station of the egg they're after
         col.attempts
           .aggregate([
             { $match: { startedAt: { $gt: since } } },
-            { $lookup: { from: col.eggs.collectionName, localField: 'eggId', foreignField: '_id', as: 'e' } },
-            { $group: { _id: { $first: '$e.stationId' }, users: { $addToSet: '$userId' } } },
-            { $project: { n: { $size: '$users' } } },
+            { $lookup: { from: 'eggs', localField: 'eggId', foreignField: '_id', as: 'egg', pipeline: [{ $project: { stationId: 1 } }] } },
+            { $unwind: '$egg' },
+            { $group: { _id: { s: '$egg.stationId', u: '$userId' } } },
+            { $group: { _id: '$_id.s', n: { $sum: 1 } } },
           ])
           .toArray(),
-        count(col.finds, { month }),
-        ctx.user ? count(col.finds, { userId: ctx.user._id }) : [],
-        // This month's Keeper per station: most finds, then most points, then username.
+        col.finds.aggregate(count({ month })).toArray(),
+        ctx.user ? col.finds.aggregate(count({ userId: ctx.user._id })).toArray() : [],
+        // this month's Keeper per station: most finds, then most points, then username
         col.finds
           .aggregate([
             { $match: { month } },
-            { $group: { _id: { stationId: '$stationId', userId: '$userId' }, n: { $sum: 1 }, points: { $sum: '$points' } } },
-            { $lookup: { from: col.users.collectionName, localField: '_id.userId', foreignField: '_id', as: 'u' } },
-            { $set: { username: { $first: '$u.username' } } },
-            { $sort: { n: -1, points: -1, username: 1 } },
-            { $group: { _id: '$_id.stationId', username: { $first: '$username' }, n: { $first: '$n' } } },
+            { $group: { _id: { s: '$stationId', u: '$userId' }, n: { $sum: 1 }, pts: { $sum: '$points' } } },
+            { $lookup: { from: 'users', localField: '_id.u', foreignField: '_id', as: 'user', pipeline: [{ $project: { username: 1 } }] } },
+            { $unwind: '$user' },
+            { $sort: { n: -1, pts: -1, 'user.username': 1 } },
+            { $group: { _id: '$_id.s', username: { $first: '$user.username' }, n: { $first: '$n' } } },
           ])
           .toArray(),
       ]);
@@ -1701,6 +1747,7 @@ export async function createApp({
     ['POST', /^\/api\/eggs\/([^/]+)\/report$/, api.reportEgg, 'optional'],
     ['GET', /^\/api\/me\/progress$/, api.progress, 'optional'],
     ['POST', /^\/api\/me\/names$/, api.updateNames, 'optional'],
+    ['POST', /^\/api\/me\/email$/, api.updateEmail, 'optional'],
     ['GET', /^\/api\/me\/notifications$/, api.notifications, 'optional'],
     ['POST', /^\/api\/admin\/seed$/, api.adminSeed, 'none'],
     ['POST', /^\/api\/trains\/check$/, api.trainCheck, 'optional'],

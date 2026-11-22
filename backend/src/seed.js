@@ -4,7 +4,7 @@
 // so removeSeed() takes all of it out again.
 // Used by scripts/seed.js (CLI) and by POST /api/admin/seed (only when SEED_TOKEN is set).
 import crypto from 'node:crypto';
-import { scenePhoto, FIND_OBJECTS } from './seedArt.js';
+import { scenePhoto, FIND_OBJECTS, nameFromHint } from './seedArt.js';
 import * as game from './game.js';
 import { hashPassword } from './auth.js';
 import { blurredCopy } from './images.js';
@@ -138,7 +138,7 @@ export async function refreshSeedPhotos(col, now = new Date()) {
     const key = `${egg.stationId}:${egg.level}:${n}`;
     n += 1;
     const buf = await scenePhoto({ hint, colour, key });
-    const set = { photoId: await savePhotoDoc(col, buf, tag, now) };
+    const set = { photoId: await savePhotoDoc(col, buf, tag, now), ...(!egg.name && { name: nameFromHint(hint) }) };
     const sigma = game.levelInfo(egg.level).blur;
     if (egg.status !== 'retired' && sigma) set.displayPhotoId = await savePhotoDoc(col, await blurredCopy(buf, sigma), tag, now);
     old.push(egg.photoId, egg.displayPhotoId);
@@ -221,6 +221,7 @@ export async function addSeed(col, now = new Date(), batch = null) {
       photoId,
       ...(displayPhotoId && { displayPhotoId }),
       hint,
+      name: nameFromHint(hint), // what it is, shown to finders
       createdBy: who(n)._id,
       createdAt,
       status: 'active',
@@ -244,7 +245,7 @@ export async function addSeed(col, now = new Date(), batch = null) {
     const photoId = await savePhoto(await scenePhoto({ hint: object, colour, key: `${stationId}:${level}:${n}`, view: 1 })); // the finder's photo
     const foundAt = ago(60 * (30 - n * 1.5));
     const eggId = id();
-    await col.eggs.insertOne({ _id: eggId, stationId, level, photoId: eggPhotoId, hint: null, createdBy: hider._id, createdAt: ago(60 * 48), status: 'retired', retiredAt: foundAt, activatedAt: ago(60 * 48), timesFound: 1, avgFindSeconds: secondsTaken, ...tag });
+    await col.eggs.insertOne({ _id: eggId, stationId, level, photoId: eggPhotoId, hint: null, name: nameFromHint(object), createdBy: hider._id, createdAt: ago(60 * 48), status: 'retired', retiredAt: foundAt, activatedAt: ago(60 * 48), timesFound: 1, avgFindSeconds: secondsTaken, ...tag });
     const score = game.scoreFind(level, secondsTaken, game.ROUND_SECONDS);
     await col.finds.insertOne({
       _id: id(),

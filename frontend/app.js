@@ -81,6 +81,7 @@ function toast(msg, ms = 2600) {
   const el = $('#toast');
   el.textContent = msg;
   el.hidden = false;
+  el.onclick = () => (el.hidden = true); // tap to dismiss
   clearTimeout(toast.t);
   toast.t = setTimeout(() => (el.hidden = true), ms);
 }
@@ -347,9 +348,12 @@ async function checkArrival() {
   const s = fresh.find((x) => x.id === st.id) ?? st;
   const left = s.playable ?? 0;
   const href = `#/station/${encodeURIComponent(s.id)}`;
-  if (left) notifyPlayer(`You're at ${s.name}.`, `Find your eggs today: ${plural(left, 'egg')} waiting for you here.`, href);
-  else if (s.activeEggs) notifyPlayer(`You're at ${s.name}.`, "You've cleared every egg here today. Hide a new one!", href);
-  else notifyPlayer(`You're at ${s.name}.`, 'No eggs here yet. Hide the first one today!', href);
+  // The Here tab and the station's own page already say all this: don't cover them with a toast.
+  const h = location.hash || '#/';
+  if (document.visibilityState === 'visible' && (h === '#/' || h === href)) return;
+  if (left) notifyPlayer(`${s.name}:`, `${plural(left, 'egg')} for you here.`, href);
+  else if (s.activeEggs) notifyPlayer(`${s.name}:`, 'you found every egg here.', href);
+  else notifyPlayer(`${s.name}:`, 'no eggs yet. Hide the first.', href);
 }
 
 // ---------- trains ----------
@@ -786,6 +790,11 @@ async function render() {
     drawHud();
     return viewSignup();
   }
+  if (!state.user.email) {
+    $('#tabs').hidden = true;
+    drawHud();
+    return viewAddEmail();
+  }
   const hash = location.hash || '#/';
   const playing = hash.startsWith('#/play') || hash.startsWith('#/hide');
   $('#hud').classList.toggle('hud-quiet', playing);
@@ -876,8 +885,11 @@ function viewSignup(mode = 'register') {
           <button type="button" role="tab" data-mode="register" aria-selected="${registering}">Create account</button>
           <button type="button" role="tab" data-mode="login" aria-selected="${!registering}">Sign in</button>
         </div>
-        <label class="field-label" for="username">Username</label>
-        <input id="username" class="input" maxlength="20" autocomplete="username" autocapitalize="none" placeholder="e.g. kenmore_kid" required />
+        ${registering ? `<label class="field-label" for="email">Email</label>
+        <input id="email" class="input" type="email" maxlength="254" autocomplete="email" autocapitalize="none" inputmode="email" required />
+        <p class="field-hint">Private. Only you see it, and you can sign in with it.</p>` : ''}
+        <label class="field-label" for="username">${registering ? 'Username' : 'Username or email'}</label>
+        <input id="username" class="input" maxlength="${registering ? 20 : 254}" autocomplete="username" autocapitalize="none" ${registering ? 'placeholder="e.g. kenmore_kid"' : ''} required />
         ${registering ? '<p class="field-hint">Shown on leaderboards. Group chats use a separate anonymous name.</p>' : ''}
         <label class="field-label" for="password">Password ${registering ? `<span class="opt">(at least ${min} characters)</span>` : ''}</label>
         <input id="password" class="input" type="password" maxlength="200" ${registering ? `minlength="${min}"` : ''} autocomplete="${registering ? 'new-password' : 'current-password'}" required />
@@ -895,6 +907,7 @@ function viewSignup(mode = 'register') {
       const data = await api(registering ? '/api/auth/register' : '/api/auth/login', {
         username: $('#username').value,
         password: $('#password').value,
+        ...(registering && { email: $('#email').value }),
       });
       setSession(data);
       startLocation();
@@ -912,6 +925,40 @@ function viewSignup(mode = 'register') {
       if (t && b.lines.length) t.innerHTML = lineWar(b.lines, { title: 'Line war this month', sub: 'Every find scores for its line' });
     })
     .catch(() => {});
+}
+
+// Accounts made before emails were required add one before they keep playing.
+function viewAddEmail() {
+  app.innerHTML = `
+    <form id="emailForm" class="tk welcome">
+      ${BAND_LINES}
+      <div class="tk-top">
+        <h1 class="welcome-h">Add your email</h1>
+        <p class="welcome-p">Every Lookout account is now linked to an email. It stays private, and you can sign in with it.</p>
+      </div>
+      <div class="tk-perf" aria-hidden="true"></div>
+      <div class="tk-bottom stack">
+        <label class="field-label" for="email">Email</label>
+        <input id="email" class="input" type="email" maxlength="254" autocomplete="email" autocapitalize="none" inputmode="email" required />
+        <button class="btn btn-ink btn-block btn-l">Save and keep playing</button>
+        <button id="emailOut" class="btn btn-ghost btn-block" type="button">Sign out</button>
+        <div id="err"></div>
+      </div>
+    </form>`;
+  $('#emailOut').addEventListener('click', () => signOut({ remote: true }));
+  $('#emailForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = $('#emailForm .btn-ink');
+    btn.disabled = true;
+    try {
+      const { user } = await api('/api/me/email', { email: $('#email').value });
+      setSession({ user: { ...state.user, ...user }, token: state.token });
+      render();
+    } catch (err) {
+      $('#err').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+      btn.disabled = false;
+    }
+  });
 }
 
 // ---------- Here: the station you're standing in ----------
@@ -939,6 +986,61 @@ async function viewHere() {
   }
   return showLocating(stations);
 }
+
+// ---------- next trains, both directions ----------
+// One row per line and direction at a station: where it goes, the next train, and the two after it.
+// Green Line branches share a row per direction (each train shows its own branch).
+const minsText = (sec) => (sec < 60 ? 'Now' : `${Math.round(sec / 60)} min`);
+function trainRows(trains) {
+  const rows = new Map();
+  for (const t of trains) {
+    if (t.seconds <= -20) continue;
+    const fam = family(t.routeId);
+    const key = `${fam}|${t.directionId ?? t.headsign}`;
+    if (!rows.has(key)) rows.set(key, { fam, color: t.color, dirName: t.directionName, destination: t.destination, trains: [] });
+    rows.get(key).trains.push(t);
+  }
+  const order = { Red: 0, Mattapan: 1, Orange: 2, Blue: 3, Green: 4 };
+  return [...rows.values()].sort((a, b) => (order[a.fam] ?? 9) - (order[b.fam] ?? 9) || String(a.dirName).localeCompare(String(b.dirName)));
+}
+function trainBoardHtml(trains, error) {
+  const rows = trainRows(trains);
+  if (!rows.length) return `<p class="dirs-none">${esc(trainsUnavailable(error))}</p>`;
+  return `<ul class="dirs">${rows
+    .map((r) => {
+      const [next, ...more] = r.trains;
+      const green = r.fam === 'Green';
+      const bound = r.dirName ? `${r.dirName}bound` : '';
+      const title = green ? bound || 'Green Line' : r.destination || next.headsign || r.fam;
+      const branch = (t) => (green && /^Green-[A-E]$/.test(t.routeId) ? `${t.routeId.slice(-1)} ` : '');
+      const sub = [
+        green ? `${branch(next)}${next.headsign}` : next.headsign && next.headsign !== title ? `To ${next.headsign}` : bound,
+        more.length ? `then ${more.slice(0, 2).map((t) => (green ? `${branch(t)}${minsText(t.seconds)}` : minsText(t.seconds))).join(', ')}` : '',
+      ].filter(Boolean).join(', ');
+      return `<li style="--ln:${esc(r.color)}">
+        <span class="route" aria-hidden="true"></span>
+        <div class="dirs-txt"><p class="dirs-to">${esc(title)}</p>${sub ? `<p class="dirs-sub">${esc(sub)}</p>` : ''}</div>
+        <p class="dirs-min">${next.seconds < 60 ? '<span class="now">Now</span>' : `${Math.round(next.seconds / 60)}<small>min</small>`}</p>
+      </li>`;
+    })
+    .join('')}</ul>`;
+}
+// Fills `box` with the station's board and refreshes it every 30 s while the page is open.
+function startTrainBoard(box, stationId) {
+  if (!box) return;
+  const load = async () => {
+    if (!box.isConnected) return;
+    try {
+      const { trains, error } = await api(`/api/stations/${encodeURIComponent(stationId)}/predictions`);
+      box.innerHTML = trainBoardHtml(trains, error);
+    } catch (err) {
+      box.innerHTML = trainBoardHtml([], err.message);
+    }
+  };
+  load();
+  every(30_000, load);
+}
+const TRAIN_BOARD = '<div class="train-board" aria-live="polite"><p class="next-label">Next trains</p><div id="next"><p class="dirs-none">Loading live times</p></div></div>';
 
 const BAND_LINES = '<div class="band band-lines" aria-hidden="true"><i style="--ln:var(--line-red)"></i><i style="--ln:var(--line-orange)"></i><i style="--ln:var(--line-blue)"></i><i style="--ln:var(--line-green)"></i></div>';
 
@@ -978,6 +1080,7 @@ function showNearby(stations, n) {
       </div>
       <div class="tk-perf" aria-hidden="true"></div>
       <div class="tk-bottom stack">
+        ${TRAIN_BOARD}
         <a class="btn btn-primary btn-block" href="#/station/${encodeURIComponent(n.station.id)}">See ${esc(n.station.name)}</a>
         <a class="btn btn-ghost btn-block" href="#/map">Open the map</a>
       </div>
@@ -985,6 +1088,7 @@ function showNearby(stations, n) {
     <h2 class="sec-h">Stations near you</h2>
     ${stationSearch()}`;
   wireStationSearch(stations);
+  startTrainBoard($('#next'), n.station.id);
 }
 
 function stationSearch() {
@@ -1065,7 +1169,7 @@ async function showStation(id, { here = false, distance = null } = {}) {
       </div>
       <div class="tk-perf" aria-hidden="true"></div>
       <div class="tk-bottom">
-        <div id="next" class="next-row"><span class="route" aria-hidden="true"></span><div><p class="next-label">Next train</p><p class="next-to next-none">Loading live times</p></div></div>
+        ${TRAIN_BOARD}
       </div>
     </section>
     ${challengeTicket(state.progress?.today)}
@@ -1078,7 +1182,7 @@ async function showStation(id, { here = false, distance = null } = {}) {
         <p class="clear-note">${card.cleared ? '<b>Cleared.</b> Every egg here is punched.' : `<b>${card.found} of ${card.playable}</b> found here`}</p>
       </div>` : ''}
     </div>
-    <ol class="stubs">${slots.map((s) => stubRow(s)).join('')}</ol>`;
+    <ol class="stubs">${stubsHtml(slots)}</ol>`;
 
   app.querySelectorAll('[data-play]').forEach((btn) =>
     btn.addEventListener('click', async () => {
@@ -1104,23 +1208,7 @@ async function showStation(id, { here = false, distance = null } = {}) {
     }),
   );
 
-  const loadTrains = async () => {
-    const box = $('#next');
-    if (!box) return;
-    try {
-      const { trains, error } = await api(`/api/stations/${encodeURIComponent(id)}/predictions`);
-      const t = trains.find((x) => x.seconds > -20);
-      box.innerHTML = t
-        ? `<span class="route" style="--ln:${esc(t.color)}" aria-hidden="true"></span>
-           <div><p class="next-label">Next train${t.line ? `, ${esc(t.line)}` : ''}</p><p class="next-to">${esc(t.headsign || t.line)}</p></div>
-           <p class="next-min">${t.seconds < 60 ? '<span class="now">Now</span>' : `${Math.round(t.seconds / 60)}<small>min</small>`}</p>`
-        : `<span class="route" aria-hidden="true"></span><div><p class="next-label">Next train</p><p class="next-to next-none">${esc(trainsUnavailable(error))}</p></div>`;
-    } catch (err) {
-      box.innerHTML = `<span class="route" aria-hidden="true"></span><div><p class="next-label">Next train</p><p class="next-to next-none">${esc(trainsUnavailable(err.message))}</p></div>`;
-    }
-  };
-  loadTrains();
-  every(30_000, loadTrains);
+  startTrainBoard($('#next'), id);
 
   // Running clocks on this page keep counting down; when one hits zero, reload to show the lock.
   const running = [...app.querySelectorAll('[data-ends]')];
@@ -1133,6 +1221,31 @@ async function showStation(id, { here = false, distance = null } = {}) {
       }
     });
   }
+}
+
+// Stamp text size: as big as fits, so a long word ("Impossible", "Massachusetts") stays whole
+// on one line and a long name ("Boston University Central") fits in the circle.
+function sealFont(name) {
+  const inner = 58; // px of text width inside an 80px stamp
+  const words = name.split(/\s+/);
+  const longest = Math.max(...words.map((w) => w.length));
+  const byWord = inner / (longest * 0.55);
+  const byLines = 46 / (Math.min(words.length, 3) * 1.1); // up to 3 lines tall
+  return Math.max(8, Math.min(13.5, byWord, byLines)).toFixed(1);
+}
+
+// Eggs you can play first, then yours and ones you've found; empty slots fold into one row.
+function stubsHtml(slots) {
+  const rank = (s) => (!s.egg ? 3 : s.egg.mine || s.egg.foundByMe ? 2 : 1);
+  const filled = slots.filter((s) => s.egg).sort((a, b) => rank(a) - rank(b) || a.level - b.level);
+  const empty = slots.filter((s) => !s.egg);
+  const emptyRow = empty.length
+    ? `<li class="stub-empties">
+        <p><b>${empty.length === slots.length ? 'No eggs here yet.' : `${plural(empty.length, 'empty slot')}.`}</b> Hide one and earn points when it's found.</p>
+        <div class="hide-chips">${empty.map((s) => `<button class="hide-chip" type="button" data-hide="${s.level}"><b>${s.level}</b>${esc(s.name)}<span class="hide-pts">${s.points}</span></button>`).join('')}</div>
+      </li>`
+    : '';
+  return filled.map((s) => stubRow(s)).join('') + emptyRow;
 }
 
 function stubRow(slot) {
@@ -1220,10 +1333,11 @@ function viewPlay() {
     <section class="tk play-tk">
       <div class="tk-top">
         <div class="egg-photo">
-          <img src="${apiUrl(egg.imageUrl)}" alt="The egg to find: a photo of something in this station" />
+          <img src="${apiUrl(egg.imageUrl)}" alt="The egg to find: ${egg.name ? esc(egg.name) : 'a photo of something in this station'}" />
           ${tag ? `<p class="first-tag">${esc(tag)}</p>` : ''}
           ${egg.blur ? `<p class="blur-tag">${egg.blur === 'heavy' ? 'Heavily blurred' : 'Blurred'}: ${esc(egg.levelName)}</p>` : ''}
         </div>
+        ${egg.name ? `<p class="hint"><b>Find</b> ${esc(egg.name)}</p>` : ''}
         ${egg.hint ? `<p class="hint"><b>Hint</b> ${esc(egg.hint)}</p>` : ''}
       </div>
       <div class="tk-perf" aria-hidden="true"></div>
@@ -1502,6 +1616,9 @@ function viewHide() {
       </div>
       <div class="tk-perf" aria-hidden="true"></div>
       <div class="tk-bottom">
+        <label class="field-label" for="eggName">What is it?</label>
+        <input id="eggName" class="input" maxlength="40" required placeholder="e.g. sticker, red sign, cracked tile" />
+        <p class="field-hint">Finders see this. It has to match what's in the photo.</p>
         <label class="field-label" for="hint">Hint <span class="opt">(optional, one line)</span></label>
         <input id="hint" class="input" maxlength="80" placeholder="e.g. near the stairs to outbound" />
         <p class="clock-ctx">You score when your egg beats people. Each player who runs out of time adds to its bounty, and you get half when someone finally finds it. An egg nobody finds pays nothing, so make it hard but findable.</p>
@@ -1533,10 +1650,17 @@ function viewHide() {
 
   $('#submit').addEventListener('click', async () => {
     const btn = $('#submit');
+    const name = $('#eggName').value.trim();
+    if (name.length < 2) {
+      $('#err').innerHTML = '<div class="notice bad">Say what it is, like "sticker" or "red sign".</div>';
+      $('#eggName').focus();
+      return;
+    }
     btn.disabled = true;
-    btn.textContent = 'Hiding';
+    btn.textContent = 'Checking your photo';
+    $('#err').innerHTML = '';
     try {
-      await api('/api/eggs', { stationId: hide.stationId, level: hide.level, findId: hide.findId, hint: $('#hint').value, image });
+      await api('/api/eggs', { stationId: hide.stationId, level: hide.level, findId: hide.findId, name, hint: $('#hint').value, image });
       state.pendingHide = null;
       state.stations = null; // egg counts changed
       toast('Egg hidden. Now someone else has to find it.');
@@ -1889,9 +2013,9 @@ async function viewProfile() {
       .join('')}</ol>
     <div class="eggs-head"><h2 class="sec-h">Stamps</h2><p class="eggs-count">${earned} of ${progress.stamps.length}</p></div>
     <ul class="stamps">${progress.stamps
-      .map((s) => `<li class="st ${s.earned ? 'is-got' : ''}"><span class="st-seal">${esc(s.name)}</span><p>${s.earned || s.target === 1 ? esc(s.description) : `${esc(s.description)} ${s.progress} of ${s.target}.`}</p></li>`)
+      .map((s) => `<li class="st ${s.earned ? 'is-got' : ''}"><span class="st-seal" style="font-size:${sealFont(s.name)}px">${esc(s.name)}</span><p>${s.earned || s.target === 1 ? esc(s.description) : `${esc(s.description)} ${s.progress} of ${s.target}.`}</p></li>`)
       .join('')}${progress.stations
-      .map((s) => `<li class="st is-got"><span class="st-seal st-station" style="--ln:${LINE_VAR[s.lines[0]] ?? 'var(--stamp)'}">${esc(s.name)}</span><p>${plural(s.finds, 'find')} here</p></li>`)
+      .map((s) => `<li class="st is-got"><span class="st-seal st-station" style="--ln:${LINE_VAR[s.lines[0]] ?? 'var(--stamp)'};font-size:${sealFont(s.name)}px">${esc(s.name)}</span><p>${plural(s.finds, 'find')} here</p></li>`)
       .join('')}</ul>` : ''}
     <div class="eggs-head"><h2 class="sec-h">Recent finds</h2><p class="eggs-count">${plural(p.recentFinds.length, 'find')}</p></div>
     ${ticketsGrid(p.recentFinds)}
@@ -1941,7 +2065,7 @@ async function viewNotifications() {
   const row = (n) =>
     n.type === 'egg_found'
       ? `<li class="${n.unseen ? 'is-new' : ''}"><span class="act-ic" aria-hidden="true">🎉</span><p><b>${esc(n.by)}</b> found your ${esc(n.levelName)} egg at ${at(n)}<small>${fmtWhen(n.at)}${n.unseen ? ' · New' : ''}</small></p><b class="act-pts">+${n.points}</b></li>`
-      : `<li class="nt-egg"><img src="${apiUrl(n.photoUrl)}" alt="Your egg at ${esc(n.stationName)}" loading="lazy" /><p>You hid a ${esc(n.levelName)} egg at ${at(n)}${n.hint ? `<small>Hint: ${esc(n.hint)}</small>` : ''}<small>${fmtWhen(n.at)} · ${EGG_STATUS[n.status] ?? esc(n.status)} · ${n.timesFound ? `found ${plural(n.timesFound, 'time')}` : 'not found yet'}</small></p></li>`;
+      : `<li class="nt-egg"><img src="${apiUrl(n.photoUrl)}" alt="Your egg at ${esc(n.stationName)}" loading="lazy" /><p>You hid a ${esc(n.levelName)} egg${n.name ? ` (${esc(n.name)})` : ''} at ${at(n)}${n.hint ? `<small>Hint: ${esc(n.hint)}</small>` : ''}<small>${fmtWhen(n.at)} · ${EGG_STATUS[n.status] ?? esc(n.status)} · ${n.timesFound ? `found ${plural(n.timesFound, 'time')}` : 'not found yet'}</small></p></li>`;
   const ask = 'Notification' in window && Notification.permission === 'default';
   app.innerHTML = `
     <h1 class="page-h">Notifications</h1>
@@ -2575,13 +2699,16 @@ function makeTrainLayer() {
 async function viewMap() {
   loading('Loading the map');
   const [{ stations, totals }, , linesData, statsData] = await Promise.all([
-    api('/api/stations'), // fresh egg counts every time the map opens
+    api('/api/stations'), // fresh counts, including how many eggs are still left for you
     loadLeaflet(),
     api('/api/map/lines').catch(() => ({ lines: [] })),
     api('/api/map/stations').catch(() => ({ stations: [] })),
   ]);
   state.stations = stations;
   const stats = new Map(statsData.stations.map((s) => [s.id, s]));
+  // Eggs you can still find at each station (not yours, not already found). Only known when signed in.
+  const leftFor = new Map(stations.map((s) => [s.id, s.playable]));
+  const allFound = (id) => (stats.get(id)?.activeEggs ?? 0) > 0 && leftFor.get(id) === 0;
   const root = getComputedStyle(document.documentElement);
   const tok = (n) => root.getPropertyValue(n).trim();
   const motion = !reducedMotion();
@@ -2611,6 +2738,7 @@ async function viewMap() {
       <div class="tk-bottom map-key">
         <ul class="legend">
           <li><span class="lg-stn has-eggs" style="--ln:var(--line-green)"><b>3</b></span>Eggs up</li>
+          <li><span class="lg-stn has-eggs done" style="--ln:var(--line-blue)"><b>2</b></span>All found by you</li>
           <li><span class="lg-stn" style="--ln:var(--line-green)"></span>No eggs yet</li>
           <li><span class="lg-stn mine" style="--ln:var(--line-green)"></span>You found eggs here</li>
           <li><span class="lg-stn live" style="--ln:var(--line-green)"></span>Someone hunting now</li>
@@ -2735,7 +2863,7 @@ async function viewMap() {
     const st = stats.get(s.id);
     const fams = familiesOf(s.lines);
     const n = st?.activeEggs ?? 0;
-    const cls = ['stn', n ? 'has-eggs' : '', fams.length > 1 ? 'hub' : '', st?.huntingNow ? 'live' : '', st?.yourFinds ? 'mine' : '', selected ? 'sel' : ''].filter(Boolean).join(' ');
+    const cls = ['stn', n ? 'has-eggs' : '', fams.length > 1 ? 'hub' : '', st?.huntingNow ? 'live' : '', st?.yourFinds ? 'mine' : '', allFound(s.id) ? 'done' : '', selected ? 'sel' : ''].filter(Boolean).join(' ');
     const size = n ? 26 : 14;
     return L.divIcon({ className: 'stn-wrap', iconSize: [size, size], iconAnchor: [size / 2, size / 2], html: `<span class="${cls}" style="--ln:${LINE_VAR[fams[0]] ?? 'var(--ink)'}">${n ? `<b>${n}</b>` : ''}</span>` });
   };
@@ -2793,7 +2921,7 @@ async function viewMap() {
       </div>
       <div class="sheet-top">
         <h2 class="sheet-h">${esc(s.name)}</h2>
-        <p class="sheet-sub">${dist != null ? (dist <= RANGE_METERS ? "You're here." : `${fmtDist(dist)} from you.`) : ''}</p>
+        <p class="sheet-sub">${[dist != null ? (dist <= RANGE_METERS ? "You're here." : `${fmtDist(dist)} from you.`) : '', st.activeEggs && leftFor.get(s.id) != null ? (leftFor.get(s.id) ? `${plural(leftFor.get(s.id), 'egg')} left for you.` : "You've found every egg here.") : ''].filter(Boolean).join(' ')}</p>
         ${st.keeper ? `<p class="stamp sheet-keeper">Keeper: ${esc(st.keeper.username)}</p>` : ''}
       </div>
       <div class="tk-perf" aria-hidden="true"></div>

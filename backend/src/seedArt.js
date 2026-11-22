@@ -116,3 +116,9 @@ export const scenePhoto = (opts) => sharp(Buffer.from(sceneSvg(opts))).jpeg({ qu
 
 // Retired eggs (behind past finds) have no hint: give each a plausible object.
 export const FIND_OBJECTS = ['Sticker on a pillar', 'Mosaic tile', 'Bronze plaque', 'Station clock', 'Painted smiley', 'Railing detail', 'Old lamp', 'Tiny trinket', 'Map sign'];
+
+// A short "what it is" name for an egg, from its hint: "Brass plaque by the stairs" -> "brass plaque".
+export function nameFromHint(hint) {
+  const head = String(hint ?? '').split(/\s+(?:by|on|next to|near|at|in|above|with|set|glued|wedged|beside|under)\s+/i)[0];
+  return head.replace(/["']/g, '').trim().toLowerCase().slice(0, 40) || 'something in the station';
+}
