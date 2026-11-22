@@ -20,6 +20,8 @@ const STATIONS = [
   { id: 'test-green', name: 'Test Green', lat: 42.35, lng: -71.09, lines: [{ id: 'Green-B', name: 'Green Line B', color: '#00843D' }] },
   { id: 'test-redgreen', name: 'Test Red Green', lat: 42.355, lng: -71.06, lines: [{ id: 'Red', name: 'Red Line', color: '#DA291C' }, { id: 'Green-B', name: 'Green Line B', color: '#00843D' }] },
   { id: 'test-blur', name: 'Test Blur', lat: 42.36, lng: -71.07, lines: [{ id: 'Orange', name: 'Orange Line', color: '#ED8B00' }] },
+  { id: 'test-count', name: 'Test Count', lat: 42.37, lng: -71.08, lines: [{ id: 'Blue', name: 'Blue Line', color: '#003DA5' }] },
+  { id: 'test-activity', name: 'Test Activity', lat: 42.38, lng: -71.09, lines: [{ id: 'Red', name: 'Red Line', color: '#DA291C' }] },
 ];
 const fakeMbta = {
   loadStations: async () => STATIONS,
@@ -366,12 +368,17 @@ test('group sticker chat: members only, stickers only, polling, rate limit', asy
   assert.equal((await call(chat, { sticker: '<img src=x>' }, kai)).status, 400, 'unknown sticker');
 
   const first = await ok(chat, { sticker: 'crown' }, kai);
-  assert.deepEqual([first.message.emoji, first.message.label, first.message.username, first.message.seq], ['👑', "Who's the king now", 'kai', 1]);
+  assert.deepEqual([first.message.emoji, first.message.label, first.message.name, first.message.mine, first.message.seq], ['👑', "Who's the king now", kai.chatName, true, 1]);
   await ok(chat, { sticker: 'snail' }, lou);
 
+  // Anonymous: senders show by chat name only, with no username or user id.
   const all = await ok(chat, null, lou);
-  assert.deepEqual(all.messages.map((m) => [m.username, m.sticker]), [['kai', 'crown'], ['lou', 'snail']]);
-  assert.equal(all.messages.some((m) => 'text' in m), false);
+  assert.deepEqual(all.messages.map((m) => [m.name, m.mine, m.sticker]), [[kai.chatName, false, 'crown'], [lou.chatName, true, 'snail']]);
+  assert.equal(all.messages.some((m) => 'text' in m || 'username' in m || 'userId' in m), false);
+  assert.equal(JSON.stringify(all).includes(kai.id), false);
+  // A new chat name shows on old messages too.
+  await ok('/api/me/names', { chatName: 'Masked Crown' }, kai);
+  assert.equal((await ok(chat, null, lou)).messages[0].name, 'Masked Crown');
   // Polling returns only what's new.
   assert.deepEqual((await ok(`${chat}?after=2`, null, kai)).messages, []);
   await ok(chat, { sticker: 'fire' }, kai);
@@ -451,6 +458,31 @@ test('every level has a 3-minute timer; Extreme and Impossible show a blurred ph
   assert.equal((await call('/api/eggs', { stationId: 'test-blur', level: 4, image: junk }, hider)).status, 400);
 });
 
+test('station list: egg count at every station, what each player can still find, totals', async () => {
+  const [ann, bo, cy] = [await user('countann'), await user('countbo'), await user('countcy')];
+  await ok('/api/eggs', { stationId: 'test-count', level: 1, image: IMG }, ann);
+  await ok('/api/eggs', { stationId: 'test-count', level: 2, image: IMG }, ann);
+  const eggId = (await ok('/api/stations/test-count')).slots[0].egg.id;
+  const r = await ok('/api/attempts', { eggId }, bo);
+  await ok(`/api/attempts/${r.attempt.id}/find`, { image: IMG }, bo);
+
+  const pick = (d) => d.stations.find((s) => s.id === 'test-count');
+  const anon = await ok('/api/stations');
+  assert.equal(anon.stations.length, STATIONS.length, 'every station is listed');
+  assert.ok(anon.stations.every((s) => Number.isInteger(s.activeEggs)), 'every station has a count, 0 included');
+  assert.equal(pick(anon).activeEggs, 2);
+  assert.equal('playable' in pick(anon), false, 'no per-player numbers when signed out');
+  assert.equal(anon.totals.eggs, anon.stations.reduce((n, s) => n + s.activeEggs, 0));
+  assert.equal(anon.totals.stationsWithEggs, anon.stations.filter((s) => s.activeEggs).length);
+  assert.equal(anon.totals.stations, STATIONS.length);
+
+  assert.equal(pick(await ok('/api/stations', null, ann)).playable, 0, 'both are ann\'s own');
+  assert.equal(pick(await ok('/api/stations', null, bo)).playable, 1, 'bo found one');
+  const forCy = await ok('/api/stations', null, cy);
+  assert.equal(pick(forCy).playable, 2);
+  assert.equal(forCy.totals.playable, forCy.stations.reduce((n, s) => n + s.playable, 0));
+});
+
 test('bad input, CORS, health and static files', async () => {
   assert.equal((await call('/api/auth/register', { username: '<script>', password: PW })).status, 400);
   const lee = await user('lee');
@@ -519,4 +551,95 @@ test('progress: rider level, daily challenge, stamps, stations and lines', async
   assert.deepEqual([p.level.level, p.level.floor, p.level.next], [3, 150, 300]);
   assert.ok(['transfer', 'racer', 'climber', 'triple'].includes(p.today.id));
   assert.equal(p.today.target >= p.today.progress, true);
+});
+
+test('names: a username plus an anonymous chat name, both changeable, one namespace', async () => {
+  const ada = await user('ada');
+  assert.match(ada.chatName, /^[A-Z][a-z]+ [A-Z][a-z]+ \d{2}$/, 'a random chat name at sign-up');
+  assert.notEqual(ada.chatName, ada.username);
+  // Other players never see it.
+  const bo = await user('bo');
+  const seen = await ok(`/api/users/${ada.id}`, null, bo);
+  assert.equal('chatName' in seen.user, false);
+  assert.equal('activity' in seen, false, 'activity is private');
+
+  const names = (body, as = ada) => call('/api/me/names', body, as);
+  assert.equal((await ok('/api/me/names', { chatName: '  Night   Owl ' }, ada)).user.chatName, 'Night Owl');
+  assert.equal((await ok('/api/auth/me', null, ada)).user.chatName, 'Night Owl');
+  assert.equal((await names({ chatName: 'x' })).status, 400, 'too short');
+  assert.equal((await names({ chatName: '<b>hi</b>' })).status, 400);
+  assert.equal((await names({ chatName: 'ADA' })).status, 400, "can't be your own username");
+  assert.equal((await names({ chatName: 'bo' })).status, 409, "can't look like someone else's username");
+  assert.equal((await names({ chatName: 'night owl' }, bo)).status, 409, 'chat names are unique');
+  assert.equal((await call('/api/auth/register', { username: 'Night Owl', password: PW })).status, 409, 'and usernames avoid chat names');
+
+  // Username changes: login uses the new one; the old one is free again.
+  assert.equal((await names({ username: 'Bo' })).status, 409);
+  assert.equal((await ok('/api/me/names', { username: 'ada_lovelace' }, ada)).user.username, 'ada_lovelace');
+  assert.equal((await call('/api/auth/login', { username: 'ada', password: PW })).status, 401);
+  await ok('/api/auth/login', { username: 'ADA_lovelace', password: PW });
+  await user('ada');
+  assert.equal((await names({ username: 'Night Owl' })).status, 400, "username can't become your own chat name");
+
+  // Accounts made before chat names existed get one the next time they load.
+  const legacy = await user('legacy');
+  await db.col.users.updateOne({ _id: legacy.id }, { $unset: { chatName: 1, chatNameLower: 1 } });
+  assert.ok((await ok('/api/auth/me', null, legacy)).user.chatName);
+});
+
+test('profile activity: finds, eggs hidden, your eggs found by others, groups, sign-up', async () => {
+  const [cy, dot] = [await user('cy'), await user('dot')];
+  const st = { id: 'test-activity', name: 'Test Activity' };
+  clock += 1000;
+  const { egg } = await ok('/api/eggs', { stationId: st.id, level: 2, image: IMG, hint: 'by the map' }, cy);
+  clock += 1000;
+  const { attempt } = await ok('/api/attempts', { eggId: egg.id }, dot);
+  clock += 5000;
+  await ok(`/api/attempts/${attempt.id}/find`, { image: IMG }, dot);
+  clock += 1000;
+  const { group } = await ok('/api/groups', { name: 'Activity Club' }, cy);
+
+  const { activity } = await ok(`/api/users/${cy.id}`, null, cy);
+  assert.deepEqual(activity.map((a) => a.type), ['joined_group', 'egg_found', 'hid', 'signed_up']);
+  assert.deepEqual([activity[0].groupName, activity[1].by, activity[1].stationName, activity[2].levelName], ['Activity Club', 'dot', st.name, 'Medium']);
+  const mine = (await ok(`/api/users/${dot.id}`, null, dot)).activity;
+  assert.equal(mine[0].type, 'found');
+  assert.ok(mine[0].points > 0);
+  await ok(`/api/groups/${group.id}/leave`, {}, cy);
+});
+
+test('notifications: your eggs, a heads-up when one is found, counts', async () => {
+  const [eve, fin, gus] = [await user('n_eve'), await user('n_fin'), await user('n_gus')];
+  const none = await ok('/api/me/notifications', null, eve);
+  assert.deepEqual([none.unseen, none.counts, none.items], [0, { finds: 0, eggsHidden: 0, foundByOthers: 0 }, []]);
+  assert.equal((await call('/api/me/notifications')).status, 401);
+
+  clock += 1000;
+  const { egg } = await ok('/api/eggs', { stationId: 'test-activity', level: 3, image: IMG, hint: 'under the clock' }, eve);
+  const hid = (await ok('/api/me/notifications', null, eve)).items[0];
+  assert.deepEqual([hid.type, hid.levelName, hid.hint, hid.timesFound, hid.status], ['egg_hidden', 'Hard', 'under the clock', 0, 'active']);
+  assert.ok(hid.photoUrl, 'you see your own egg photo');
+
+  for (const p of [fin, gus]) {
+    clock += 1000;
+    const { attempt } = await ok('/api/attempts', { eggId: egg.id }, p);
+    clock += 3000;
+    await ok(`/api/attempts/${attempt.id}/find`, { image: IMG }, p);
+  }
+  const poll = await ok('/api/me/notifications?summary=1', null, eve);
+  assert.equal(poll.unseen, 2);
+  assert.deepEqual(poll.latest.map((n) => n.by), ['n_gus', 'n_fin'], 'newest first');
+  assert.equal('items' in poll, false, 'the poll stays small');
+
+  const full = await ok('/api/me/notifications', null, eve);
+  assert.deepEqual(full.counts, { finds: 0, eggsHidden: 1, foundByOthers: 2 });
+  assert.deepEqual(full.items.map((n) => n.type), ['egg_found', 'egg_found', 'egg_hidden']);
+  assert.ok(full.items[0].unseen && full.items[0].points > 0);
+  assert.equal(full.items[2].timesFound, 2);
+  assert.equal((await ok('/api/me/notifications', null, fin)).counts.finds, 1);
+
+  await ok('/api/me/notifications/seen', {}, eve);
+  const after = await ok('/api/me/notifications', null, eve);
+  assert.equal(after.unseen, 0);
+  assert.equal(after.items.some((n) => n.unseen), false, 'still listed, no longer new');
 });

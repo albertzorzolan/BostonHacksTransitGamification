@@ -81,6 +81,8 @@ export async function createApp({
   const stationName = (id) => stationById.get(id)?.name ?? id;
   const photoUrl = (id) => `/photos/${id}.jpg`;
   const publicUser = (u) => ({ id: u._id, username: u.username, createdAt: u.createdAt });
+  // Only the player themself sees their chat name: it's what keeps the group chat anonymous.
+  const selfUser = (u) => ({ ...publicUser(u), chatName: u.chatName ?? null });
   const requireUser = (ctx) => ctx.user ?? fail(401, 'Sign in to play.');
   const hasFound = (userId, eggId, session) => col.finds.findOne({ userId, eggId }, { session, projection: { _id: 1 } });
 
@@ -140,7 +142,38 @@ export async function createApp({
       lastSeenAt: t,
       expiresAt: new Date(t.getTime() + auth.SESSION_DAYS * 86400_000),
     });
-    return { user: publicUser(user), token };
+    return { user: selfUser(user), token };
+  }
+
+  // ---------- names ----------
+  // Usernames show on leaderboards and profiles; chat names show only in group chats.
+  // One namespace for both, so nobody can take a chat name that looks like someone's username.
+  const NAME_RE = /^[A-Za-z0-9_. -]{2,20}$/;
+  const NAME_RULE = '2–20 letters, numbers, spaces, dots, dashes or underscores';
+  const cleanName = (v) => String(v ?? '').trim().replace(/\s+/g, ' ');
+
+  async function nameTaken(name, exceptUserId = null) {
+    const lower = name.toLowerCase();
+    const q = { $or: [{ usernameLower: lower }, { chatNameLower: lower }] };
+    if (exceptUserId) q._id = { $ne: exceptUserId };
+    return Boolean(await col.users.findOne(q, { projection: { _id: 1 } }));
+  }
+
+  // Gives an account a random anonymous chat name, retrying on the rare collision.
+  async function ensureChatName(user) {
+    if (user.chatName) return user;
+    for (let i = 0; i < 10; i++) {
+      const chatName = game.randomChatName();
+      if (await nameTaken(chatName)) continue;
+      try {
+        const r = await col.users.updateOne({ _id: user._id, chatName: { $exists: false } }, { $set: { chatName, chatNameLower: chatName.toLowerCase() } });
+        if (r.matchedCount) return { ...user, chatName, chatNameLower: chatName.toLowerCase() };
+        return (await col.users.findOne({ _id: user._id })) ?? user; // another request named it first
+      } catch (err) {
+        if (!isDuplicateKey(err)) throw err;
+      }
+    }
+    throw new Error('Could not pick a free chat name.');
   }
 
   // Returns { user, sessionId } for a valid bearer token, null with no token, 401 for a bad one.
@@ -220,10 +253,87 @@ export async function createApp({
   }
 
   // Stickers only: messages carry a sticker id from game.STICKERS, never free text.
-  const publicMessage = (m) => {
+  // The chat is anonymous: a message names its sender only by chat name, and carries no
+  // user id (just whether it's yours), so it can't be matched to the group's leaderboard.
+  const publicMessage = (m, viewerId, names) => {
     const s = game.stickerById.get(m.sticker);
-    return { id: m._id, seq: m.seq, userId: m.userId, username: m.username, sticker: m.sticker, emoji: s?.emoji ?? '🥚', label: s?.label ?? '', createdAt: m.createdAt };
+    return {
+      id: m._id,
+      seq: m.seq,
+      mine: m.userId === viewerId,
+      name: names.get(m.userId) ?? 'Anonymous rider',
+      sticker: m.sticker,
+      emoji: s?.emoji ?? '🥚',
+      label: s?.label ?? '',
+      createdAt: m.createdAt,
+    };
   };
+  const chatNames = async (userIds) =>
+    new Map((await col.users.find({ _id: { $in: [...new Set(userIds)] } }, { projection: { chatName: 1 } }).toArray()).map((u) => [u._id, u.chatName]));
+
+  // A player's own recent activity, newest first: finds, eggs hidden, their eggs found by
+  // others, groups joined and the day they signed up. Only ever sent to the player themself.
+  const ACTIVITY_LIMIT = 30;
+  async function activityFor(user, myEggIds) {
+    const recent = (c, q, sortField) => c.find(q).sort({ [sortField]: -1 }).limit(ACTIVITY_LIMIT).toArray();
+    const [finds, hidden, foundByOthers, memberships] = await Promise.all([
+      recent(col.finds, { userId: user._id }, 'foundAt'),
+      recent(col.eggs, { createdBy: user._id }, 'createdAt'),
+      myEggIds.length ? recent(col.finds, { eggId: { $in: myEggIds }, userId: { $ne: user._id } }, 'foundAt') : [],
+      recent(col.groupMembers, { userId: user._id }, 'joinedAt'),
+    ]);
+    const finders = new Map((await col.users.find({ _id: { $in: [...new Set(foundByOthers.map((f) => f.userId))] } }, { projection: { username: 1 } }).toArray()).map((u) => [u._id, u.username]));
+    const groupNames = new Map((await col.groups.find({ _id: { $in: memberships.map((m) => m.groupId) } }, { projection: { name: 1 } }).toArray()).map((g) => [g._id, g.name]));
+    const where = (x) => ({ stationId: x.stationId, stationName: stationName(x.stationId), levelName: game.levelInfo(x.level).name });
+    const events = [
+      ...finds.map((f) => ({ type: 'found', at: f.foundAt, ...where(f), points: f.points })),
+      ...hidden.map((e) => ({ type: 'hid', at: e.createdAt, ...where(e) })),
+      ...foundByOthers.map((f) => ({ type: 'egg_found', at: f.foundAt, ...where(f), by: finders.get(f.userId) ?? 'A player' })),
+      ...memberships.filter((m) => groupNames.has(m.groupId)).map((m) => ({ type: 'joined_group', at: m.joinedAt, groupId: m.groupId, groupName: groupNames.get(m.groupId) })),
+      { type: 'signed_up', at: user.createdAt },
+    ];
+    return events.sort((a, b) => b.at - a.at).slice(0, ACTIVITY_LIMIT);
+  }
+
+  // ---------- notifications ----------
+  // The eggs you hid, and every time another player found one. "Unseen" means found since you
+  // last opened the notifications page (users.notificationsSeenAt).
+  const NOTIFY_LIMIT = 40;
+  async function notificationsFor(user, { summary = false } = {}) {
+    const seenAt = user.notificationsSeenAt ?? user.createdAt;
+    const mine = await col.eggs.find({ createdBy: user._id }, { projection: { photoId: 1, stationId: 1, level: 1, status: 1, createdAt: 1, timesFound: 1, hint: 1 } }).sort({ createdAt: -1 }).toArray();
+    const eggIds = mine.map((e) => e._id);
+    const none = async () => [];
+    const [unseenFinds, finds] = await Promise.all([
+      eggIds.length ? col.finds.find({ eggId: { $in: eggIds }, foundAt: { $gt: seenAt } }).sort({ foundAt: -1 }).limit(summary ? 3 : NOTIFY_LIMIT).toArray() : none(),
+      summary ? none() : eggIds.length ? col.finds.find({ eggId: { $in: eggIds } }).sort({ foundAt: -1 }).limit(NOTIFY_LIMIT).toArray() : none(),
+    ]);
+    const unseen = eggIds.length ? await col.finds.countDocuments({ eggId: { $in: eggIds }, foundAt: { $gt: seenAt } }) : 0;
+    const shown = summary ? unseenFinds : finds;
+    const finders = new Map((await col.users.find({ _id: { $in: [...new Set(shown.map((f) => f.userId))] } }, { projection: { username: 1 } }).toArray()).map((u) => [u._id, u.username]));
+    const where = (x) => ({ stationId: x.stationId, stationName: stationName(x.stationId), levelName: game.levelInfo(x.level).name });
+    const foundItems = shown.map((f) => ({ id: f._id, type: 'egg_found', at: f.foundAt, ...where(f), by: finders.get(f.userId) ?? 'A player', points: f.points, unseen: f.foundAt > seenAt }));
+    if (summary) return { unseen, latest: foundItems };
+    const hidItems = mine.slice(0, NOTIFY_LIMIT).map((e) => ({
+      id: e._id,
+      type: 'egg_hidden',
+      at: e.createdAt,
+      ...where(e),
+      hint: e.hint ?? null,
+      photoUrl: photoUrl(e.photoId),
+      timesFound: e.timesFound ?? 0,
+      status: e.status,
+    }));
+    const [findCount, foundByOthers] = await Promise.all([
+      col.finds.countDocuments({ userId: user._id }),
+      eggIds.length ? col.finds.countDocuments({ eggId: { $in: eggIds } }) : 0,
+    ]);
+    return {
+      unseen,
+      counts: { finds: findCount, eggsHidden: mine.length, foundByOthers },
+      items: [...foundItems, ...hidItems].sort((a, b) => b.at - a.at).slice(0, NOTIFY_LIMIT),
+    };
+  }
 
   // ---------- handlers ----------
   const api = {
@@ -248,11 +358,10 @@ export async function createApp({
     // ----- auth -----
     async register({ body, req }) {
       const { username, password } = credentials(body);
-      if (!/^[A-Za-z0-9_. -]{2,20}$/.test(username)) {
-        fail(400, 'Username must be 2–20 letters, numbers, spaces, dots, dashes or underscores.');
-      }
+      if (!NAME_RE.test(username)) fail(400, `Username must be ${NAME_RULE}.`);
       if (password.length < auth.PASSWORD_MIN) fail(400, `Password must be at least ${auth.PASSWORD_MIN} characters.`);
       if (password.length > auth.PASSWORD_MAX) fail(400, 'Password is too long.');
+      if (await nameTaken(username)) fail(409, 'That username is taken.');
       const user = {
         _id: crypto.randomUUID(),
         username,
@@ -266,7 +375,7 @@ export async function createApp({
         if (isDuplicateKey(err)) fail(409, 'That username is taken.');
         throw err;
       }
-      return startSession(user, req);
+      return startSession(await ensureChatName(user), req);
     },
 
     async login({ body, req }) {
@@ -290,8 +399,47 @@ export async function createApp({
       return { ok: true, signedOut: r.deletedCount };
     },
 
-    me(ctx) {
-      return { user: publicUser(requireUser(ctx)) };
+    async me(ctx) {
+      return { user: selfUser(await ensureChatName(requireUser(ctx))) };
+    },
+
+    // ?summary=1 is the cheap poll: just the unseen count and the newest unseen finds.
+    async notifications(ctx) {
+      return notificationsFor(requireUser(ctx), { summary: ctx.query.get('summary') === '1' });
+    },
+
+    async notificationsSeen(ctx) {
+      const user = requireUser(ctx);
+      await col.users.updateOne({ _id: user._id }, { $set: { notificationsSeenAt: now() } });
+      return { ok: true };
+    },
+
+    // Change your username (public) and/or chat name (anonymous). Send only the ones you change.
+    async updateNames(ctx) {
+      const user = await ensureChatName(requireUser(ctx));
+      const set = {};
+      for (const [field, label] of [['username', 'Username'], ['chatName', 'Chat name']]) {
+        if (ctx.body?.[field] === undefined) continue;
+        const v = cleanName(ctx.body[field]);
+        if (!NAME_RE.test(v)) fail(400, `${label} must be ${NAME_RULE}.`);
+        if (v === user[field]) continue;
+        if (await nameTaken(v, user._id)) fail(409, `"${v}" is taken. Try another.`);
+        set[field] = v;
+        set[`${field}Lower`] = v.toLowerCase();
+      }
+      const next = { ...user, ...set };
+      if (next.username.toLowerCase() === next.chatName.toLowerCase()) {
+        fail(400, "Your chat name can't be your username, or the chat wouldn't be anonymous.");
+      }
+      if (Object.keys(set).length) {
+        try {
+          await col.users.updateOne({ _id: user._id }, { $set: set });
+        } catch (err) {
+          if (isDuplicateKey(err)) fail(409, 'That name was just taken. Try another.');
+          throw err;
+        }
+      }
+      return { user: selfUser(next) };
     },
 
     async sessions(ctx) {
@@ -312,15 +460,35 @@ export async function createApp({
     },
 
     // ----- game -----
-    async stations() {
+    // Every station with its count of active eggs (0 to 5). Signed in, each station also says how
+    // many of those the player can still find (not their own, not already found by them).
+    async stations({ user }) {
       await ensureStations();
       await housekeeping();
-      const counts = new Map(
-        (await col.eggs.aggregate([{ $match: { status: 'active' } }, { $group: { _id: '$stationId', n: { $sum: 1 } } }]).toArray()).map(
-          (r) => [r._id, r.n],
-        ),
-      );
-      return { stations: stations.map((s) => ({ ...s, activeEggs: counts.get(s.id) ?? 0 })) };
+      const active = await col.eggs.find({ status: 'active' }, { projection: { stationId: 1, createdBy: 1 } }).toArray();
+      const found = user
+        ? new Set((await col.finds.find({ userId: user._id, eggId: { $in: active.map((e) => e._id) } }, { projection: { eggId: 1 } }).toArray()).map((f) => f.eggId))
+        : null;
+      const counts = new Map();
+      for (const e of active) {
+        const c = counts.get(e.stationId) ?? { activeEggs: 0, playable: 0 };
+        c.activeEggs += 1;
+        if (user && e.createdBy !== user._id && !found.has(e._id)) c.playable += 1;
+        counts.set(e.stationId, c);
+      }
+      const rows = stations.map((s) => {
+        const c = counts.get(s.id) ?? { activeEggs: 0, playable: 0 };
+        return { ...s, activeEggs: c.activeEggs, ...(user && { playable: c.playable }) };
+      });
+      return {
+        stations: rows,
+        totals: {
+          eggs: active.length,
+          stationsWithEggs: rows.filter((r) => r.activeEggs).length,
+          stations: rows.length,
+          ...(user && { playable: rows.reduce((n, r) => n + r.playable, 0) }),
+        },
+      };
     },
 
     async station({ params: [id], user }) {
@@ -407,7 +575,8 @@ export async function createApp({
         hidden = new Set(live.filter((e) => !seen.has(e)));
       }
       return {
-        user: publicUser(user),
+        user: viewerId === id ? selfUser(user) : publicUser(user),
+        ...(viewerId === id && { activity: await activityFor(user, myEggIds) }),
         monthPoints: totals?.month ?? 0,
         allTimePoints: totals?.allTime ?? 0,
         monthRank: rankIndex >= 0 ? rankIndex + 1 : null,
@@ -844,17 +1013,19 @@ export async function createApp({
     // Without ?after: the latest CHAT_PAGE messages. With ?after=<seq>: only newer ones (for polling).
     async groupMessages(ctx) {
       const [id] = ctx.params;
-      await memberGroup(ctx, id);
+      const { user } = await memberGroup(ctx, id);
       const after = Number(ctx.query.get('after'));
       const rows = Number.isInteger(after) && after >= 0
         ? await col.groupMessages.find({ groupId: id, seq: { $gt: after } }).sort({ seq: 1 }).limit(CHAT_PAGE).toArray()
         : (await col.groupMessages.find({ groupId: id }).sort({ seq: -1 }).limit(CHAT_PAGE).toArray()).reverse();
-      return { messages: rows.map(publicMessage) };
+      const names = await chatNames(rows.map((m) => m.userId));
+      return { messages: rows.map((m) => publicMessage(m, user._id, names)) };
     },
 
     async sendGroupMessage(ctx) {
       const [id] = ctx.params;
-      const { user } = await memberGroup(ctx, id);
+      const { user: member } = await memberGroup(ctx, id);
+      const user = await ensureChatName(member);
       const sticker = game.stickerById.get(String(ctx.body?.sticker ?? ''));
       if (!sticker) fail(400, 'Pick one of the stickers.');
       const t = now();
@@ -869,11 +1040,11 @@ export async function createApp({
       const message = await tx(async (session) => {
         const g = await col.groups.findOneAndUpdate({ _id: id }, { $inc: { msgSeq: 1 } }, { session, returnDocument: 'after' });
         if (!g) fail(404, 'Group not found');
-        const m = { _id: crypto.randomUUID(), groupId: id, seq: g.msgSeq, userId: user._id, username: user.username, sticker: sticker.id, createdAt: t };
+        const m = { _id: crypto.randomUUID(), groupId: id, seq: g.msgSeq, userId: user._id, sticker: sticker.id, createdAt: t };
         await col.groupMessages.insertOne(m, { session });
         return m;
       });
-      return { message: publicMessage(message) };
+      return { message: publicMessage(message, user._id, new Map([[user._id, user.chatName]])) };
     },
 
     async leaderboard({ query }) {
@@ -909,7 +1080,7 @@ export async function createApp({
     ['POST', /^\/api\/auth\/logout-all$/, api.logoutAll, 'optional'],
     ['GET', /^\/api\/auth\/me$/, api.me, 'optional'],
     ['GET', /^\/api\/auth\/sessions$/, api.sessions, 'optional'],
-    ['GET', /^\/api\/stations$/, api.stations, 'none'],
+    ['GET', /^\/api\/stations$/, api.stations, 'optional'],
     ['GET', /^\/api\/stations\/([^/]+)$/, api.station, 'optional'],
     ['GET', /^\/api\/stations\/([^/]+)\/predictions$/, api.predictions, 'none'],
     ['GET', /^\/api\/users\/([^/]+)$/, api.profile, 'optional'],
@@ -918,6 +1089,9 @@ export async function createApp({
     ['POST', /^\/api\/eggs$/, api.createEgg, 'optional'],
     ['POST', /^\/api\/eggs\/([^/]+)\/report$/, api.reportEgg, 'optional'],
     ['GET', /^\/api\/me\/progress$/, api.progress, 'optional'],
+    ['POST', /^\/api\/me\/names$/, api.updateNames, 'optional'],
+    ['GET', /^\/api\/me\/notifications$/, api.notifications, 'optional'],
+    ['POST', /^\/api\/me\/notifications\/seen$/, api.notificationsSeen, 'optional'],
     ['GET', /^\/api\/leaderboard$/, api.leaderboard, 'none'],
     ['GET', /^\/api\/groups$/, api.groups, 'optional'],
     ['POST', /^\/api\/groups$/, api.createGroup, 'optional'],
