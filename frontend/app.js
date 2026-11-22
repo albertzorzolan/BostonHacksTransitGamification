@@ -1179,10 +1179,9 @@ async function showStation(id, { here = false, distance = null } = {}) {
       if (btn.getAttribute('aria-disabled') === 'true') return;
       btn.setAttribute('aria-disabled', 'true');
       const slot = slots.find((s) => s.egg?.id === btn.dataset.play);
-      const before = { hud: state.hud, progress: state.progress, card };
       try {
         const round = await api('/api/attempts', { eggId: btn.dataset.play });
-        state.play = { ...round, station, receivedAt: performance.now(), result: null, firstChance: slot?.egg?.timesFound === 0, before };
+        state.play = { ...round, station, receivedAt: performance.now(), result: null, firstChance: slot?.egg?.timesFound === 0 };
         if (round.attempt.resumed) toast(`Your clock kept running: ${fmtClock(round.attempt.secondsLeft)} left.`);
         location.hash = '#/play';
       } catch (err) {
@@ -1231,7 +1230,7 @@ function stubsHtml(slots) {
   const empty = slots.filter((s) => !s.egg);
   const emptyRow = empty.length
     ? `<li class="stub-empties">
-        <p><b>${empty.length === slots.length ? 'No eggs here yet.' : `${plural(empty.length, 'empty slot')}.`}</b> Hide one and earn points when it's found.</p>
+        <p><b>${empty.length === slots.length ? 'No eggs here yet.' : `${plural(empty.length, 'empty slot')}.`}</b> Hide one for other riders to find.</p>
         <div class="hide-chips">${empty.map((s) => `<button class="hide-chip" type="button" data-hide="${s.level}"><b>${s.level}</b>${esc(s.name)}<span class="hide-pts">${s.points}</span></button>`).join('')}</div>
       </li>`
     : '';
@@ -1384,7 +1383,6 @@ function viewPlay() {
         return;
       }
       play.result = result;
-      play.myPhoto = image;
       renderResult();
     } catch (err) {
       status.innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
@@ -1411,18 +1409,6 @@ function viewPlay() {
     renderResult();
   });
   $('#quitX').addEventListener('click', () => (state.play = null));
-}
-
-// The round stamp shown when a station is cleared.
-function stationSeal(name, sub) {
-  const id = `ring-${Math.random().toString(36).slice(2, 8)}`;
-  return `<svg class="seal-svg" viewBox="0 0 160 160" role="img" aria-label="${esc(name)} cleared">
-    <defs><path id="${id}" d="M80,80 m-58,0 a58,58 0 1,1 116,0 a58,58 0 1,1 -116,0"/></defs>
-    <circle cx="80" cy="80" r="74" fill="none" stroke="currentColor" stroke-width="5"/>
-    <circle cx="80" cy="80" r="44" fill="none" stroke="currentColor" stroke-width="2.5"/>
-    <text class="seal-ring"><textPath href="#${id}" startOffset="2%">${esc(sub)}</textPath></text>
-    <text class="seal-mid" x="80" y="88" text-anchor="middle">Cleared</text>
-  </svg>`;
 }
 
 async function renderResult() {
@@ -1452,37 +1438,16 @@ async function renderResult() {
     return;
   }
 
-  const { points, verification } = result;
-  const chads = [[-46, -30, 120], [38, -42, -80], [52, 10, 200], [-30, 36, 60], [14, 48, -140], [-56, 4, 30]]
-    .map(([x, y, r]) => `<i class="chad" style="--x:${x}px;--y:${y}px;--r:${r}deg"></i>`)
-    .join('');
+  const { points } = result;
   app.innerHTML = `
     <section class="tk win">
-      ${play.station ? lineBand(play.station, esc(egg.levelName)) : ''}
       <div class="tk-top">
         <h1 class="win-head">${result.firstFind ? 'Found it first' : 'Found it'}</h1>
         <p class="win-pts">+<span id="count">${points.total}</span></p>
-        <span class="hole hole-big" aria-hidden="true">${chads}</span>
-        <p class="stamp stamp-big">Found ${fmtClock(result.secondsTaken)}</p>
+        <p class="win-sub">Image approved, good job!</p>
       </div>
-      <div class="tk-perf" aria-hidden="true"></div>
-      <dl class="tk-bottom win-math">
-        <div><dt>${esc(egg.levelName)}</dt><dd>${points.base}</dd></div>
-        <div><dt>Time bonus</dt><dd>+${points.bonus}</dd></div>
-        <div><dt>Took</dt><dd>${fmtClock(result.secondsTaken)}</dd></div>
-      </dl>
     </section>
-    <section class="match" aria-label="Photo check">
-      <div class="match-pair">
-        <figure class="m"><img src="${apiUrl(result.revealUrl || egg.imageUrl)}" alt="The egg photo" /><figcaption>${egg.blur && result.revealUrl ? 'The egg, unblurred' : 'The egg'}</figcaption></figure>
-        ${play.myPhoto ? `<figure class="m"><img src="${play.myPhoto}" alt="Your photo" /><figcaption>Your photo</figcaption></figure>` : ''}
-      </div>
-      <p class="match-verdict ${verification.method === 'gemini' ? 'is-ok' : ''}">${verification.method === 'gemini' ? `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg><b>Cleared.</b> Same object${verification.reason ? `: ${esc(verification.reason)}` : ''}` : esc(verification.reason)}</p>
-    </section>
-    <ul id="gains" class="gains" aria-live="polite"></ul>
     <section class="next-egg">
-      <h2 class="sec-h">Hide the next one</h2>
-      <p class="next-egg-copy">Your photo becomes the new ${esc(egg.levelName)} egg at ${esc(egg.stationName)}.</p>
       <button id="hide" class="btn btn-primary btn-block btn-l" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>Hide the next ${esc(egg.levelName)} egg</button>
       <a id="skip" class="btn btn-ghost btn-block" href="${back}">Skip</a>
     </section>`;
@@ -1508,60 +1473,9 @@ async function renderResult() {
   });
   $('#skip').addEventListener('click', () => (state.play = null));
 
-  // What this find changed: rank, rival, line war, challenge, stamps, the station card.
-  const before = play.before ?? {};
-  const [, progress, stationNow] = await Promise.all([
-    refreshHud(true),
-    refreshProgress(),
-    api(`/api/stations/${encodeURIComponent(egg.stationId)}`).catch(() => null),
-  ]);
-  const gains = [];
-  const h = state.hud;
-  if (h?.rank) {
-    const was = before.hud?.rank ?? null;
-    if (!was) gains.push(['up', `<b>You're on the board at ${ordinal(h.rank)}.</b>`]);
-    else if (h.rank < was) {
-      const passed = h.rows.filter((r) => r.rank > h.rank && r.rank <= was).map((r) => r.username);
-      gains.push(['up', `<b>Up to ${ordinal(h.rank)}.</b> You passed ${esc(passed[0] ?? 'someone')}${passed.length > 1 ? ` and ${passed.length - 1} more` : ''}.`]);
-    }
-    if (h.rival) gains.push(['rival', `<b>Next: ${esc(h.rival.username)}.</b> ${plural(h.gap, 'point')} to pass.`]);
-  }
-  const fam = play.station ? familiesOf(play.station.lines)[0] : null;
-  if (MAIN_LINES.includes(fam) && h?.lines?.length) {
-    const sorted = MAIN_LINES.map((l) => ({ line: l, points: h.lines.find((x) => x.line === l)?.points ?? 0 })).sort((a, b) => b.points - a.points);
-    const i = sorted.findIndex((x) => x.line === fam);
-    const line = sorted[i];
-    const note = i === 0
-      ? `${fam} leads ${sorted[1].line} by ${(line.points - sorted[1].points).toLocaleString()}.`
-      : `${fam} is ${ordinal(i + 1)}, ${(sorted[i - 1].points - line.points).toLocaleString()} behind ${sorted[i - 1].line}.`;
-    gains.push(['line', `<b>+${points.total} for the ${fam} Line.</b> ${note}`, fam]);
-  }
-  if (progress?.today?.done && before.progress && !before.progress.today?.done) {
-    gains.push(['stamp', `<b>Challenge done: ${esc(progress.today.title)}.</b> Stamp earned.`]);
-  }
-  const had = new Set((before.progress?.stamps ?? []).filter((s) => s.earned).map((s) => s.id));
-  if (before.progress) {
-    for (const s of progress?.stamps ?? []) if (s.earned && !had.has(s.id)) gains.push(['stamp', `<b>Stamp earned: ${esc(s.name)}.</b> ${esc(s.description)}`]);
-  }
-
-  const box = $('#gains');
-  if (!box) return;
-  const card = stationNow ? stationCard(stationNow.slots) : null;
-  const month = new Date().toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'America/New_York' });
-  const sealHtml = card?.cleared && !before.card?.cleared
-    ? `<li class="gain gain-seal">${stationSeal(egg.stationName, `${egg.stationName}, ${fam ? `${fam} Line, ` : ''}${month}`)}<p><b>${esc(egg.stationName)} cleared.</b> Every egg you can play here is punched.</p></li>`
-    : card && card.playable
-      ? `<li class="gain"><span class="gain-ico gain-card" aria-hidden="true">${card.found}/${card.playable}</span><p><b>${esc(egg.stationName)} card: ${card.found} of ${card.playable}.</b> ${card.playable - card.found === 1 ? 'One egg left to clear it.' : `${card.playable - card.found} eggs left to clear it.`}</p></li>`
-      : '';
-  const icon = (kind, f) =>
-    kind === 'line'
-      ? `<span class="gain-ico gain-line" style="--ln:${LINE_VAR[f]}" aria-hidden="true">${f[0]}</span>`
-      : kind === 'stamp'
-        ? '<span class="gain-ico gain-stamp-ico" aria-hidden="true"><svg viewBox="0 0 40 40"><circle cx="20" cy="20" r="16"/><path d="m13 20.5 5 5 9-10"/></svg></span>'
-        : kind === 'rival'
-          ? '<span class="gain-ico gain-rival" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/></svg></span>'
-          : '<span class="gain-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m6 15 6-6 6 6"/></svg></span>';
-  box.innerHTML = sealHtml + gains.map(([k, html, f]) => `<li class="gain ${k === 'stamp' ? 'gain-stamp' : ''}">${icon(k, f)}<p>${html}</p></li>`).join('');
+  // The find changed your points, rank and stamps: refresh them for the other screens.
+  refreshHud(true);
+  refreshProgress();
 }
 
 // ---------- hide an egg ----------
