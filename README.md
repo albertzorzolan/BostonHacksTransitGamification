@@ -1,6 +1,6 @@
 # Station Egg Hunt
 
-BostonHacks 2026 · Transit Gamification track. Team: Jonathan & Albert.
+BostonHacks 2026 · Transit Gamification track. Team: Jonathan & Albert & Darsh.
 
 Riders photograph small things in MBTA stations (a sticker, a tile, a mark on a bench). Other riders get the photo and a timer and have to find the real thing. You find it, take a photo to prove it and score points, then hide the next one.
 
