@@ -1251,10 +1251,12 @@ export async function createApp({
 
     async leaderboard({ query }) {
       await ensureStations();
+      // ?period=all ranks every point ever scored; otherwise one month (this one by default).
+      const period = query.get('period') === 'all' ? 'all' : 'month';
       const month = query.get('month') || game.monthKey(now());
       if (!/^\d{4}-\d{2}$/.test(month)) fail(400, 'Month must look like 2026-11.');
       const stationId = query.get('stationId') || null;
-      const match = stationId ? { month, stationId } : { month };
+      const match = { ...(period === 'month' && { month }), ...(stationId && { stationId }) };
       const board = await pointsBoard(match);
       const byStation = await col.finds.aggregate([...scoredPoints(match), { $group: { _id: '$stationId', points: { $sum: '$points' } } }]).toArray();
       const lineTotals = new Map();
@@ -1263,7 +1265,8 @@ export async function createApp({
         for (const fam of families) lineTotals.set(fam, (lineTotals.get(fam) ?? 0) + r.points);
       }
       return {
-        month,
+        period,
+        month: period === 'month' ? month : null,
         stationId,
         rows: board.slice(0, 50).map((r, i) => ({ userId: r._id, username: r.username, points: r.points, finds: r.finds, rank: i + 1 })),
         lines: [...lineTotals].map(([line, points]) => ({ line, points })).sort((a, b) => b.points - a.points),
