@@ -24,7 +24,6 @@ const STATIONS = [
   { id: 'test-activity', name: 'Test Activity', lat: 42.4, lng: -71.11, lines: [{ id: 'Red', name: 'Red Line', color: '#DA291C' }] },
   { id: 'test-clock', name: 'Test Clock', lat: 42.37, lng: -71.08, lines: [{ id: 'Blue', name: 'Blue Line', color: '#003DA5' }] },
   { id: 'test-map', name: 'Test Map', lat: 42.41, lng: -71.12, lines: [{ id: 'Green-B', name: 'Green Line B', color: '#00843D' }] },
-  { id: 'test-bounty', name: 'Test Bounty', lat: 42.38, lng: -71.09, lines: [{ id: 'Blue', name: 'Blue Line', color: '#003DA5' }] },
   { id: 'test-screen', name: 'Test Screen', lat: 42.43, lng: -71.14, lines: [{ id: 'Red', name: 'Red Line', color: '#DA291C' }] },
   { id: 'test-map', name: 'Test Map', lat: 42.41, lng: -71.12, lines: [{ id: 'Orange', name: 'Orange Line', color: '#ED8B00' }] },
 ];
@@ -163,8 +162,7 @@ test('full round: hide, find, hide next, leaderboard', async () => {
   clock += 60_000; // 60s of 180s used -> 2/3 left -> bonus round(20*0.5*2/3)=7
   const found = await ok(`/api/attempts/${round.attempt.id}/find`, { image: IMG }, ben);
   assert.equal(found.status, 'found');
-  assert.deepEqual(found.points, { base: 20, bonus: 7, bounty: 0, total: 27 });
-  assert.equal(found.hider, null, 'nobody was beaten, so no bounty and nothing for the hider');
+  assert.deepEqual(found.points, { base: 20, bonus: 7, total: 27 });
 
   assert.equal((await call('/api/attempts', { eggId: egg.id }, ben)).status, 409, 'no double finds');
   assert.equal((await call(`/api/attempts/${round.attempt.id}/find`, { image: IMG }, ben)).status, 409);
@@ -245,7 +243,7 @@ test('no match keeps the round open; time runs out', async () => {
   assert.equal(late.status, 'expired');
 });
 
-test('there is no race-the-train mode: every round gets the 3-minute clock', async () => {
+test('there is no race-the-train mode: every round gets its level\'s fixed clock', async () => {
   const eve = await user('eve');
   const fay = await user('fay');
   await ok('/api/eggs', { name: 'sticker', stationId: 'place-pktrm', level: 4, image: IMG }, eve);
@@ -422,9 +420,9 @@ test('group sticker chat: members only, stickers only, polling, rate limit', asy
   assert.equal(await db.col.groupMessages.countDocuments({ groupId: group.id }), 0);
 });
 
-test('every level has a 3-minute timer; Extreme and Impossible show a blurred photo', async () => {
+test('Hard gets 2 minutes and Impossible 1, the rest 3; Extreme and Impossible show a blurred photo', async () => {
   const cfg = await ok('/api/config');
-  assert.deepEqual(cfg.levels.map((l) => l.seconds), [180, 180, 180, 180, 180]);
+  assert.deepEqual(cfg.levels.map((l) => l.seconds), [180, 180, 120, 180, 60]);
   assert.deepEqual(cfg.levels.map((l) => l.points), [10, 20, 30, 40, 60], 'points unchanged');
 
   const [hider, finder, rival] = [await user('blurhider'), await user('blurfinder'), await user('blurrival')];
@@ -439,7 +437,7 @@ test('every level has a 3-minute timer; Extreme and Impossible show a blurred ph
   for (const level of [1, 4, 5]) {
     const egg = slots.find((s) => s.level === level).egg;
     rounds[level] = await ok('/api/attempts', { eggId: egg.id }, finder);
-    assert.equal(rounds[level].attempt.limitSeconds, 180, `level ${level}: 3 minutes`);
+    assert.equal(rounds[level].attempt.limitSeconds, { 1: 180, 4: 180, 5: 60 }[level], `level ${level} timer`);
   }
   assert.equal(rounds[1].egg.blur, null);
   assert.equal(rounds[4].egg.blur, 'light');
@@ -564,9 +562,9 @@ test('progress: rider level, daily challenge, stamps, stations and lines', async
   assert.deepEqual(p.lines.find((l) => l.line === 'Green'), { line: 'Green', stations: 2 });
   assert.deepEqual(p.lines.find((l) => l.line === 'Red'), { line: 'Red', stations: 1 });
   assert.deepEqual(new Set(p.today.lines), new Set(['Green', 'Red']));
-  // 60 + 27 bonus (20 s of 3 min) at Kenmore, 60 + 20 bonus (60 s of 3 min) = 167 -> level 3 (150 to 300)
-  assert.equal(p.level.points, 167);
-  assert.deepEqual([p.level.level, p.level.floor, p.level.next], [3, 150, 300]);
+  // Impossible has a 1-minute timer: 60 + 20 bonus (20 s of 60) at Kenmore, 60 + 0 bonus (all 60 s used) = 140 -> level 2 (50 to 150)
+  assert.equal(p.level.points, 140);
+  assert.deepEqual([p.level.level, p.level.floor, p.level.next], [2, 50, 150]);
   assert.ok(['transfer', 'climber', 'triple'].includes(p.today.id));
   assert.equal(p.stamps.some((st) => st.id === 'beat_train'), false, 'no train stamp');
   assert.equal(p.today.target >= p.today.progress, true);
@@ -669,15 +667,15 @@ test('one clock per egg: coming back resumes it; a retry after a miss gets a fre
   const eggId = (await ok('/api/stations/test-clock')).slots[2].egg.id;
 
   const first = await ok('/api/attempts', { eggId, mode: 'fixed' }, sam);
-  assert.deepEqual([first.attempt.secondsLeft, first.attempt.resumed, first.attempt.retry], [180, false, false]);
+  assert.deepEqual([first.attempt.secondsLeft, first.attempt.resumed, first.attempt.retry], [120, false, false], 'Hard: 2 minutes');
 
-  // sam leaves for 70 s and comes back: same round, 110 s left, not a fresh 3 minutes.
+  // sam leaves for 70 s and comes back: same round, 50 s left, not a fresh 2 minutes.
   clock += 70_000;
-  assert.deepEqual((await ok('/api/stations/test-clock', null, sam)).slots[2].egg.clock, { secondsLeft: 110 });
+  assert.deepEqual((await ok('/api/stations/test-clock', null, sam)).slots[2].egg.clock, { secondsLeft: 50 });
   assert.equal((await ok('/api/stations/test-clock', null, pal)).slots[2].egg.clock, null, "pal's clock hasn't started");
   const back = await ok('/api/attempts', { eggId }, sam);
   assert.equal(back.attempt.id, first.attempt.id, 'resumed, not restarted');
-  assert.deepEqual([back.attempt.secondsLeft, back.attempt.resumed], [110, true]);
+  assert.deepEqual([back.attempt.secondsLeft, back.attempt.resumed], [50, true]);
   assert.equal(await db.col.attempts.countDocuments({ userId: sam.id, eggId }), 1);
 
   // Two taps (or two phones) at once open one clock, not two.
@@ -686,7 +684,7 @@ test('one clock per egg: coming back resumes it; a retry after a miss gets a fre
   assert.equal(await db.col.attempts.countDocuments({ userId: pal.id, eggId }), 1);
 
   // sam's time and the upload grace run out. The station now offers sam a retry.
-  clock += (110 + 16) * 1000;
+  clock += (50 + 16) * 1000;
   const view = (await ok('/api/stations/test-clock', null, sam)).slots[2].egg;
   assert.deepEqual([view.clock, view.retry], [null, true]);
   assert.equal((await ok('/api/stations/test-clock', null, pal)).slots[2].egg.retry, false, "pal's clock is still running");
@@ -697,7 +695,7 @@ test('one clock per egg: coming back resumes it; a retry after a miss gets a fre
   // Retry straight away: a fresh clock, marked as a retry.
   const retry = await ok('/api/attempts', { eggId }, sam);
   assert.notEqual(retry.attempt.id, first.attempt.id);
-  assert.deepEqual([retry.attempt.secondsLeft, retry.attempt.resumed, retry.attempt.retry], [180, false, true]);
+  assert.deepEqual([retry.attempt.secondsLeft, retry.attempt.resumed, retry.attempt.retry], [120, false, true]);
 
   // Giving up ends that round; sam can retry again at once.
   assert.equal((await call(`/api/attempts/${retry.attempt.id}/end`, {}, hid)).status, 403, 'not your round');
@@ -706,84 +704,13 @@ test('one clock per egg: coming back resumes it; a retry after a miss gets a fre
   const again = await ok('/api/attempts', { eggId }, sam);
   assert.equal(again.attempt.retry, true);
 
-  // A find on a retry scores base points (and any bounty) but no time bonus, however fast it is.
+  // A find on a retry scores base points but no time bonus, however fast it is.
   clock += 20_000;
   const found = await ok(`/api/attempts/${again.attempt.id}/find`, { image: IMG }, sam);
-  assert.deepEqual(found.points, { base: 30, bonus: 0, bounty: 0, total: 30 });
+  assert.deepEqual(found.points, { base: 30, bonus: 0, total: 30 });
   const stamps = (await ok('/api/me/progress', null, sam)).stamps;
   assert.equal(stamps.find((s) => s.id === 'speedy').earned, false, 'a 20 s find on a retry is not a speed stamp');
   assert.equal(stamps.find((s) => s.id === 'first_find').earned, true);
-});
-
-test('bounty: players an egg beats build a pot; the finder takes it and the hider gets half', async () => {
-  const game = await import('../src/game.js');
-  assert.equal(game.bountyFor(3, 1), 8, '25% of 30, rounded');
-  assert.equal(game.bountyFor(1, 100), 20, 'capped at 2x base');
-  assert.equal(game.bountyFor(5, 0), 0);
-
-  const [hider, a, b, c, newbie, finder] = await Promise.all(
-    ['bhider', 'bplayer_a', 'bplayer_b', 'bplayer_c', 'bnewbie', 'bfinder'].map((n) => user(n)),
-  );
-  // a, b and c each find one easy egg first: only players with a find count toward a bounty.
-  await ok('/api/eggs', { name: 'sticker', stationId: 'test-bounty', level: 1, image: IMG }, hider);
-  const easy = (await ok('/api/stations/test-bounty')).slots[0].egg.id;
-  for (const p of [a, b, c]) {
-    const r = await ok('/api/attempts', { eggId: easy }, p);
-    await ok(`/api/attempts/${r.attempt.id}/find`, { image: IMG }, p);
-  }
-
-  await ok('/api/eggs', { name: 'sticker', stationId: 'test-bounty', level: 3, image: IMG }, hider);
-  const eggId = (await ok('/api/stations/test-bounty')).slots[2].egg.id;
-  clock += 1000; // a miss counts only if it ends after the egg was hidden (or last claimed)
-  const rounds = {};
-  for (const [name, p] of Object.entries({ a, b, c, newbie })) rounds[name] = await ok('/api/attempts', { eggId }, p);
-
-  // Nobody is beaten while their clock is still running.
-  assert.equal((await ok('/api/stations/test-bounty', null, finder)).slots[2].egg.bounty, 0);
-  await ok(`/api/attempts/${rounds.c.attempt.id}/end`, {}, c); // c gives up
-  clock += (180 + 16) * 1000; // a, b and newbie run out of time
-
-  // a, b and c count; newbie (no finds yet) doesn't. 3 x 7.5 = 22.5 -> 23.
-  const seen = (await ok('/api/stations/test-bounty', null, finder)).slots[2].egg;
-  assert.deepEqual([seen.beaten, seen.bounty], [3, 23]);
-  const seenByA = (await ok('/api/stations/test-bounty', null, a)).slots[2].egg;
-  assert.deepEqual([seenByA.beaten, seenByA.bounty], [2, 15], "a can't win a pot built from a's own miss");
-  const endA = await ok(`/api/attempts/${rounds.a.attempt.id}/end`, {}, a);
-  assert.deepEqual([endA.status, endA.counted, endA.bounty], ['expired', true, 23]);
-  assert.equal((await ok(`/api/attempts/${rounds.newbie.attempt.id}/end`, {}, newbie)).counted, false);
-
-  // newbie gets a first find now. That doesn't make the earlier miss count after the fact...
-  const nr = await ok('/api/attempts', { eggId: easy }, newbie);
-  await ok(`/api/attempts/${nr.attempt.id}/find`, { image: IMG }, newbie);
-  const still = (await ok('/api/stations/test-bounty', null, finder)).slots[2].egg;
-  assert.deepEqual([still.beaten, still.bounty], [3, 23], 'a miss from before your first find never counts');
-  // ...but a miss after it does: newbie retries the Hard egg and gives up. 4 x 7.5 = 30.
-  clock += 1000;
-  const retry = await ok('/api/attempts', { eggId }, newbie);
-  assert.equal(retry.attempt.retry, true);
-  const endNewbie = await ok(`/api/attempts/${retry.attempt.id}/end`, {}, newbie);
-  assert.deepEqual([endNewbie.counted, endNewbie.beaten, endNewbie.bounty], [true, 4, 30]);
-
-  // finder takes the pot: 30 base + 10 time bonus (120 of 180 s left) + 30 bounty.
-  const r = await ok('/api/attempts', { eggId }, finder);
-  assert.deepEqual([r.egg.bounty, r.egg.beaten], [30, 4]);
-  clock += 60_000;
-  const found = await ok(`/api/attempts/${r.attempt.id}/find`, { image: IMG }, finder);
-  assert.deepEqual(found.points, { base: 30, bonus: 10, bounty: 30, total: 70 });
-  assert.equal(found.beaten, 4);
-  assert.deepEqual(found.hider, { username: 'bhider', points: 15 }, 'half the pot');
-  assert.equal((await db.col.finds.findOne({ _id: found.findId })).bounty, 30);
-
-  // The pot is claimed: the next finder starts from zero.
-  assert.equal((await ok('/api/stations/test-bounty', null, newbie)).slots[2].egg.bounty, 0);
-
-  // The hider's share counts everywhere points do: leaderboard, profile and rider level.
-  const row = (await ok('/api/leaderboard')).rows.find((x) => x.username === 'bhider');
-  assert.deepEqual([row.points, row.finds], [15, 0], 'a payout is points, not a find');
-  const profile = await ok(`/api/users/${hider.id}`, null, a);
-  assert.deepEqual([profile.monthPoints, profile.allTimePoints, profile.hiderPoints], [15, 15, 15]);
-  assert.equal((await ok('/api/me/progress', null, hider)).level.points, 15);
-  assert.equal((await ok('/api/leaderboard?stationId=test-bounty')).rows.find((x) => x.username === 'bhider').points, 15);
 });
 
 test('leaderboard: this month or all time', async () => {
@@ -922,6 +849,19 @@ test('train lobbies: verified riders join one lobby per journey, everyone pledge
   assert.equal(annProfile.lobbyPoints, 60);
   assert.equal(annProfile.findsByLevel.Impossible, 2, 'pledged eggs stay in the collection');
   assert.equal(await db.col.finds.countDocuments({ userId: ann.id, pledgedIn: lobby.id }), 5, 'every egg ann used is marked pledged');
+
+  // Lobby bonuses count on the leaderboard, the profile and rider level. Old payouts from the
+  // removed bounty system don't.
+  const findPoints = (await db.col.finds.find({ userId: ann.id }).toArray()).reduce((n, f) => n + f.points, 0);
+  const annTotals = async () => [
+    (await ok('/api/leaderboard?period=all')).rows.find((r) => r.userId === ann.id)?.points,
+    (await ok(`/api/users/${ann.id}`, null, ann)).allTimePoints,
+    (await ok('/api/me/progress', null, ann)).level.points,
+  ];
+  const withBonus = findPoints + 60;
+  assert.deepEqual(await annTotals(), [withBonus, withBonus, withBonus]);
+  await db.col.payouts.insertOne({ _id: 'legacy-bounty-payout', userId: ann.id, kind: 'bounty', stationId: null, month: null, points: 99, createdAt: new Date(clock) });
+  assert.deepEqual(await annTotals(), [withBonus, withBonus, withBonus], 'a leftover bounty payout scores nothing');
 
   // Anonymous chat: stickers and short text, filtered, reportable.
   const chat = `${L}/messages`;

@@ -1274,17 +1274,16 @@ function stubRow(slot) {
     </li>`;
   }
   const hot = egg.timesFound === 0;
-  const bounty = egg.bounty ? `Bounty +${egg.bounty}, beat ${plural(egg.beaten, 'player')}. ` : '';
   // A running clock keeps ticking here too: leaving the round doesn't pause it.
   const meta = egg.clock
     ? `Your clock is running: <span data-ends="${Date.now() + egg.clock.secondsLeft * 1000}">${fmtClock(egg.clock.secondsLeft)}</span> left.`
     : egg.retry
-      ? `${bounty}It beat you last time. A retry earns no time bonus.`
-      : `${bounty}${hot ? `${mins}. Nobody's found it yet.` : `${mins}, found ${plural(egg.timesFound, 'time')}`}`;
-  return `<li class="stub is-open ${hot || egg.bounty || egg.clock ? 'is-hot' : ''}">
+      ? 'It beat you last time. A retry earns no time bonus.'
+      : hot ? `${mins}. Nobody's found it yet.` : `${mins}, found ${plural(egg.timesFound, 'time')}`;
+  return `<li class="stub is-open ${hot || egg.clock ? 'is-hot' : ''}">
     <span class="punch" aria-hidden="true">${slot.level}</span>
     <div class="stub-body"><p class="stub-name">${esc(slot.name)}</p>${pips}<p class="stub-meta">${meta}</p></div>
-    <button class="stub-act" type="button" data-play="${egg.id}"><b>${slot.points + (egg.bounty ?? 0)}</b><span>${egg.clock ? 'Resume' : egg.retry ? 'Retry' : 'Play'}</span></button>
+    <button class="stub-act" type="button" data-play="${egg.id}"><b>${slot.points}</b><span>${egg.clock ? 'Resume' : egg.retry ? 'Retry' : 'Play'}</span></button>
   </li>`;
 }
 
@@ -1320,15 +1319,13 @@ function viewPlay() {
   const graceLeft = () => secondsLeft() + (state.config?.graceSeconds ?? 15);
   const maxBonus = state.config?.maxTimeBonus ?? 0.5;
   const perHole = attempt.limitSeconds / PUNCH_HOLES;
-  const tag = [play.firstChance && 'Nobody has found this yet', egg.bounty && `Bounty +${egg.bounty}: beat ${plural(egg.beaten, 'player')}`]
-    .filter(Boolean)
-    .join(' · ');
+  const tag = play.firstChance ? 'Nobody has found this yet' : '';
 
   app.innerHTML = `
     <div class="play-bar">
       <a class="icon-btn" href="#/station/${encodeURIComponent(egg.stationId)}" id="quitX" aria-label="Leave for now. Your clock keeps running."><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></a>
       <p class="play-title"><b>${esc(egg.levelName)}</b> at ${esc(egg.stationName)}</p>
-      <p class="mypts mypts-here"><b>${egg.points + (egg.bounty ?? 0)}</b> pts</p>
+      <p class="mypts mypts-here"><b>${egg.points}</b> pts</p>
     </div>
     <section class="tk play-tk">
       <div class="tk-top">
@@ -1452,19 +1449,13 @@ async function renderResult() {
         <div class="tk-top">
           <h1 class="win-head">${gaveUp ? 'You gave up' : "Time's up"}</h1>
           <p class="win-sub">The ${esc(egg.levelName)} egg at ${esc(egg.stationName)} beat you.${gaveUp ? '' : ' Every hole is punched.'} You can retry it, but a retry earns no time bonus.</p>
-          <p class="win-sub" id="bountyNote"></p>
         </div>
       </section>
       <a class="btn btn-ink btn-block btn-l" href="${back}">Try another level</a>`;
     state.play = null;
-    // Tell the server the round is over: it locks the egg for you and counts your miss toward the
-    // bounty. If this fails, the round still runs out on its own a moment later.
+    // Tell the server the round is over. If this fails, the round still runs out on its own a moment later.
     try {
-      const end = await api(`/api/attempts/${play.attempt.id}/end`, {});
-      const note = $('#bountyNote');
-      if (note && end.counted) {
-        note.innerHTML = `<b>You added to its bounty.</b> Whoever finds it now gets +${end.bounty}, and its hider gets half.`;
-      }
+      await api(`/api/attempts/${play.attempt.id}/end`, {});
     } catch {
       /* nothing to show */
     }
@@ -1488,7 +1479,7 @@ async function renderResult() {
       <dl class="tk-bottom win-math">
         <div><dt>${esc(egg.levelName)}</dt><dd>${points.base}</dd></div>
         <div><dt>Time bonus</dt><dd>+${points.bonus}</dd></div>
-        ${points.bounty ? `<div><dt>Bounty</dt><dd>+${points.bounty}</dd></div>` : `<div><dt>Took</dt><dd>${fmtClock(result.secondsTaken)}</dd></div>`}
+        <div><dt>Took</dt><dd>${fmtClock(result.secondsTaken)}</dd></div>
       </dl>
     </section>
     <section class="match" aria-label="Photo check">
@@ -1501,7 +1492,7 @@ async function renderResult() {
     <ul id="gains" class="gains" aria-live="polite"></ul>
     <section class="next-egg">
       <h2 class="sec-h">Hide the next one</h2>
-      <p class="next-egg-copy">Your photo becomes the new ${esc(egg.levelName)} egg at ${esc(egg.stationName)}. Every player it beats grows its bounty, and you get half when someone finally finds it.</p>
+      <p class="next-egg-copy">Your photo becomes the new ${esc(egg.levelName)} egg at ${esc(egg.stationName)}.</p>
       <button id="hide" class="btn btn-primary btn-block btn-l" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>Hide the next ${esc(egg.levelName)} egg</button>
       <a id="skip" class="btn btn-ghost btn-block" href="${back}">Skip</a>
     </section>`;
@@ -1535,10 +1526,6 @@ async function renderResult() {
     api(`/api/stations/${encodeURIComponent(egg.stationId)}`).catch(() => null),
   ]);
   const gains = [];
-  if (points.bounty) {
-    const hider = result.hider ? ` ${esc(result.hider.username)} gets +${result.hider.points} for hiding it.` : '';
-    gains.push(['stamp', `<b>Bounty +${points.bounty}.</b> This egg beat ${plural(result.beaten, 'player')} before you.${hider}`]);
-  }
   const h = state.hud;
   if (h?.rank) {
     const was = before.hud?.rank ?? null;
@@ -1621,7 +1608,6 @@ function viewHide() {
         <p class="field-hint">Finders see this. It has to match what's in the photo.</p>
         <label class="field-label" for="hint">Hint <span class="opt">(optional, one line)</span></label>
         <input id="hint" class="input" maxlength="80" placeholder="e.g. near the stairs to outbound" />
-        <p class="clock-ctx">You score when your egg beats people. Each player who runs out of time adds to its bounty, and you get half when someone finally finds it. An egg nobody finds pays nothing, so make it hard but findable.</p>
       </div>
     </section>
     <ul class="rules">
@@ -1987,7 +1973,7 @@ async function viewProfile() {
       <div class="tk-top level-top">
         <div>
           <h1 class="page-h">${esc(p.user.username)}</h1>
-          <p class="page-sub">${p.monthRank ? `${ordinal(p.monthRank)} this month. ` : ''}${lv ? `Rider level ${lv.level}${lv.next ? `, ${lv.next - lv.points} pts to level ${lv.level + 1}.` : '.'}` : ''}${p.hiderPoints ? ` Your eggs have earned you ${p.hiderPoints} pts in bounties.` : ''}</p>
+          <p class="page-sub">${p.monthRank ? `${ordinal(p.monthRank)} this month. ` : ''}${lv ? `Rider level ${lv.level}${lv.next ? `, ${lv.next - lv.points} pts to level ${lv.level + 1}.` : '.'}` : ''}</p>
         </div>
         ${lv ? `<span class="level-badge" aria-hidden="true">${lv.level}</span>` : ''}
       </div>
@@ -2040,7 +2026,7 @@ async function viewPlayer(id) {
   app.innerHTML = `
     <a class="back" href="#/leaderboard"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>Ranks</a>
     <section class="tk level-tk">
-      <div class="tk-top"><h1 class="page-h">${esc(p.user.username)}</h1><p class="page-sub">${p.monthRank ? `${ordinal(p.monthRank)} this month` : 'Not on the board yet this month'}${p.hiderPoints ? `. Their eggs have earned ${p.hiderPoints} pts in bounties` : ''}</p></div>
+      <div class="tk-top"><h1 class="page-h">${esc(p.user.username)}</h1><p class="page-sub">${p.monthRank ? `${ordinal(p.monthRank)} this month` : 'Not on the board yet this month'}</p></div>
       <div class="tk-perf" aria-hidden="true"></div>
       <dl class="tk-bottom mini-stats">
         <div><dt>This month</dt><dd>${p.monthPoints}</dd></div>

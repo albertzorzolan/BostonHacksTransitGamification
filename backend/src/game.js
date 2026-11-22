@@ -1,15 +1,15 @@
 // Game rules: levels, scoring, timers. Pure functions, no database.
 // How eggs rotate through a station's slots lives in slots.js (SQL).
 
-// Every level gets the same 3-minute timer; harder levels show the finder a blurred photo instead.
+// seconds = the round's timer. Hard and Impossible get less time; Extreme and Impossible show
+// the finder a blurred photo.
 // blur = Gaussian sigma in pixels, applied after scaling the photo to fit 1024 px (0 = sharp).
-export const ROUND_SECONDS = 180;
 export const LEVELS = [
-  { level: 1, name: 'Easy', points: 10, seconds: ROUND_SECONDS, blur: 0 },
-  { level: 2, name: 'Medium', points: 20, seconds: ROUND_SECONDS, blur: 0 },
-  { level: 3, name: 'Hard', points: 30, seconds: ROUND_SECONDS, blur: 0 },
-  { level: 4, name: 'Extreme', points: 40, seconds: ROUND_SECONDS, blur: 6 },
-  { level: 5, name: 'Impossible', points: 60, seconds: ROUND_SECONDS, blur: 16 },
+  { level: 1, name: 'Easy', points: 10, seconds: 180, blur: 0 },
+  { level: 2, name: 'Medium', points: 20, seconds: 180, blur: 0 },
+  { level: 3, name: 'Hard', points: 30, seconds: 120, blur: 0 },
+  { level: 4, name: 'Extreme', points: 40, seconds: 180, blur: 6 },
+  { level: 5, name: 'Impossible', points: 60, seconds: 60, blur: 16 },
 ];
 
 export const GRACE_SECONDS = 15; // upload time allowance after the clock hits zero
@@ -22,39 +22,23 @@ export const HIDE_WINDOW_MINUTES = 30; // how long after a find you can hide the
 // back resumes it instead of resetting it. Once it runs out (or you give up) you can retry right
 // away with a fresh clock, but a retry earns no time bonus: you've already had a look around.
 
-// Bounty: every player an egg beats (their clock ran out or they gave up) adds to its pot.
-// The finder takes the pot, and the hider gets a share of it, paid only when the egg is found.
-export const BOUNTY_PER_PLAYER = 0.25; // of the level's base points, per player beaten
-export const BOUNTY_CAP = 2; // the pot tops out at 2x the level's base points
-export const HIDER_SHARE = 0.5; // of the pot, paid to the hider when someone claims it
-
 export function levelInfo(level) {
   const info = LEVELS.find((l) => l.level === Number(level));
   if (!info) throw new Error(`Unknown level ${level}`);
   return info;
 }
 
-export function scoreFind(level, secondsTaken, limitSeconds, { bounty = 0, retry = false } = {}) {
+export function scoreFind(level, secondsTaken, limitSeconds, { retry = false } = {}) {
   const base = levelInfo(level).points;
   const fractionLeft = Math.max(0, limitSeconds - secondsTaken) / limitSeconds;
   const bonus = retry ? 0 : Math.round(base * MAX_TIME_BONUS * Math.min(1, fractionLeft));
-  return { base, bonus, bounty, total: base + bonus + bounty };
+  return { base, bonus, total: base + bonus };
 }
-
-export function bountyFor(level, playersBeaten) {
-  const base = levelInfo(level).points;
-  return Math.min(Math.round(base * BOUNTY_CAP), Math.round(base * BOUNTY_PER_PLAYER * playersBeaten));
-}
-
-export const hiderShare = (bounty) => Math.round(bounty * HIDER_SHARE);
 
 // When a round's clock is over: when it was given up, or when its time plus the upload grace ran out.
 export function roundEndsAt(attempt) {
   return attempt.endedAt ?? new Date(attempt.startedAt.getTime() + (attempt.limitSeconds + GRACE_SECONDS) * 1000);
 }
-
-// The longest a round can last, so queries can skip rounds that started too early to matter.
-export const MAX_ROUND_MS = (ROUND_SECONDS + GRACE_SECONDS) * 1000;
 
 // "2026-11" in Boston time, so the monthly board flips at local midnight.
 export function monthKey(date, timeZone = 'America/New_York') {

@@ -68,10 +68,10 @@ export const BATCHES = {
     ],
     finds: [
       [0, 'place-portr', 3, 70], [0, 'place-sull', 2, 45], [0, 'place-boyls', 4, 150], [0, 'place-aqucl', 1, 25],
-      [1, 'place-brdwy', 1, 33], [1, 'place-forhl', 5, 170],
+      [1, 'place-brdwy', 1, 33], [1, 'place-forhl', 5, 55],
       [2, 'place-rugg', 2, 52], [2, 'place-ogmnl', 3, 110], [2, 'place-state', 1, 19],
       [3, 'place-hymnl', 2, 61], [3, 'place-sdmnl', 4, 128],
-      [4, 'place-prmnl', 1, 24], [4, 'place-river', 5, 165], [4, 'place-asmnl', 2, 77],
+      [4, 'place-prmnl', 1, 24], [4, 'place-river', 5, 48], [4, 'place-asmnl', 2, 77],
       [5, 'place-bmmnl', 3, 90], [5, 'place-chmnl', 1, 29],
     ],
     group: {
@@ -246,7 +246,7 @@ export async function addSeed(col, now = new Date(), batch = null) {
     const foundAt = ago(60 * (30 - n * 1.5));
     const eggId = id();
     await col.eggs.insertOne({ _id: eggId, stationId, level, photoId: eggPhotoId, hint: null, name: nameFromHint(object), createdBy: hider._id, createdAt: ago(60 * 48), status: 'retired', retiredAt: foundAt, activatedAt: ago(60 * 48), timesFound: 1, avgFindSeconds: secondsTaken, ...tag });
-    const score = game.scoreFind(level, secondsTaken, game.ROUND_SECONDS);
+    const score = game.scoreFind(level, secondsTaken, game.levelInfo(level).seconds);
     await col.finds.insertOne({
       _id: id(),
       eggId,
@@ -259,7 +259,6 @@ export async function addSeed(col, now = new Date(), batch = null) {
       points: score.total,
       base: score.base,
       bonus: score.bonus,
-      bounty: 0,
       photoId,
       verified: false,
       canHide: false,
