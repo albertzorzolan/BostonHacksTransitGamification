@@ -27,6 +27,8 @@ export async function createDb({ uri, dbName = 'egghunt', maxPoolSize = 10 }) {
   // Idempotent, so every instance runs it on startup.
   await Promise.all([
     col.users.createIndex({ usernameLower: 1 }, { unique: true }),
+    // Anonymous chat names are unique too (accounts made before chat names existed have none).
+    col.users.createIndex({ chatNameLower: 1 }, { unique: true, partialFilterExpression: { chatNameLower: { $exists: true } } }),
     col.sessions.createIndex({ tokenHash: 1 }, { unique: true }),
     col.sessions.createIndex({ userId: 1 }),
     // MongoDB deletes expired sessions on its own.

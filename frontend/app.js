@@ -267,6 +267,110 @@ function nearestStation(stations) {
 }
 const isInRange = (n) => Boolean(n && n.m <= RANGE_METERS + Math.min(loc.pos?.accuracy ?? 0, ACCURACY_CAP));
 
+// ---------- alerts ----------
+// Two kinds, both shown as a toast, and as a phone/desktop notification when the player allowed it:
+//  - someone found one of your eggs (polled from /api/me/notifications?summary=1)
+//  - GPS puts you at a station: how many eggs are waiting for you there today
+const ALERT_POLL_MS = 30_000;
+const ARRIVAL_COOLDOWN_MS = 30 * 60_000; // per station, so walking around a platform doesn't repeat it
+const canNotify = () => 'Notification' in window && Notification.permission === 'granted';
+
+// Alerts queue up so two at once (say, arriving at a station just as your egg is found)
+// don't overwrite each other.
+const alertQueue = [];
+function showNextAlert() {
+  if (showNextAlert.busy || !alertQueue.length) return;
+  showNextAlert.busy = true;
+  toast(alertQueue.shift(), 5000);
+  setTimeout(() => {
+    showNextAlert.busy = false;
+    showNextAlert();
+  }, 5200);
+}
+function notifyPlayer(title, body, href) {
+  alertQueue.push(`${title} ${body}`);
+  showNextAlert();
+  if (!canNotify()) return;
+  try {
+    const n = new Notification(title, { body, icon: 'icon.svg', tag: href });
+    n.onclick = () => {
+      window.focus();
+      location.hash = href;
+      n.close();
+    };
+  } catch {
+    /* some mobile browsers only allow notifications from a service worker: the toast is enough */
+  }
+}
+
+async function checkNotifications() {
+  if (!state.user || document.visibilityState === 'hidden' && !canNotify()) return;
+  try {
+    const { unseen, latest } = await api('/api/me/notifications?summary=1');
+    state.unseen = unseen;
+    drawBell();
+    // Alert once per find: remember the newest one already announced.
+    const key = `egg-told:${state.user.id}`;
+    const told = readStored(key) ?? 0;
+    const fresh = latest.filter((n) => Date.parse(n.at) > told);
+    if (fresh.length) {
+      const n = fresh[0];
+      const more = fresh.length > 1 ? ` (+${fresh.length - 1} more)` : '';
+      notifyPlayer('Your egg was found!', `${n.by} found your ${n.levelName} egg at ${n.stationName}.${more}`, '#/notifications');
+    }
+    if (latest.length) store(key, Math.max(told, ...latest.map((n) => Date.parse(n.at))));
+  } catch {
+    /* extra: try again next time */
+  }
+}
+
+async function checkArrival() {
+  if (!state.user || loc.status !== 'ok') return;
+  const stations = state.stations ?? (await getStations().catch(() => null));
+  const near = stations && nearestStation(stations);
+  if (!isInRange(near)) {
+    state.arrivedAt = null; // left the station: arriving again later can alert again
+    return;
+  }
+  const st = near.station;
+  if (state.arrivedAt === st.id) return;
+  state.arrivedAt = st.id;
+  const seen = readStored('egg-arrivals') ?? {};
+  if (Date.now() - (seen[st.id] ?? 0) < ARRIVAL_COOLDOWN_MS) return;
+  store('egg-arrivals', { ...seen, [st.id]: Date.now() });
+  let fresh;
+  try {
+    fresh = (await api('/api/stations')).stations;
+    state.stations = fresh;
+  } catch {
+    return;
+  }
+  const s = fresh.find((x) => x.id === st.id) ?? st;
+  const left = s.playable ?? 0;
+  const href = `#/station/${encodeURIComponent(s.id)}`;
+  if (left) notifyPlayer(`You're at ${s.name}.`, `Find your eggs today: ${plural(left, 'egg')} waiting for you here.`, href);
+  else if (s.activeEggs) notifyPlayer(`You're at ${s.name}.`, "You've cleared every egg here today. Hide a new one!", href);
+  else notifyPlayer(`You're at ${s.name}.`, 'No eggs here yet. Hide the first one today!', href);
+}
+
+function startAlerts() {
+  if (state.alerting) return;
+  state.alerting = true;
+  loc.subs.add(checkArrival); // stays on for the whole visit, not just one page
+  setInterval(checkNotifications, ALERT_POLL_MS);
+  document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && checkNotifications());
+  checkNotifications();
+}
+
+function drawBell() {
+  const b = $('#bell');
+  if (!b) return;
+  const n = state.unseen ?? 0;
+  b.querySelector('.bell-n')?.remove();
+  if (n) b.insertAdjacentHTML('beforeend', `<span class="bell-n">${n > 9 ? '9+' : n}</span>`);
+  b.setAttribute('aria-label', n ? `Notifications, ${n} new` : 'Notifications');
+}
+
 // ---------- the HUD: rank, points and the rival just above you ----------
 async function refreshHud(force = false) {
   if (!state.user) return;
@@ -309,9 +413,13 @@ function drawHud() {
   el.innerHTML = `
     <div class="hud-top">
       <a href="#/" class="brand"><img src="icon.svg" alt="" width="28" height="28" />Lookout</a>
-      <a class="mypts" href="#/leaderboard">${chip}<b>${h?.points ?? 0}</b> pts</a>
+      <div class="hud-right">
+        <a id="bell" class="bell" href="#/notifications" aria-label="Notifications"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z" /><path d="M10 20.5a2 2 0 0 0 4 0" /></svg></a>
+        <a class="mypts" href="#/leaderboard">${chip}<b>${h?.points ?? 0}</b> pts</a>
+      </div>
     </div>
     <a class="rival" href="#/leaderboard">${rival}</a>`;
+  drawBell();
 }
 
 async function refreshProgress() {
@@ -332,6 +440,7 @@ const routes = [
   [/^#\/hide$/, viewHide],
   [/^#\/leaderboard$/, viewLeaderboard],
   [/^#\/profile$/, viewProfile],
+  [/^#\/notifications$/, viewNotifications],
   [/^#\/user\/([^/]+)$/, viewPlayer],
   [/^#\/map$/, viewMap],
   [/^#\/groups$/, viewGroups],
@@ -359,7 +468,7 @@ async function render() {
     ? 'map'
     : hash.startsWith('#/leaderboard') || hash.startsWith('#/user/')
       ? 'leaderboard'
-      : hash.startsWith('#/profile')
+      : hash.startsWith('#/profile') || hash.startsWith('#/notifications')
         ? 'profile'
         : /^#\/(groups|group\/|join\/)/.test(hash)
           ? 'groups'
@@ -388,6 +497,7 @@ function setSession(data) {
   state.user = data?.user ?? null;
   state.token = data?.token ?? null;
   store('egg-session', data ? { user: data.user, token: data.token } : null);
+  if (state.user) startAlerts();
 }
 
 // Forget this device's session. `everywhere` signs out every device on the account.
@@ -442,6 +552,7 @@ function viewSignup(mode = 'register') {
         </div>
         <label class="field-label" for="username">Username</label>
         <input id="username" class="input" maxlength="20" autocomplete="username" autocapitalize="none" placeholder="e.g. kenmore_kid" required />
+        ${registering ? '<p class="field-hint">Shown on leaderboards. Group chats use a separate anonymous name.</p>' : ''}
         <label class="field-label" for="password">Password ${registering ? `<span class="opt">(at least ${min} characters)</span>` : ''}</label>
         <input id="password" class="input" type="password" maxlength="200" ${registering ? `minlength="${min}"` : ''} autocomplete="${registering ? 'new-password' : 'current-password'}" required />
         <button class="btn btn-ink btn-block btn-l">${registering ? 'Start playing' : 'Sign in'}</button>
@@ -461,6 +572,7 @@ function viewSignup(mode = 'register') {
       });
       setSession(data);
       startLocation();
+      if (registering && data.user.chatName) toast(`In group chats you're "${data.user.chatName}". Change it in Profile.`, 4200);
       if (location.hash && location.hash !== '#/' && !location.hash.startsWith('#/join/')) location.hash = '#/';
       else render();
     } catch (err) {
@@ -1204,7 +1316,8 @@ async function viewLeaderboard() {
   await draw();
 }
 
-// ---------- tickets (your profile) ----------
+// ---------- profile ----------
+// Each find is a little punched ticket.
 function ticketsGrid(finds) {
   return finds.length
     ? `<ul class="book">${finds
@@ -1221,7 +1334,88 @@ function ticketsGrid(finds) {
           </li>`;
         })
         .join('')}</ul>`
-    : '<div class="empty"><p>No punched tickets yet. Find an egg and it lands here.</p></div>';
+    : '<div class="empty"><p>No finds yet. Find an egg and it lands here.</p></div>';
+}
+
+// Your recent activity, newest first (only ever sent for your own profile).
+const fmtWhen = (iso) => {
+  const mins = (Date.now() - new Date(iso).getTime()) / 60_000;
+  if (mins < 1) return 'just now';
+  if (mins < 60) return relTime.format(-Math.floor(mins), 'minute');
+  if (mins < 24 * 60) return relTime.format(-Math.floor(mins / 60), 'hour');
+  if (mins < 7 * 24 * 60) return relTime.format(-Math.floor(mins / 1440), 'day');
+  return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+};
+function activityList(items) {
+  if (!items?.length) return '';
+  const at = (a) => `<a href="#/station/${encodeURIComponent(a.stationId)}">${esc(a.stationName)}</a>`;
+  const row = (a) => {
+    const [icon, text, pts] =
+      a.type === 'found' ? ['🥚', `Found the ${esc(a.levelName)} egg at ${at(a)}`, `+${a.points}`]
+      : a.type === 'hid' ? ['📍', `Hid a ${esc(a.levelName)} egg at ${at(a)}`]
+      : a.type === 'egg_found' ? ['👀', `<b>${esc(a.by)}</b> found your ${esc(a.levelName)} egg at ${at(a)}`]
+      : a.type === 'joined_group' ? ['👥', `Joined <a href="#/group/${encodeURIComponent(a.groupId)}">${esc(a.groupName)}</a>`]
+      : ['🎟️', 'Joined Lookout'];
+    return `<li><span class="act-ic" aria-hidden="true">${icon}</span><p>${text}<small>${fmtWhen(a.at)}</small></p>${pts ? `<b class="act-pts">${pts}</b>` : ''}</li>`;
+  };
+  return `<ol class="activity">${items.map(row).join('')}</ol>`;
+}
+
+// Username (public: leaderboards, profile) and chat name (anonymous: group chats only).
+function namesCard(user) {
+  return `<section class="tk names">
+    <div class="name-row">
+      <div><p class="next-label">Username</p><p class="name-val">${esc(user.username)}</p><small>On leaderboards and your profile. You sign in with it.</small></div>
+      <button class="link" type="button" data-edit="username">Change</button>
+    </div>
+    <div class="tk-perf" aria-hidden="true"></div>
+    <div class="name-row">
+      <div><p class="next-label">Anonymous chat name</p><p class="name-val">${esc(user.chatName ?? '')}</p><small>All group chats show this name instead of your username. Only you can see it's yours.</small></div>
+      <button class="link" type="button" data-edit="chatName">Change</button>
+    </div>
+    <form id="nameForm" class="name-form" hidden>
+      <label class="field-label" for="nameInput"></label>
+      <div class="name-edit"><input id="nameInput" class="input" maxlength="20" autocapitalize="none" autocomplete="off" required /><button class="btn btn-ink" type="submit">Save</button></div>
+      <div class="name-tools"><button id="dice" class="link" type="button" hidden>Random name</button><button id="nameCancel" class="link" type="button">Cancel</button></div>
+      <div id="nameErr"></div>
+    </form>
+  </section>`;
+}
+
+const CHAT_WORDS = [['Sleepy', 'Speedy', 'Sneaky', 'Lucky', 'Rusty', 'Shiny', 'Grumpy', 'Jolly', 'Cosmic', 'Salty', 'Mystic', 'Stealthy'], ['Turnstile', 'Trolley', 'Pigeon', 'Conductor', 'Railcar', 'Signal', 'Token', 'Tunnel', 'Caboose', 'Owl', 'Raccoon', 'Otter']];
+const randomChatName = () => `${CHAT_WORDS.map((w) => w[Math.floor(Math.random() * w.length)]).join(' ')} ${10 + Math.floor(Math.random() * 90)}`;
+
+function wireNames(onSaved) {
+  const form = $('#nameForm');
+  let field = null;
+  app.querySelectorAll('[data-edit]').forEach((b) =>
+    b.addEventListener('click', () => {
+      field = b.dataset.edit;
+      form.hidden = false;
+      form.querySelector('label').textContent = field === 'username' ? 'New username' : 'New chat name';
+      $('#dice').hidden = field !== 'chatName';
+      $('#nameErr').innerHTML = '';
+      $('#nameInput').value = state.user[field] ?? '';
+      $('#nameInput').focus();
+      $('#nameInput').select();
+    }),
+  );
+  $('#dice').addEventListener('click', () => ($('#nameInput').value = randomChatName()));
+  $('#nameCancel').addEventListener('click', () => (form.hidden = true));
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = form.querySelector('.btn');
+    btn.disabled = true;
+    try {
+      const { user } = await api('/api/me/names', { [field]: $('#nameInput').value });
+      setSession({ user, token: state.token });
+      toast(field === 'username' ? 'Username changed. Sign in with the new one from now on.' : `You're now "${user.chatName}" in group chats.`, 3600);
+      onSaved();
+    } catch (err) {
+      $('#nameErr').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+      btn.disabled = false;
+    }
+  });
 }
 
 function deviceList(sessions) {
@@ -1270,6 +1464,8 @@ async function viewProfile() {
         </dl>
       </div>
     </section>
+    ${namesCard({ ...p.user, chatName: p.user.chatName ?? state.user.chatName })}
+    ${p.activity?.length ? `<div class="eggs-head"><h2 class="sec-h">Activity</h2><p class="eggs-count">Latest first</p></div>${activityList(p.activity)}` : ''}
     ${challengeTicket(progress?.today)}
     ${progress ? `
     <div class="eggs-head"><h2 class="sec-h">Lines punched</h2><p class="eggs-count">${progress.lines.filter((l) => l.stations).length} of 4</p></div>
@@ -1282,7 +1478,7 @@ async function viewProfile() {
       .join('')}${progress.stations
       .map((s) => `<li class="st is-got"><span class="st-seal st-station" style="--ln:${LINE_VAR[s.lines[0]] ?? 'var(--stamp)'}">${esc(s.name)}</span><p>${plural(s.finds, 'find')} here</p></li>`)
       .join('')}</ul>` : ''}
-    <div class="eggs-head"><h2 class="sec-h">Punched tickets</h2><p class="eggs-count">${plural(p.recentFinds.length, 'recent find')}</p></div>
+    <div class="eggs-head"><h2 class="sec-h">Recent finds</h2><p class="eggs-count">${plural(p.recentFinds.length, 'find')}</p></div>
     ${ticketsGrid(p.recentFinds)}
     <h2 class="sec-h">Signed-in devices</h2>
     ${deviceList(sessions)}
@@ -1290,6 +1486,7 @@ async function viewProfile() {
       <button id="out" class="btn btn-ghost" type="button">Sign out</button>
       <button id="outAll" class="link" type="button">Sign out on all devices</button>
     </div>`;
+  wireNames(viewProfile);
   $('#out').addEventListener('click', () => signOut({ remote: true }));
   $('#outAll').addEventListener('click', () => {
     if (confirm('Sign out on every phone and computer using this account?')) signOut({ remote: true, everywhere: true });
@@ -1313,8 +1510,45 @@ async function viewPlayer(id) {
         <div><dt>Found by others</dt><dd>${p.timesYourEggsWereFound}</dd></div>
       </dl>
     </section>
-    <div class="eggs-head"><h2 class="sec-h">Punched tickets</h2></div>
+    <div class="eggs-head"><h2 class="sec-h">Recent finds</h2></div>
     ${ticketsGrid(p.recentFinds)}`;
+}
+
+// ---------- notifications ----------
+// Your eggs, and every time someone found one. Opening the page marks them seen.
+const EGG_STATUS = { active: 'Live now', pool: 'Waiting in the pool', retired: 'Retired' };
+async function viewNotifications() {
+  loading();
+  const [data] = await Promise.all([api('/api/me/notifications'), getStations()]);
+  const c = data.counts;
+  const at = (n) => `<a href="#/station/${encodeURIComponent(n.stationId)}">${esc(n.stationName)}</a>`;
+  const row = (n) =>
+    n.type === 'egg_found'
+      ? `<li class="${n.unseen ? 'is-new' : ''}"><span class="act-ic" aria-hidden="true">🎉</span><p><b>${esc(n.by)}</b> found your ${esc(n.levelName)} egg at ${at(n)}<small>${fmtWhen(n.at)}${n.unseen ? ' · New' : ''}</small></p><b class="act-pts">+${n.points}</b></li>`
+      : `<li class="nt-egg"><img src="${apiUrl(n.photoUrl)}" alt="Your egg at ${esc(n.stationName)}" loading="lazy" /><p>You hid a ${esc(n.levelName)} egg at ${at(n)}${n.hint ? `<small>Hint: ${esc(n.hint)}</small>` : ''}<small>${fmtWhen(n.at)} · ${EGG_STATUS[n.status] ?? esc(n.status)} · ${n.timesFound ? `found ${plural(n.timesFound, 'time')}` : 'not found yet'}</small></p></li>`;
+  const ask = 'Notification' in window && Notification.permission === 'default';
+  app.innerHTML = `
+    <h1 class="page-h">Notifications</h1>
+    <p class="page-sub">Your eggs, and every time someone finds one.</p>
+    <div class="map-tally nt-tally">
+      <p><b>${c.finds}</b>${c.finds === 1 ? 'egg' : 'eggs'} you found</p>
+      <p><b>${c.eggsHidden}</b>${c.eggsHidden === 1 ? 'egg' : 'eggs'} you hid</p>
+      <p><b>${c.foundByOthers}</b>${c.foundByOthers === 1 ? 'time' : 'times'} others found yours</p>
+    </div>
+    ${ask ? '<div class="notice nt-ask"><p>Get a heads-up when someone finds your egg, or when you reach a station with eggs waiting.</p><button id="allow" class="btn btn-ink" type="button">Turn on alerts</button></div>' : ''}
+    ${data.items.length
+      ? `<ol class="activity nt-list">${data.items.map(row).join('')}</ol>`
+      : '<div class="empty"><p>Nothing yet. Hide an egg at a station and you\'ll hear here when someone finds it.</p><a class="btn btn-ghost" href="#/">Find a station</a></div>'}`;
+  $('#allow')?.addEventListener('click', async () => {
+    const r = await Notification.requestPermission().catch(() => 'denied');
+    toast(r === 'granted' ? "Alerts on. We'll tell you when your eggs are found." : 'Alerts are off. You can still check this page.');
+    $('.nt-ask')?.remove();
+  });
+  if (data.unseen) {
+    api('/api/me/notifications/seen', {}).catch(() => {});
+    state.unseen = 0;
+    drawBell();
+  }
 }
 
 // ---------- friend groups ----------
@@ -1405,15 +1639,14 @@ async function viewGroup(id) {
   let stopPolling = null;
   const monthLabel = new Date().toLocaleString('en-US', { month: 'long', timeZone: 'America/New_York' });
 
-  // Every sticker carries the sender's rank in this group: it's a competition.
-  const rankOf = (userId) => data.rows.find((r) => r.userId === userId)?.rank ?? null;
+  // The chat is anonymous: everyone shows by their chat name, never their username or rank.
+  const myRank = () => data.rows.find((r) => r.userId === state.user.id)?.rank ?? null;
   const stickerHtml = (m) => {
-    const mine = m.userId === state.user.id;
-    const r = rankOf(m.userId);
-    return `<div class="msg ${mine ? 'mine' : ''}">
+    const r = m.mine ? myRank() : null;
+    return `<div class="msg ${m.mine ? 'mine' : ''}">
       <span class="msg-emoji" aria-hidden="true">${esc(m.emoji)}</span>
       <p class="msg-cap">${esc(m.label)}</p>
-      <p class="msg-meta">${mine ? 'You' : esc(m.username)}${r ? `<span class="rank-chip">${r === 1 ? '👑 ' : ''}${ordinal(r)}</span>` : ''} · ${fmtTime(m.createdAt)}</p>
+      <p class="msg-meta">${m.mine ? 'You' : esc(m.name)}${r ? `<span class="rank-chip">${r === 1 ? '👑 ' : ''}${ordinal(r)}</span>` : ''} · ${fmtTime(m.createdAt)}</p>
     </div>`;
   };
 
@@ -1438,7 +1671,7 @@ async function viewGroup(id) {
     <section class="tk"><div id="feed" class="feed" aria-live="polite">${chat.messages.length
       ? chat.messages.map(stickerHtml).join('')
       : '<div class="empty"><p>No stickers yet. Start the trash talk.</p></div>'}</div></section>
-    <p class="chat-hint">Tap a sticker to send it to the group</p>
+    <p class="chat-hint">You're <b>${esc(state.user.chatName ?? 'anonymous')}</b> here (<a href="#/profile">change</a>). Tap a sticker to send it.</p>
     <div class="stickers">${(state.config?.stickers ?? [])
       .map((st) => `<button class="stk" type="button" data-sticker="${esc(st.id)}" aria-label="Send ${esc(st.label)}"><span aria-hidden="true">${esc(st.emoji)}</span><small>${esc(st.label)}</small></button>`)
       .join('')}</div>`;
@@ -1458,7 +1691,7 @@ async function viewGroup(id) {
     if (!feed) return;
     feed.querySelector('.empty')?.remove();
     feed.insertAdjacentHTML('beforeend', fresh.map(stickerHtml).join(''));
-    scrollFeed(fresh.some((m) => m.userId === state.user.id));
+    scrollFeed(fresh.some((m) => m.mine));
   }
 
   async function poll() {
@@ -1641,30 +1874,57 @@ function loadLeaflet() {
   });
 }
 
+// Every station gets a badge with its egg count: line colour when there are eggs, faded once
+// you've found (or hidden) all of them, a small grey 0 when there are none.
 async function viewMap() {
   loading('Loading the map');
-  const [stations] = await Promise.all([getStations(), loadLeaflet()]);
+  const [{ stations, totals }] = await Promise.all([api('/api/stations'), loadLeaflet()]); // fresh counts
+  state.stations = stations;
   const css = getComputedStyle(document.documentElement);
   const ink = css.getPropertyValue('--ink').trim();
   const ticket = css.getPropertyValue('--ticket').trim();
-  const muted = css.getPropertyValue('--muted').trim();
   app.innerHTML = `
     <h1 class="page-h">Map</h1>
-    <p class="page-sub">Bigger dots have more eggs hidden. Tap a station to open it.</p>
-    <div id="map" class="map"></div>`;
+    <div class="map-tally" aria-label="Eggs on the T right now">
+      <p><b>${totals.eggs}</b>${totals.eggs === 1 ? 'egg' : 'eggs'} hidden</p>
+      <p><b>${totals.stationsWithEggs}</b>of ${totals.stations} stations</p>
+      <p><b>${totals.playable ?? totals.eggs}</b>left for you</p>
+    </div>
+    <div id="map" class="map"></div>
+    <ul class="map-key" aria-label="Map key">
+      <li><span class="pin pin-key" data-fam="Red" style="--ln:var(--line-red)">3</span>Eggs to find</li>
+      <li><span class="pin pin-done pin-key" style="--ln:var(--line-blue)">2</span>All found by you</li>
+      <li><span class="pin pin-zero pin-key">0</span>None yet</li>
+    </ul>`;
   const map = L.map('map', { zoomControl: true }).setView(loc.pos ? [loc.pos.lat, loc.pos.lng] : [42.3555, -71.0805], loc.pos ? 14 : 12);
   state.map = map;
+  // Zoomed out, stations without eggs shrink to dots and badges get smaller, so the city view stays readable.
+  const scale = () => {
+    const z = map.getZoom();
+    $('#map').dataset.z = z >= 14 ? 'near' : z >= 13 ? 'mid' : 'far';
+  };
+  map.on('zoomend', scale);
+  scale();
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18, attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
   for (const s of stations) {
-    L.circleMarker([s.lat, s.lng], {
-      radius: 5 + s.activeEggs * 1.6,
-      color: ticket,
-      weight: 2,
-      fillColor: s.lines[0]?.color ?? muted,
-      fillOpacity: s.activeEggs ? 1 : 0.55,
-    })
+    const fam = familiesOf(s.lines)[0];
+    const n = s.activeEggs;
+    const left = s.playable ?? n;
+    const size = n ? 28 : 18;
+    const cls = n === 0 ? 'pin pin-zero' : left === 0 ? 'pin pin-done' : 'pin';
+    const icon = L.divIcon({
+      className: 'pin-wrap',
+      html: `<span class="${cls}" data-fam="${esc(fam ?? '')}" style="--ln:${LINE_VAR[fam] ?? 'var(--ink)'}">${n}</span>`,
+      iconSize: [size, size],
+      iconAnchor: [size / 2, size / 2],
+      popupAnchor: [0, -size / 2],
+    });
+    const what = n
+      ? `${plural(n, 'egg')} hidden${left !== n ? `, ${left === 0 ? 'none' : left} left for you` : ''}`
+      : 'No eggs yet. Hide the first one.';
+    L.marker([s.lat, s.lng], { icon, title: `${s.name}: ${plural(n, 'egg')}`, riseOnHover: true, zIndexOffset: n ? 1000 + n * 10 + left : 0 })
       .addTo(map)
-      .bindPopup(`<strong>${esc(s.name)}</strong><br/>${s.activeEggs} of 5 eggs hidden<br/><a href="#/station/${encodeURIComponent(s.id)}">Open station</a>`);
+      .bindPopup(`<strong>${esc(s.name)}</strong><br/>${what}<br/><a href="#/station/${encodeURIComponent(s.id)}">Open station</a>`);
   }
   if (loc.pos) {
     L.circle([loc.pos.lat, loc.pos.lng], { radius: RANGE_METERS, color: ink, weight: 1, fillOpacity: 0.06 }).addTo(map);

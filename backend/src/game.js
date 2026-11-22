@@ -132,3 +132,12 @@ export function challengeFor(day) {
 }
 
 export const MAIN_LINES = ['Red', 'Orange', 'Blue', 'Green'];
+
+// Anonymous chat names, e.g. "Sleepy Turnstile 27". Every player gets one at sign-up
+// and can change it; the group chat shows only this name, never the username.
+const CHAT_ADJECTIVES = ['Sleepy', 'Speedy', 'Sneaky', 'Lucky', 'Rusty', 'Shiny', 'Grumpy', 'Jolly', 'Quiet', 'Brave', 'Dizzy', 'Fuzzy', 'Mighty', 'Swift', 'Cosmic', 'Salty', 'Witty', 'Mystic', 'Bouncy', 'Stealthy'];
+const CHAT_NOUNS = ['Turnstile', 'Trolley', 'Pigeon', 'Conductor', 'Platform', 'Railcar', 'Signal', 'Token', 'Tunnel', 'Switch', 'Bogie', 'Caboose', 'Lantern', 'Ticket', 'Whistle', 'Owl', 'Raccoon', 'Comet', 'Fox', 'Otter'];
+export function randomChatName(rand = Math.random) {
+  const pick = (a) => a[Math.floor(rand() * a.length)];
+  return `${pick(CHAT_ADJECTIVES)} ${pick(CHAT_NOUNS)} ${10 + Math.floor(rand() * 90)}`;
+}

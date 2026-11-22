@@ -51,6 +51,7 @@ To host `frontend/` somewhere else, set `window.EGG_API_BASE` in `frontend/confi
 ### Accounts
 
 - Players sign up with a username and password. Passwords are hashed with scrypt.
+- Every player also gets a random anonymous **chat name** (like "Sleepy Turnstile 27"), used only in group chats. Both names can be changed on the Profile tab. They share one namespace: a chat name can't match anyone's username, or your own.
 - Each sign-in creates a session for that device, using a random bearer token. The database stores only a SHA-256 hash of the token.
 - A session expires after 30 days without use. Profile lists every device signed in to the account, and "Sign out on all devices" ends all of those sessions.
 
@@ -95,6 +96,14 @@ To host `frontend/` somewhere else, set `window.EGG_API_BASE` in `frontend/confi
   - An egg is retired after 3 reports, or after 7 days live with no finds.
 - **Leaderboard:** this month (Boston time) for everyone, by station, or by line (Red / Orange / Blue / Green). Points include hiders' bounty shares. Tap a player to see their stats and recent finds.
 
+## Map
+
+- **Every station's egg count:** a badge in its line colour when it has eggs.
+- **Faded badges:** shown once you've found (or hidden) every egg there.
+- **Empty stations:** a grey "0" when zoomed in, and a small dot when zoomed out to city level, so the map stays readable.
+- **Totals above the map:** eggs hidden, stations with eggs, and how many are left for you.
+- **Fresh counts:** `/api/stations` returns `activeEggs` for every station and `totals`. When you're signed in, it also returns `playable`, the eggs that aren't yours and that you haven't found yet.
+
 ## Progress
 
 - **Rider level:** grows with all-time points.
@@ -102,7 +111,20 @@ To host `frontend/` somewhere else, set `window.EGG_API_BASE` in `frontend/confi
 - **Stamps:** 9 of them, for things like a first find, beating the train, finding an egg in 30 seconds, finding on all 4 lines, or hiding 5 eggs.
 - **Station cards:** one per station you've found eggs at.
 
-All of it is computed from your finds, so nothing extra is stored. It's shown on the Tickets tab and on each station.
+All of it is computed from your finds, so nothing extra is stored. It's shown on the Profile tab and on each station.
+
+## Profile
+
+The Profile tab has your level and points, your username and anonymous chat name (both changeable), and an **activity** feed: eggs you found and hid, other players finding your eggs, groups you joined and when you signed up. Activity is private to you. Below that are today's challenge, lines, stamps, recent finds and your signed-in devices.
+
+## Notifications
+
+The bell at the top opens **Notifications**:
+- every egg you hid, with its photo, hint, status (live, in the pool, retired) and how many times it's been found
+- every time another player found one of your eggs, with the points they scored
+- three counts: eggs you found, eggs you hid, and how many times others found yours
+
+**Alerts.** A red badge on the bell counts finds you haven't seen yet. The app checks every 30 seconds while it's open. When someone finds your egg, a pop-up says who and where. When GPS puts you at a station, a pop-up says how many eggs are waiting for you there today, or asks you to hide the first one. It shows at most once per station every 30 minutes. If you tap "Turn on alerts", the same messages also arrive as browser notifications.
 
 ## Friend groups
 
@@ -111,7 +133,7 @@ All of it is computed from your finds, so nothing extra is stored. It's shown on
 - Each group has its own leaderboard covering only its members, for this month or all time. Members with no points are listed unranked.
 - When the owner leaves, the longest-standing member becomes the owner. The last member to leave deletes the group.
 - Limits: 20 groups per player and 50 players per group. Both hold even when people join at the same moment.
-- **Sticker chat:** each group has a chat for trash talk, using stickers only (no typed messages). There are 20 competitive stickers such as 👑 "Who's the king now", 🐌 "Too slow" and ⚔️ "Bring it on". Each sticker shows the sender's current rank in the group. New stickers appear within about 4 seconds (the app checks for new ones while the chat is open). The limit is 8 stickers per 10 seconds per player, and stickers are deleted after 30 days.
+- **Sticker chat:** each group has a chat for trash talk, using stickers only (no typed messages). There are 20 competitive stickers such as 👑 "Who's the king now", 🐌 "Too slow" and ⚔️ "Bring it on". The chat is anonymous: senders show only by their chat name, and messages carry no user id, so they can't be matched to the group's leaderboard. New stickers appear within about 4 seconds (the app checks for new ones while the chat is open). The limit is 8 stickers per 10 seconds per player, and stickers are deleted after 30 days.
 
 ## Code map
 
