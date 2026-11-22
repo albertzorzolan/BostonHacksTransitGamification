@@ -27,6 +27,8 @@ export async function createDb({ uri, dbName = 'egghunt', maxPoolSize = 10 }) {
   // Idempotent, so every instance runs it on startup.
   await Promise.all([
     col.users.createIndex({ usernameLower: 1 }, { unique: true }),
+    // One account per email (accounts made before emails were required have none until they add one).
+    col.users.createIndex({ emailLower: 1 }, { unique: true, partialFilterExpression: { emailLower: { $exists: true } } }),
     // Anonymous chat names are unique too (accounts made before chat names existed have none).
     col.users.createIndex({ chatNameLower: 1 }, { unique: true, partialFilterExpression: { chatNameLower: { $exists: true } } }),
     col.sessions.createIndex({ tokenHash: 1 }, { unique: true }),

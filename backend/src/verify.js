@@ -135,3 +135,76 @@ export async function checkGemini({ apiKey, model: models, fetchImpl = fetch, no
   lastHealth = { at: now, model, result };
   return result;
 }
+
+// ---------- screening a photo before it's hidden as an egg ----------
+// Every new egg photo is checked before it's saved. It's rejected when it shows a person's face,
+// has no specific object in it, is too plain (a bare wall, floor or ceiling), is too dark or
+// blurry to use, or is inappropriate. It has to show one clear thing another rider could go and
+// find. Without a key (local development only) photos are accepted.
+const SCREEN_PROMPT = `You review photos for a scavenger hunt inside subway stations.
+A player took this photo to hide as an "egg": other riders will see it and must find that exact thing in the station.
+
+Decide whether the photo is usable. It is usable only if it clearly shows one specific, findable physical thing
+(a sticker, sign, tile, mark, fixture, poster detail, piece of art, damage, graffiti, a map, a number) with enough
+detail that someone standing in the station could recognise it.
+
+Pick the single most important problem, or "none":
+- "face": any human face is visible, even partly, small, in the background, or on a poster or screen.
+- "no_object": there is no specific object to find, only a general view, a crowd, a scene, or empty space.
+- "too_plain": the photo is mostly a plain surface (a white wall, a bare floor, a ceiling, sky, a single flat colour) with nothing distinctive.
+- "unclear": too dark, too blurry, or too zoomed in or out to tell what the thing is.
+- "inappropriate": nudity, gore, hate symbols, or anything unsafe or offensive.
+When unsure whether it is usable, do not answer "none".
+Also name the thing to find in a few words (subject), and give one short sentence of reason.`;
+
+const SCREEN_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    problem: { type: 'STRING', enum: ['none', 'face', 'no_object', 'too_plain', 'unclear', 'inappropriate'] },
+    subject: { type: 'STRING' },
+    reason: { type: 'STRING' },
+  },
+  required: ['problem', 'subject', 'reason'],
+  propertyOrdering: ['problem', 'subject', 'reason'],
+};
+
+// What the player is told for each problem.
+export const SCREEN_MESSAGES = {
+  face: "There's a face in this photo. Retake it without anyone in the shot.",
+  no_object: 'There is nothing specific to find in this photo. Get closer to one thing, like a sticker, sign or mark.',
+  too_plain: "This photo is too plain to find, like a bare wall. Pick something with details someone could spot.",
+  unclear: 'This photo is too dark or blurry to tell what it is. Try again with more light or a steadier hand.',
+  inappropriate: "This photo can't be used as an egg. Pick something else in the station.",
+};
+
+export async function screenEggPhoto({ jpeg, type = 'image/jpeg', apiKey, model, fetchImpl = fetch, timeoutMs = TIMEOUT_MS }) {
+  if (!apiKey) return { ok: true, method: 'honor' };
+  const body = JSON.stringify({
+    contents: [{ parts: [{ text: SCREEN_PROMPT }, { inlineData: { mimeType: type, data: jpeg.toString('base64') } }] }],
+    generationConfig: { temperature: 0, responseMimeType: 'application/json', responseSchema: SCREEN_SCHEMA },
+  });
+  for (const m of modelList(model)) {
+    try {
+      const res = await fetchImpl(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(m)}:generateContent`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
+        body,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok) throw new Error(`Gemini returned ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      const json = await res.json();
+      const text = json.candidates?.[0]?.content?.parts?.map((p) => p.text ?? '').join('') ?? '';
+      const parsed = JSON.parse(text.replace(/^```(?:json)?|```$/g, '').trim());
+      const problem = String(parsed.problem ?? '');
+      if (problem !== 'none' && !SCREEN_MESSAGES[problem]) throw new Error(`Gemini answer had no usable problem: ${problem}`);
+      const subject = String(parsed.subject ?? '').slice(0, 80);
+      const reason = String(parsed.reason ?? '').slice(0, 200);
+      if (problem === 'none') return { ok: true, method: 'gemini', subject, reason, model: m };
+      return { ok: false, method: 'gemini', problem, message: SCREEN_MESSAGES[problem], reason, model: m };
+    } catch (err) {
+      console.warn(`[screen] ${m} failed, trying the next model if any:`, err.message);
+    }
+  }
+  // As with finds: with a key set, an unchecked photo is never hidden.
+  return { ok: false, method: 'gemini', problem: 'unavailable', message: 'The photo check is unavailable right now. Try again in a moment.' };
+}

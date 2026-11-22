@@ -157,6 +157,7 @@ html[data-line="Orange"] .btn-primary:hover { color: var(--ticket); }
 .notice { padding: var(--space-sm) var(--space-md); border-radius: var(--radius); background: var(--ticket); font-size: var(--text-sm); }
 .notice.row { display: flex; gap: var(--space-sm); align-items: center; }
 .notice.bad { box-shadow: inset 0 0 0 2px var(--bad); }
+.toast { cursor: pointer; }
 .toast { position: fixed; left: 50%; bottom: calc(var(--tabs-h) + env(safe-area-inset-bottom) + var(--space-sm)); transform: translateX(-50%); z-index: 20; max-width: calc(100% - 32px); padding: var(--space-sm) var(--space-md); border-radius: 10px; background: var(--ink); color: var(--ticket); font-size: var(--text-sm); }
 .empty { display: grid; justify-items: center; gap: var(--space-sm); padding: var(--space-xl) var(--space-md); color: var(--muted); text-align: center; }
 .spin { width: 22px; height: 22px; border-radius: 50%; border: 3px solid var(--perf); border-top-color: var(--ink); animation: spin 0.8s linear infinite; }
@@ -451,7 +452,7 @@ html[data-line="Orange"] .vs-sc { color: var(--here-deep); }
 .stamps { list-style: none; margin: var(--space-sm) 0 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-md) var(--space-xs); }
 .st { display: grid; justify-items: center; gap: var(--space-2xs); text-align: center; }
 .st p { font-size: var(--text-xs); color: var(--muted); line-height: 1.25; }
-.st-seal { display: grid; place-items: center; width: 80px; height: 80px; padding: var(--space-sm); border-radius: 50%; color: var(--muted); font-weight: 800; font-stretch: var(--wide); font-size: 0.85rem; line-height: 1.05; overflow-wrap: anywhere; box-shadow: inset 0 0 0 2px var(--perf); outline: 2px dashed var(--perf); outline-offset: -9px; }
+.st-seal { display: grid; place-items: center; width: 80px; height: 80px; padding: var(--space-xs); border-radius: 50%; color: var(--muted); font-weight: 800; font-stretch: var(--wide); line-height: 1.05; overflow-wrap: normal; word-break: keep-all; hyphens: none; box-shadow: inset 0 0 0 2px var(--perf); outline: 2px dashed var(--perf); outline-offset: -9px; }
 .st.is-got .st-seal { color: var(--stamp); background: var(--ticket); box-shadow: inset 0 0 0 3px var(--stamp); outline: 1.5px solid var(--stamp); transform: rotate(-8deg); }
 .st.is-got:nth-child(2n) .st-seal { transform: rotate(6deg); }
 .st.is-got .st-station { color: var(--ln); box-shadow: inset 0 0 0 3px var(--ln); outline-color: var(--ln); }
@@ -669,3 +670,18 @@ html[data-line="Orange"] .msg.mine .msg-cap { color: var(--ink); }
 .nt-list .is-new { box-shadow: inset 4px 0 0 var(--here); }
 .nt-egg { grid-template-columns: 48px 1fr !important; }
 .nt-egg img { width: 48px; height: 48px; border-radius: 8px; object-fit: cover; }
+
+/* empty egg slots, folded into one row */
+.stub-empties { display: grid; gap: var(--space-sm); padding: var(--space-md); border-radius: var(--radius); border: 2px dashed var(--perf); color: var(--ink-2); font-size: var(--text-sm); }
+.stub-empties b { color: var(--ink); }
+.hide-chips { display: flex; flex-wrap: wrap; gap: var(--space-xs); }
+.hide-chip { display: inline-flex; align-items: center; gap: var(--space-2xs); min-height: 44px; padding: 0 var(--space-sm); border: 0; border-radius: 999px; background: var(--ticket); color: var(--ink); font: inherit; font-weight: 700; cursor: pointer; transition: background-color var(--dur-micro) var(--ease-out); }
+.hide-chip b { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: var(--here); color: var(--ticket); font-size: var(--text-xs); }
+.hide-chip .hide-pts { color: var(--muted); font-weight: 600; }
+.hide-chip .hide-pts::before { content: "+"; }
+.hide-chip:hover { background: var(--paper-3); }
+.hide-chip:active { transform: translateY(1px); }
+.hide-chip:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+
+/* the map keeps its layers (and the card over it) inside itself, under the tab bar */
+.map-wrap { isolation: isolate; }

@@ -24,6 +24,7 @@ const STATIONS = [
   { id: 'test-activity', name: 'Test Activity', lat: 42.4, lng: -71.11, lines: [{ id: 'Red', name: 'Red Line', color: '#DA291C' }] },
   { id: 'test-clock', name: 'Test Clock', lat: 42.37, lng: -71.08, lines: [{ id: 'Blue', name: 'Blue Line', color: '#003DA5' }] },
   { id: 'test-bounty', name: 'Test Bounty', lat: 42.38, lng: -71.09, lines: [{ id: 'Blue', name: 'Blue Line', color: '#003DA5' }] },
+  { id: 'test-screen', name: 'Test Screen', lat: 42.43, lng: -71.14, lines: [{ id: 'Red', name: 'Red Line', color: '#DA291C' }] },
   { id: 'test-map', name: 'Test Map', lat: 42.41, lng: -71.12, lines: [{ id: 'Orange', name: 'Orange Line', color: '#ED8B00' }] },
 ];
 const fakeMbta = {
@@ -40,6 +41,8 @@ const PW = 'correct horse';
 
 let clock = Date.parse('2026-11-21T20:00:00Z');
 let nextVerify = { method: 'gemini', match: true, confidence: 0.9, reason: 'Same sticker.' };
+let nextScreen = { ok: true, method: 'gemini', subject: 'a red sticker' };
+const screened = [];
 let server;
 let base;
 let db;
@@ -56,6 +59,7 @@ before(async () => {
     db,
     mbta: fakeMbta,
     verify: async () => nextVerify,
+    screen: async (args) => { screened.push(args); return nextScreen; },
     geminiKey: 'test',
     now: () => new Date(clock),
     frontendDir: path.resolve(ROOT, '../frontend'),
@@ -86,8 +90,9 @@ const ok = async (p, body, as) => {
   return r.data;
 };
 // Registers and returns { id, username, token }.
+let emailN = 0; // a username can be freed and reused (renames), so each sign-up gets its own address
 const user = async (name) => {
-  const { user: u, token } = await ok('/api/auth/register', { username: name, password: PW });
+  const { user: u, token } = await ok('/api/auth/register', { username: name, password: PW, email: `player${++emailN}@example.com` });
   return { ...u, token };
 };
 
@@ -817,4 +822,55 @@ test('map: per-station stats, keeper and hunting now; lines and trains degrade t
   // The fake MBTA has no shapes or vehicles: the endpoints answer with empty lists instead of failing.
   assert.deepEqual(await ok('/api/map/lines'), { lines: [] });
   assert.deepEqual((await ok('/api/map/vehicles')).vehicles, []);
+});
+
+test('email: required at sign-up, unique, private, usable to sign in, and addable later', async () => {
+  const reg = (body) => call('/api/auth/register', { password: PW, ...body });
+  assert.equal((await reg({ username: 'em_a' })).status, 400, 'no email');
+  assert.equal((await reg({ username: 'em_a', email: 'not-an-email' })).status, 400);
+  const a = await ok('/api/auth/register', { username: 'em_a', password: PW, email: 'Em.A@Example.com' });
+  assert.equal(a.user.email, 'Em.A@Example.com');
+  assert.equal((await reg({ username: 'em_b', email: 'em.a@example.com' })).status, 409, 'one account per email');
+
+  // Sign in with the email instead of the username (any case).
+  assert.equal((await ok('/api/auth/login', { username: 'EM.A@example.com', password: PW })).user.username, 'em_a');
+  assert.equal((await call('/api/auth/login', { username: 'em.a@example.com', password: 'wrong password' })).status, 401);
+
+  // Other players never see it.
+  const b = await user('em_viewer');
+  const seen = await ok(`/api/users/${a.user.id}`, null, b);
+  assert.equal('email' in seen.user, false);
+
+  // An older account without an email adds one; it can't take someone else's.
+  const legacy = await user('em_legacy');
+  await db.col.users.updateOne({ _id: legacy.id }, { $unset: { email: 1, emailLower: 1 } });
+  assert.equal((await ok('/api/auth/me', null, legacy)).user.email, null);
+  assert.equal((await call('/api/me/email', { email: 'em.a@example.com' }, legacy)).status, 409);
+  assert.equal((await ok('/api/me/email', { email: 'legacy@example.com' }, legacy)).user.email, 'legacy@example.com');
+  assert.equal((await ok('/api/auth/me', null, legacy)).user.email, 'legacy@example.com');
+});
+
+test('photo screen: a rejected egg photo is never hidden, and the player is told why', async () => {
+  const hider = await user('screen_hider');
+  const hide = () => call('/api/eggs', { stationId: 'test-screen', level: 1, image: IMG }, hider);
+  const before = await db.col.eggs.countDocuments({ stationId: 'test-screen' });
+
+  for (const [problem, status, words] of [['face', 422, /face/], ['too_plain', 422, /too plain/], ['no_object', 422, /nothing specific/], ['unavailable', 503, /unavailable/]]) {
+    const { SCREEN_MESSAGES } = await import('../src/verify.js');
+    nextScreen = { ok: false, method: 'gemini', problem, message: SCREEN_MESSAGES[problem] ?? 'The photo check is unavailable right now. Try again in a moment.' };
+    const r = await hide();
+    assert.equal(r.status, status, problem);
+    assert.match(r.data.error, words);
+  }
+  assert.equal(await db.col.eggs.countDocuments({ stationId: 'test-screen' }), before, 'nothing saved');
+
+  // A good photo goes through; the screen saw the uploaded image.
+  nextScreen = { ok: true, method: 'gemini', subject: 'a red sticker' };
+  const n = screened.length;
+  assert.equal((await hide()).status, 200);
+  assert.equal(screened.length, n + 1);
+  assert.ok(Buffer.isBuffer(screened.at(-1).jpeg));
+  // A slot that's already taken is refused before spending a Gemini call.
+  assert.equal((await hide()).status, 409);
+  assert.equal(screened.length, n + 1);
 });
