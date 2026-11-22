@@ -372,7 +372,7 @@ async function checkTrain() {
       const told = readStored('egg-train-told');
       if (told !== t.tripId) {
         store('egg-train-told', t.tripId);
-        notifyPlayer(`You're on a ${t.line} train.`, `Join the lobby for this ride and pledge eggs with the other riders.`, '#/train');
+        notifyPlayer(`🚇 ${t.line}`, 'Join the lobby', '#/train');
       }
     }
   } catch {
@@ -388,12 +388,12 @@ function drawTrainBar() {
   const { onTrain, lobby } = state.train ?? {};
   let html = '';
   if (lobby) {
-    html = `<a class="train-bar" href="#/lobby/${encodeURIComponent(lobby.id)}" style="--ln:${LINE_VAR[trainFam(lobby.routeId)] ?? 'var(--ink)'}"><span aria-hidden="true">🚇</span><b>Train lobby</b><span>${lobby.status === 'reached' ? 'Goal reached' : `${lobby.atTarget}/${lobby.riders} at ${lobby.target} pts`}</span></a>`;
+    html = `<a class="train-bar" href="#/lobby/${encodeURIComponent(lobby.id)}" style="--ln:${LINE_VAR[trainFam(lobby.routeId)] ?? 'var(--ink)'}"><span aria-hidden="true">🚇</span><b>Lobby</b><span>${lobby.status === 'reached' ? '🏆' : `${lobby.atTarget}/${lobby.riders} at ${lobby.target}`}</span></a>`;
   } else if (onTrain?.verified) {
-    html = `<a class="train-bar" href="#/train" style="--ln:${LINE_VAR[trainFam(onTrain.routeId)] ?? 'var(--ink)'}"><span aria-hidden="true">🚇</span><b>${esc(onTrain.line)}${onTrain.headsign ? ` to ${esc(onTrain.headsign)}` : ''}</b><span>Join the lobby</span></a>`;
+    html = `<a class="train-bar" href="#/train" style="--ln:${LINE_VAR[trainFam(onTrain.routeId)] ?? 'var(--ink)'}"><span aria-hidden="true">🚇</span><b>${esc(onTrain.line)}${onTrain.headsign ? ` to ${esc(onTrain.headsign)}` : ''}</b><span>Join</span></a>`;
   } else if ((state.config?.trainSim || state.user?.tester) && !/^#\/(train|lobby)/.test(location.hash)) {
     // Testing only: a way into the train lobby without riding a train.
-    html = '<a class="train-bar train-sim" href="#/train"><span aria-hidden="true">🧪</span><b>Test: simulate a train ride</b><span>Open</span></a>';
+    html = '<a class="train-bar train-sim" href="#/train"><span aria-hidden="true">🧪</span><b>Simulate ride</b><span>›</span></a>';
   }
   if (html) hud.insertAdjacentHTML('beforeend', html);
 }
@@ -411,20 +411,14 @@ async function viewTrain() {
     <section class="tk" style="--ln:${LINE_VAR[fam] ?? 'var(--ink)'}">
       <div class="band train-band"><span>${onTrain ? esc(onTrain.line) : 'Train lobby'}</span></div>
       <div class="tk-top">
-        <p class="here">${onTrain?.verified ? "You're riding" : 'Train lobby'}</p>
+        <p class="here">${onTrain?.verified ? (onTrain.simulated ? '🧪 Riding' : 'Riding') : 'Train lobby'}</p>
         <h1 class="page-h">${onTrain ? esc(onTrain.headsign ? `To ${onTrain.headsign}` : onTrain.line) : 'Not on a train'}</h1>
-        <p class="page-sub">${onTrain?.verified
-          ? `Every rider on this train can join one lobby for the ride. ${onTrain.lobby ? `${plural(onTrain.lobby.riders, 'rider')} already in.` : 'Be the first in.'}`
-          : onTrain
-            ? "You're next to a train. Keep the app open: once it moves and you move with it, you're verified."
-            : 'Board a train with the app open. We match your GPS with the live trains; after a minute of riding you can join the lobby. It works best above ground: phones lose GPS in tunnels.'}</p>
+        ${onTrain?.verified && onTrain.lobby ? `<p class="page-sub">👥 ${onTrain.lobby.riders}</p>` : !onTrain?.verified ? '<p class="page-sub">🚇 Ride with the app open</p>' : ''}
       </div>
       <div class="tk-perf" aria-hidden="true"></div>
       <div class="tk-bottom stack">
-        ${onTrain?.verified ? '<button id="joinLobby" class="btn btn-ink btn-block btn-l" type="button">Join the train lobby</button>' : '<button id="recheck" class="btn btn-ghost btn-block" type="button">Check again</button>'}
-        ${!onTrain?.verified && (state.config?.trainSim || state.user?.tester) ? '<button id="simulate" class="btn btn-primary btn-block" type="button">🧪 Simulate a train ride (test)</button><p class="field-hint">Testing only: puts you on a real live train without the GPS check, so you can try the lobby and the pledge. If another tester already has a lobby open, you join their train.</p>' : ''}
-        ${onTrain?.simulated ? `<p class="field-hint">🧪 Simulated ride (testing).${onTrain.sharedLobby ? ' Same train as the other tester, so you join their lobby.' : ''}</p>` : ''}
-        <p class="field-hint">In the lobby, riders donate eggs they've found. When the pledges reach the lobby's limit (2 per rider), every donor gets +50. If the ride ends first, your eggs come back.</p>
+        ${onTrain?.verified ? '<button id="joinLobby" class="btn btn-ink btn-block btn-l" type="button">Join lobby</button>' : '<button id="recheck" class="btn btn-ghost btn-block" type="button">Check again</button>'}
+        ${!onTrain?.verified && (state.config?.trainSim || state.user?.tester) ? '<button id="simulate" class="btn btn-primary btn-block" type="button">🧪 Simulate ride</button>' : ''}
         <div id="err"></div>
       </div>
     </section>`;
@@ -471,7 +465,7 @@ async function viewLobby(id) {
       const r = riderById(m.help.riderId);
       const need = r ? r.need : m.help.need;
       return `<div class="msg msg-help ${m.mine ? 'mine' : ''}" data-id="${esc(m.id)}">
-        <p class="help-card"><span aria-hidden="true">🙋</span> <b>${m.mine ? 'You' : esc(m.name)}</b> ${need > 0 ? `${m.mine ? 'need' : 'needs'} <b>${need} pts</b> to reach ${lobby.target}` : 'reached 100. Covered ✓'}
+        <p class="help-card"><span aria-hidden="true">🙋</span> <b>${m.mine ? 'You' : esc(m.name)}</b> ${need > 0 ? `<b>−${need}</b>` : '✓'}
         ${need > 0 && !m.mine && lobby.status === 'open' ? `<button class="btn btn-primary help-btn" type="button" data-help="${esc(m.help.riderId)}">Help</button>` : ''}</p>
         <p class="msg-meta">${fmtTime(m.createdAt)}</p>
       </div>`;
@@ -504,59 +498,56 @@ async function viewLobby(id) {
       </li>`)
       .join('');
     return `
-      <div class="pledge-head"><p class="next-label">Egg pledge</p>${status}</div>
-      <p class="pledge-n"><b>${lobby.atTarget}</b> of ${plural(lobby.riders, 'rider')} at ${lobby.target} pts</p>
-      <p class="field-hint">${lobby.status === 'open'
-        ? `${lobby.riders < lobby.minRiders ? `<b>Waiting for another rider:</b> the goal needs at least ${lobby.minRiders}. ` : ''}Everyone needs <b>${lobby.target} pts</b> of found eggs pledged (Easy 10 · Medium 20 · Hard 30 · Extreme 40 · Impossible 60). When every rider gets there, all riders get <b>+${lobby.bonus}</b>, and donors <b>+${lobby.donorBonus}</b> for each egg they gave. A pledged egg can't be pledged again, even if the ride ends first; it stays in your collection.`
-        : lobby.status === 'reached' ? `Every rider got +${lobby.bonus}, and donors +${lobby.donorBonus} per egg given.` : lobby.outcome === 'missed' ? "The ride ended before everyone reached 100. Pledged eggs stay used." : ''}</p>
+      <div class="pledge-head"><p class="pledge-n"><b>${lobby.atTarget}</b>/${lobby.riders} at ${lobby.target}</p>${status}</div>
+      <ul class="pledge-rules" aria-label="Rewards">
+        <li title="Everyone pledges ${lobby.target} pts of found eggs">🎯 ${lobby.target} each</li>
+        <li title="Every rider, when all reach ${lobby.target}">🏆 +${lobby.bonus}</li>
+        <li title="Per egg you donate">🎁 +${lobby.donorBonus}/egg</li>
+        ${lobby.status === 'open' && lobby.riders < lobby.minRiders ? '<li class="is-wait">⏳ 2nd rider</li>' : ''}
+      </ul>
       <ol class="riders">${riders}</ol>
       ${lobby.status === 'open' ? `
       <div class="pledge-box">
         ${(() => {
           // Who the eggs go to: you, or any rider still short of 100 (a donation).
           const others = lobby.ridersList.filter((r) => !r.you && r.need > 0);
-          const chip = (id, label, need, on) => `<button type="button" class="for-chip ${on ? 'is-on' : ''}" data-for="${id}" aria-pressed="${on}" ${need ? '' : 'disabled'}>${label}<small>${need ? `needs ${need}` : '✓ 100'}</small></button>`;
-          return `<p class="next-label">Pledge for</p>
-            <div class="for-chips">${chip('me', 'You', me.need, !forRider)}${others.map((r) => chip(esc(r.id), `🎁 ${esc(r.name)}`, r.need, forRider === r.id)).join('')}</div>
-            <p class="pledge-for">${forRider ? `Donating to <b>${esc(recipient.name)}</b>. You get +${lobby.donorBonus} per egg when the lobby reaches its goal.`
-              : others.length ? (me.need ? 'Pledging for you. Tap a rider to donate to them instead.' : 'You have 100. Tap a rider to donate to them.')
-              : lobby.riders < 2 ? 'Donating opens when another rider joins.' : me.need ? 'Pledging for you.' : 'Everyone has 100.'}</p>`;
+          const chip = (id, label, need, on) => `<button type="button" class="for-chip ${on ? 'is-on' : ''}" data-for="${id}" aria-pressed="${on}" ${need ? '' : 'disabled'}>${label}<small>${need ? `−${need}` : '✓'}</small></button>`;
+          return `<div class="for-chips">${chip('me', 'You', me.need, !forRider)}${others.map((r) => chip(esc(r.id), `🎁 ${esc(r.name)}`, r.need, forRider === r.id)).join('')}</div>`;
         })()}
         <ul class="stash">${lobby.stash.levels
           .map((l) => {
             const c = pick[l.level] ?? 0;
             return `<li class="${l.count ? '' : 'is-none'}">
               ${eggSvg(l.level, { size: 26, title: `${l.name} egg` })}
-              <span class="st-lv">${esc(l.name)}<small>${l.points} pts · ${l.count} left</small></span>
+              <span class="st-lv">${esc(l.name)}<small>${l.points} pts · ×${l.count}</small></span>
               <span class="st-pick"><button type="button" class="st-b" data-dec="${l.level}" ${c ? '' : 'disabled'} aria-label="One fewer ${esc(l.name)}">−</button><b>${c}</b><button type="button" class="st-b" data-inc="${l.level}" ${c < l.count ? '' : 'disabled'} aria-label="One more ${esc(l.name)}">+</button></span>
             </li>`;
           })
           .join('')}</ul>
         <div class="pledge-actions">
-          <button id="doPledge" class="btn btn-ink" type="button" ${pts && (forRider || me.need) ? '' : 'disabled'}>${forRider ? `Donate ${pts} pts` : `Pledge ${pts} pts`}</button>
-          ${me.need && !forRider ? `<button id="askHelp" class="btn btn-ghost" type="button">🙋 Ask for help</button>` : ''}
+          <button id="doPledge" class="btn btn-ink" type="button" ${pts && (forRider || me.need) ? '' : 'disabled'}>${forRider ? `🎁 Donate ${pts}` : `Pledge ${pts}`}</button>
+          ${me.need && !forRider ? `<button id="askHelp" class="btn btn-ghost" type="button">🙋 Help me</button>` : ''}
         </div>
-        ${lobby.stash.points ? '' : '<p class="field-hint">You have no unpledged eggs. Find eggs at stations, or ask the others for help.</p>'}
       </div>` : ''}
       <div id="pledgeErr"></div>`;
   };
 
   app.innerHTML = `
     <section class="tk lobby-tk" style="--ln:${LINE_VAR[fam] ?? 'var(--ink)'}">
-      <div class="band train-band"><span>${esc(lobby.line)}</span><span>${plural(lobby.riders, 'rider')}</span></div>
+      <div class="band train-band"><span>${esc(lobby.line)}</span><span>👥 ${lobby.riders}</span></div>
       <div class="tk-top">
         <p class="here">Train lobby</p>
         <h1 class="page-h">${esc(lobby.headsign ? `To ${lobby.headsign}` : lobby.line)}</h1>
-        <p class="page-sub">Only for this ride. Everyone shows by their anonymous chat name. You're <b>${esc(state.user.chatName ?? 'anonymous')}</b>.</p>
+        <p class="page-sub">Chatting as <b>${esc(state.user.chatName ?? 'anonymous')}</b></p>
       </div>
       <div class="tk-perf" aria-hidden="true"></div>
       <div class="tk-bottom" id="pledge">${pledgeHtml()}</div>
     </section>
-    <section class="tk"><div id="feed" class="feed" aria-live="polite">${chat.messages.length ? chat.messages.map(msgHtml).join('') : '<div class="empty"><p>Say hi to your fellow riders.</p></div>'}</div></section>
-    ${lobby.status === 'ended' ? '' : `<form id="say" class="say"><input id="sayText" class="input" maxlength="140" placeholder="Message the train" autocomplete="off" /><button class="btn btn-ink" type="submit">Send</button></form>
+    <section class="tk"><div id="feed" class="feed" aria-live="polite">${chat.messages.length ? chat.messages.map(msgHtml).join('') : '<div class="empty"><p aria-label="No messages yet">👋</p></div>'}</div></section>
+    ${lobby.status === 'ended' ? '' : `<form id="say" class="say"><input id="sayText" class="input" maxlength="140" placeholder="Message" autocomplete="off" /><button class="btn btn-ink" type="submit">Send</button></form>
     <div id="sayErr"></div>
     <div class="stickers">${(state.config?.stickers ?? []).map((st) => `<button class="stk" type="button" data-sticker="${esc(st.id)}" aria-label="Send ${esc(st.label)}"><span aria-hidden="true">${esc(st.emoji)}</span><small>${esc(st.label)}</small></button>`).join('')}</div>`}
-    ${state.config?.trainSim || state.user?.tester ? '<div class="account"><button id="switchLobby" class="btn btn-ghost" type="button">🧪 Switch to the shared test lobby</button></div>' : ''}`;
+    ${state.config?.trainSim || state.user?.tester ? '<div class="account"><button id="switchLobby" class="btn btn-ghost" type="button">🧪 Switch lobby</button></div>' : ''}`;
 
   // Testers: hop onto the train where another tester's lobby is open (or a fresh one).
   $('#switchLobby')?.addEventListener('click', async (e) => {
@@ -622,7 +613,7 @@ async function viewLobby(id) {
       e.target.disabled = true;
       try {
         append([(await api(`/api/lobbies/${lid}/help`, {})).message]);
-        toast('Asked the train for help.');
+        toast('🙋 Sent');
       } catch (err) {
         $('#pledgeErr').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
       }
@@ -635,8 +626,8 @@ async function viewLobby(id) {
         const r = await api(`/api/lobbies/${lid}/pledge`, { eggs, ...(forRider && { for: forRider }) });
         lobby = r.lobby;
         for (const k of Object.keys(pick)) delete pick[k];
-        if (r.reached) notifyPlayer('Train goal reached!', `Every rider gets +${lobby.bonus}${lobby.ridersList.find((x) => x.you)?.donatedEggs ? `, plus +${lobby.donorBonus} for each egg you gave` : ''}.`, `#/lobby/${lid}`);
-        else toast(r.donated ? `Donated ${r.points} pts. Nice.` : `Pledged ${r.points} pts.`);
+        if (r.reached) notifyPlayer('🏆', `+${lobby.bonus}${lobby.ridersList.find((x) => x.you)?.donatedEggs ? ` · 🎁 +${lobby.donorBonus * lobby.ridersList.find((x) => x.you).donatedEggs}` : ''}`, `#/lobby/${lid}`);
+        else toast(r.donated ? `🎁 +${r.points}` : `+${r.points}`);
         forRider = null;
         drawPledge();
         redrawHelpCards();
@@ -705,7 +696,7 @@ async function viewLobby(id) {
           drawPledge();
           redrawHelpCards();
         }
-        if (justReached) notifyPlayer('Train goal reached!', `Every rider gets +${lobby.bonus}.`, `#/lobby/${lid}`);
+        if (justReached) notifyPlayer('🏆', `+${lobby.bonus}`, `#/lobby/${lid}`);
         if (fresh.status === 'ended') render();
       }
     } catch {
@@ -943,7 +934,7 @@ function viewSignup(mode = 'register') {
       });
       setSession(data);
       startLocation();
-      if (registering && data.user.chatName) toast(`In group chats you're "${data.user.chatName}". Change it in Profile.`, 4200);
+      if (registering && data.user.chatName) toast(`Your chat name is ${data.user.chatName}`, 3600);
       if (location.hash && location.hash !== '#/' && !location.hash.startsWith('#/join/')) location.hash = '#/';
       else render();
     } catch (err) {
@@ -1072,11 +1063,11 @@ const BAND_LINES = '<div class="band band-lines" aria-hidden="true"><i style="--
 
 function showLocating(stations) {
   const msg = {
-    idle: ['Finding your station', 'Lookout uses your location to open the station you are in.'],
-    locating: ['Finding your station', "Underground? A fix from the last couple of minutes works, so it's fine if you got one on the way in."],
-    denied: ['Location is off for Lookout', 'Allow location for this site in your browser settings, then try again. Or pick your station below.'],
-    unavailable: ['No location fix yet', 'Step closer to the entrance or above ground, then try again. Or pick your station below.'],
-    insecure: ['Pick your station', 'Phones only share location with https:// pages. Open the https link to detect your station automatically.'],
+    idle: ['Finding your station', ''],
+    locating: ['Finding your station', ''],
+    denied: ['Location is off', 'Turn it on in your browser settings, or pick a station below.'],
+    unavailable: ['No location yet', 'Try near the entrance, or pick a station below.'],
+    insecure: ['Pick your station', 'Location needs the https:// link.'],
   }[loc.status] ?? ['Pick your station', ''];
   const canRetry = loc.status === 'denied' || loc.status === 'unavailable';
   app.innerHTML = `
@@ -1085,7 +1076,7 @@ function showLocating(stations) {
       <div class="tk-top">
         ${loc.status === 'locating' ? '<div class="spin" aria-hidden="true"></div>' : ''}
         <h1 class="locate-h">${esc(msg[0])}</h1>
-        <p class="locate-p">${esc(msg[1])}</p>
+        ${msg[1] ? `<p class="locate-p">${esc(msg[1])}</p>` : ''}
         ${canRetry ? '<button id="retry" class="btn btn-ink btn-block" type="button">Try again</button>' : ''}
       </div>
     </section>
@@ -1148,7 +1139,7 @@ function wireStationSearch(stations) {
 async function viewStations() {
   loading();
   const stations = await getStations();
-  app.innerHTML = `<h1 class="page-h">Stations</h1><p class="page-sub">Any station on the T. Play opens wherever you are.</p>${stationSearch()}`;
+  app.innerHTML = `<h1 class="page-h">Stations</h1>${stationSearch()}`;
   wireStationSearch(stations);
 }
 
@@ -1303,7 +1294,7 @@ function stubRow(slot) {
   const meta = egg.clock
     ? `Your clock is running: <span data-ends="${Date.now() + egg.clock.secondsLeft * 1000}">${fmtClock(egg.clock.secondsLeft)}</span> left.`
     : egg.retry
-      ? 'It beat you last time. A retry earns no time bonus.'
+      ? 'Retry · no time bonus'
       : hot ? `${mins}. Nobody's found it yet.` : `${mins}, found ${plural(egg.timesFound, 'time')}`;
   return `<li class="stub is-open ${hot || egg.clock ? 'is-hot' : ''}">
     <span class="punch" aria-hidden="true">${slot.level}</span>
@@ -1369,7 +1360,7 @@ function viewPlay() {
           <div class="bonus"><p class="bonus-label">${attempt.retry ? 'Retry: no bonus' : 'Bonus right now'}</p><p class="bonus-val">+<span id="bonus">0</span></p></div>
         </div>
         <ol id="holes" class="punchclock" aria-hidden="true">${'<li></li>'.repeat(PUNCH_HOLES)}</ol>
-        <p class="clock-ctx">${attempt.retry ? "This is a retry, so there's no time bonus. " : `Each hole is ${Math.round(perHole)} seconds. The bonus drains as they go. `}Leaving doesn't stop your clock.</p>
+        ${attempt.retry ? '<p class="clock-ctx">Retry · no time bonus</p>' : ''}
       </div>
     </section>
     <div id="status"></div>
@@ -1538,7 +1529,7 @@ function viewHide() {
     <section class="tk hide-tk">
       <div class="tk-top">
         <div id="preview" class="egg-photo egg-photo-empty">
-          <p class="photo-empty">Photograph something small in ${esc(hide.stationName)}. Easy should take a minute to find. Impossible should take real searching.${level.blur ? ` Finders will see this photo ${level.blur >= 12 ? 'heavily blurred' : 'blurred'}, so pick something they can still recognise up close.` : ''}</p>
+          <p class="photo-empty">Photograph something small in ${esc(hide.stationName)}</p>
         </div>
         <label class="btn btn-ghost btn-block" id="pick">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
@@ -1550,7 +1541,6 @@ function viewHide() {
       <div class="tk-bottom">
         <label class="field-label" for="eggName">What is it?</label>
         <input id="eggName" class="input" maxlength="40" required placeholder="e.g. sticker, red sign, cracked tile" />
-        <p class="field-hint">Finders see this. It has to match what's in the photo.</p>
         <label class="field-label" for="hint">Hint <span class="opt">(optional, one line)</span></label>
         <input id="hint" class="input" maxlength="80" placeholder="e.g. near the stairs to outbound" />
       </div>
@@ -1617,8 +1607,8 @@ async function viewLeaderboard() {
   const resetLabel = nextMonth.toLocaleString('en-US', { month: 'long', day: 'numeric', timeZone: 'America/New_York' });
 
   const heading = () => (period === 'month'
-    ? `<h1 class="page-h">${esc(monthLabel)}</h1><p class="page-sub">Everything resets on ${esc(resetLabel)}. Tap a player to see their profile.</p>`
-    : '<h1 class="page-h">All time</h1><p class="page-sub">Every point since the game began. Tap a player to see their profile.</p>');
+    ? `<h1 class="page-h">${esc(monthLabel)}</h1><p class="page-sub">Resets ${esc(resetLabel)}</p>`
+    : '<h1 class="page-h">All time</h1>');
 
   app.innerHTML = `
     <div class="seg" id="periodSeg" role="tablist" aria-label="Period">
@@ -1661,7 +1651,7 @@ async function viewLeaderboard() {
           : '';
     }
     if (!data.rows.length) {
-      box.innerHTML = '<div class="empty"><p>No finds yet. The first one puts you at the top.</p></div>';
+      box.innerHTML = '<div class="empty"><p>No finds yet</p></div>';
       return;
     }
     const href = (r) => (r.userId === state.user.id ? '#/profile' : `#/user/${encodeURIComponent(r.userId)}`);
@@ -1803,7 +1793,7 @@ function ticketsGrid(finds) {
           </li>`;
         })
         .join('')}</ul>`
-    : '<div class="empty"><p>No finds yet. Find an egg and it lands here.</p></div>';
+    : '<div class="empty"><p>No finds yet</p></div>';
 }
 
 // Your recent activity, newest first (only ever sent for your own profile).
@@ -1834,12 +1824,12 @@ function activityList(items) {
 function namesCard(user) {
   return `<section class="tk names">
     <div class="name-row">
-      <div><p class="next-label">Username</p><p class="name-val">${esc(user.username)}</p><small>On leaderboards and your profile. You sign in with it.</small></div>
+      <div><p class="next-label">Username</p><p class="name-val">${esc(user.username)}</p></div>
       <button class="link" type="button" data-edit="username">Change</button>
     </div>
     <div class="tk-perf" aria-hidden="true"></div>
     <div class="name-row">
-      <div><p class="next-label">Anonymous chat name</p><p class="name-val">${esc(user.chatName ?? '')}</p><small>All group chats show this name instead of your username. Only you can see it's yours.</small></div>
+      <div><p class="next-label">Anonymous chat name</p><p class="name-val">${esc(user.chatName ?? '')}</p></div>
       <button class="link" type="button" data-edit="chatName">Change</button>
     </div>
     <form id="nameForm" class="name-form" hidden>
@@ -2000,19 +1990,18 @@ async function viewNotifications() {
   const ask = 'Notification' in window && Notification.permission === 'default';
   app.innerHTML = `
     <h1 class="page-h">Notifications</h1>
-    <p class="page-sub">Your eggs, and every time someone finds one.</p>
     <div class="map-tally nt-tally">
       <p><b>${c.finds}</b>${c.finds === 1 ? 'egg' : 'eggs'} you found</p>
       <p><b>${c.eggsHidden}</b>${c.eggsHidden === 1 ? 'egg' : 'eggs'} you hid</p>
       <p><b>${c.foundByOthers}</b>${c.foundByOthers === 1 ? 'time' : 'times'} others found yours</p>
     </div>
-    ${ask ? '<div class="notice nt-ask"><p>Get a heads-up when someone finds your egg, or when you reach a station with eggs waiting.</p><button id="allow" class="btn btn-ink" type="button">Turn on alerts</button></div>' : ''}
+    ${ask ? '<div class="nt-ask"><button id="allow" class="btn btn-ghost" type="button">🔔 Turn on alerts</button></div>' : ''}
     ${data.items.length
       ? `<ol class="activity nt-list">${data.items.map(row).join('')}</ol>`
-      : '<div class="empty"><p>Nothing yet. Hide an egg at a station and you\'ll hear here when someone finds it.</p><a class="btn btn-ghost" href="#/">Find a station</a></div>'}`;
+      : '<div class="empty"><p>No eggs yet</p><a class="btn btn-ghost" href="#/">Find a station</a></div>'}`;
   $('#allow')?.addEventListener('click', async () => {
     const r = await Notification.requestPermission().catch(() => 'denied');
-    toast(r === 'granted' ? "Alerts on. We'll tell you when your eggs are found." : 'Alerts are off. You can still check this page.');
+    toast(r === 'granted' ? 'Alerts on' : 'Alerts off');
     $('.nt-ask')?.remove();
   });
   if (data.unseen) {
@@ -2049,7 +2038,6 @@ async function viewGroups() {
   const { groups, limits } = await api('/api/groups');
   app.innerHTML = `
     <h1 class="page-h">Groups</h1>
-    <p class="page-sub">Your own leaderboard with friends. Start a group, then send them the invite link.</p>
     ${groups.length
       ? `<ul class="st-list">${groups
           .map((g) => `<li><a href="#/group/${encodeURIComponent(g.id)}">
@@ -2144,7 +2132,7 @@ async function viewGroup(id) {
       : '<div class="empty"><p>Nothing yet. Start the trash talk.</p></div>'}</div></section>
     <form id="say" class="say"><input id="sayText" class="input" maxlength="140" placeholder="Message the group 😎" autocomplete="off" /><button class="btn btn-ink" type="submit">Send</button></form>
     <div id="sayErr"></div>
-    <p class="chat-hint">You're <b>${esc(state.user.chatName ?? 'anonymous')}</b> here (<a href="#/profile">change</a>). Type a message or tap a sticker.</p>
+    <p class="chat-hint">Chatting as <b>${esc(state.user.chatName ?? 'anonymous')}</b> · <a href="#/profile">Change</a></p>
     <div class="stickers">${(state.config?.stickers ?? [])
       .map((st) => `<button class="stk" type="button" data-sticker="${esc(st.id)}" aria-label="Send ${esc(st.label)}"><span aria-hidden="true">${esc(st.emoji)}</span><small>${esc(st.label)}</small></button>`)
       .join('')}</div>`;
@@ -2647,7 +2635,6 @@ async function viewMap() {
 
   app.innerHTML = `
     <h1 class="page-h">Map</h1>
-    <p class="page-sub">Every station, every egg, and every train running right now.</p>
     <div class="map-tally map-totals" aria-label="Eggs on the T right now">
       <p><b>${totals.eggs}</b>${totals.eggs === 1 ? 'egg' : 'eggs'} hidden</p>
       <p><b>${totals.stationsWithEggs}</b>of ${totals.stations} stations</p>
@@ -2863,7 +2850,7 @@ async function viewMap() {
           <div class="${st.huntingNow ? 'is-live' : ''}"><dt>Hunting now</dt><dd>${st.huntingNow}</dd></div>
           <div><dt>This month</dt><dd>${st.findsThisMonth}</dd></div>
         </dl>
-        <p class="sheet-note">${st.keeper ? `${esc(st.keeper.username)} has the most finds here this month (${st.keeper.finds}).` : 'No Keeper yet this month. The most finds here takes it.'}</p>
+        <p class="sheet-note">${st.keeper ? `${esc(st.keeper.username)} has the most finds here this month (${st.keeper.finds}).` : 'No Keeper yet this month'}</p>
         <a class="btn btn-block sheet-go" href="#/station/${encodeURIComponent(s.id)}">${st.activeEggs ? `Hunt at ${esc(s.name)}` : `Open ${esc(s.name)}`}</a>
       </div>`;
     $('#sheetClose').addEventListener('click', closeSheet);
