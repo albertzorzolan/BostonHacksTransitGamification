@@ -1448,6 +1448,25 @@ function viewPlay() {
   $('#quitX').addEventListener('click', () => (state.play = null));
 }
 
+// A confetti burst in the line colours from the middle of `from` (the points ticket after a find).
+// Skipped for viewers who asked for less motion; the layer removes itself once the pieces have fallen.
+const CONFETTI_COLOURS = ['--line-red', '--line-orange', '--line-blue', '--line-green', '--stamp'];
+function celebrate(from) {
+  if (reducedMotion() || !from) return;
+  const r = from.getBoundingClientRect();
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const layer = document.createElement('div');
+  layer.className = 'confetti';
+  layer.setAttribute('aria-hidden', 'true');
+  layer.style.cssText = `--ox:${r.left + r.width / 2}px;--oy:${r.top + r.height / 2}px`;
+  layer.innerHTML = Array.from({ length: 64 }, (_, i) => {
+    const w = rand(6, 11);
+    return `<i style="--c:var(${CONFETTI_COLOURS[i % CONFETTI_COLOURS.length]});--w:${w}px;--h:${w * rand(0.4, 1.6)}px;--x:${rand(-55, 55)}vw;--up:${-rand(6, 20)}vh;--r:${rand(-900, 900)}deg;--t:${rand(1600, 2600)}ms;--d:${rand(120, 300)}ms"></i>`;
+  }).join('');
+  document.body.append(layer);
+  setTimeout(() => layer.remove(), 3200);
+}
+
 async function renderResult() {
   clearTimers();
   const play = state.play;
@@ -1485,13 +1504,14 @@ async function renderResult() {
       </div>
     </section>
     <section class="match-pair" aria-label="Before and after">
-      <figure class="m"><img src="${apiUrl(result.revealUrl || egg.imageUrl)}" alt="The egg when it was hidden" /><figcaption>Before</figcaption></figure>
-      ${play.myPhoto ? `<figure class="m"><img src="${play.myPhoto}" alt="Your photo of it" /><figcaption>After</figcaption></figure>` : ''}
+      <figure class="m"><img src="${apiUrl(result.revealUrl || egg.imageUrl)}" alt="The Easter egg as it was hidden" /><figcaption>Easter Egg</figcaption></figure>
+      ${play.myPhoto ? `<figure class="m"><img src="${play.myPhoto}" alt="Your photo of it" /><figcaption>Your image</figcaption></figure>` : ''}
     </section>
     <section class="next-egg">
       <button id="hide" class="btn btn-primary btn-block btn-l" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>Hide the next ${esc(egg.levelName)} egg</button>
       <a id="skip" class="btn btn-ghost btn-block" href="${back}">Skip</a>
     </section>`;
+  celebrate($('.win'));
 
   // Count the points up once (unless the viewer asked for less motion).
   if (!reducedMotion()) {
