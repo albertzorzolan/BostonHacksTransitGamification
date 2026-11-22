@@ -1281,35 +1281,776 @@ function loadLeaflet() {
   });
 }
 
+// --- track geometry: trains ride along the real route shapes ---
+// A flat projection is plenty at Boston's scale: metres east and north.
+const M_PER_LAT = 110_540;
+const M_PER_LNG = 111_320 * Math.cos((42.35 * Math.PI) / 180);
+const ON_TRACK_M = 120; // a reported position this close to a track is treated as on it
+const MAX_GLIDE_M = 4_000; // further than this between reports is a jump (new trip, yard move), not a glide
+const PLAYBACK_DELAY_MS = 25_000; // trains are replayed this far behind their reports, so there's always a next point to glide to
+const VEHICLE_POLL_MS = 15_000; // matches the server's cache
+const MAP_LINES = ['Red', 'Orange', 'Blue', 'Green'];
+
+function buildTrack(routeId, points) {
+  const xy = points.map(([lat, lng]) => [lng * M_PER_LNG, lat * M_PER_LAT]);
+  const cum = [0];
+  for (let i = 1; i < xy.length; i++) cum.push(cum[i - 1] + Math.hypot(xy[i][0] - xy[i - 1][0], xy[i][1] - xy[i - 1][1]));
+  return { routeId, points, xy, cum, length: cum[cum.length - 1] };
+}
+function snapToTrack(track, lat, lng) {
+  const px = lng * M_PER_LNG;
+  const py = lat * M_PER_LAT;
+  let best = null;
+  for (let i = 0; i < track.xy.length - 1; i++) {
+    const [ax, ay] = track.xy[i];
+    const [bx, by] = track.xy[i + 1];
+    const dx = bx - ax;
+    const dy = by - ay;
+    const len2 = dx * dx + dy * dy || 1;
+    const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / len2));
+    const off = Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+    if (!best || off < best.off) best = { along: track.cum[i] + t * Math.sqrt(len2), off };
+  }
+  return best;
+}
+function pointOnTrack(track, along) {
+  const d = Math.max(0, Math.min(track.length, along));
+  let lo = 0;
+  let hi = track.cum.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (track.cum[mid] <= d) lo = mid;
+    else hi = mid;
+  }
+  const t = (d - track.cum[lo]) / (track.cum[hi] - track.cum[lo] || 1);
+  const [la1, ln1] = track.points[lo];
+  const [la2, ln2] = track.points[hi];
+  const [ax, ay] = track.xy[lo];
+  const [bx, by] = track.xy[hi];
+  return { lat: la1 + (la2 - la1) * t, lng: ln1 + (ln2 - ln1) * t, bearing: (Math.atan2(bx - ax, by - ay) * 180) / Math.PI };
+}
+// Leaflet rounds map positions to whole pixels, which makes slow trains step a pixel at a time.
+// This is the same conversion without the rounding.
+function subpixelPoint(map, lat, lng, zoom = map.getZoom(), origin = map.getPixelOrigin(), topLeft = map.containerPointToLayerPoint([0, 0])) {
+  const pt = map.project([lat, lng], zoom);
+  return { x: pt.x - origin.x - topLeft.x, y: pt.y - origin.y - topLeft.y };
+}
+
+// All trains drawn on one canvas. Each train is drawn from above as linked cars laid along the track,
+// so it bends through curves like the real thing: heavy rail runs 3 cars, Green Line light rail 2, the Mattapan trolley 1.
+// Speed: each car is painted once into a small image and reused, and the canvas sits in map coordinates
+// with a margin around the screen, so panning moves it with the map instead of redrawing it.
+const CARS = { Red: 3, Orange: 3, Blue: 3, Green: 2, Mattapan: 1 };
+const DIR_MIN_M = 25; // smaller moves don't set a facing direction
+const BACKSTEP_M = 400; // within a trip, a report this far behind the last one is noise, not the train reversing
+const TRAIN_PAD = 0.35; // canvas margin around the screen, as a share of its size
+
+function metresPerPixel(map) {
+  return (40_075_016.686 * Math.cos((map.getCenter().lat * Math.PI) / 180)) / 2 ** (map.getZoom() + 8);
+}
+
+// One car, painted pointing right (+x = forward) into its own small canvas.
+function paintCar(color, len, width, cabFront, cabBack, style, dpr) {
+  const o = 1.8; // cream outline
+  const sh = 1.4; // shadow drop
+  const w = len + o * 2 + 2;
+  const h = width + o * 2 + sh + 2;
+  const c = document.createElement('canvas');
+  c.width = Math.ceil(w * dpr);
+  c.height = Math.ceil(h * dpr);
+  const ctx = c.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.translate(w / 2, (width + o * 2 + 2) / 2);
+  const r = width / 2;
+  const nose = (cab) => (cab ? r * 0.9 : r * 0.3);
+  const radii = [nose(cabBack), nose(cabFront), nose(cabFront), nose(cabBack)];
+  ctx.fillStyle = style.shadow;
+  ctx.beginPath();
+  ctx.roundRect(-len / 2 - o, -r - o + sh, len + o * 2, width + o * 2, radii.map((x) => x + o));
+  ctx.fill();
+  ctx.fillStyle = style.casing;
+  ctx.beginPath();
+  ctx.roundRect(-len / 2 - o, -r - o, len + o * 2, width + o * 2, radii.map((x) => x + o));
+  ctx.fill();
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.roundRect(-len / 2, -r, len, width, radii);
+  ctx.fill();
+  ctx.fillStyle = style.glass;
+  if (len >= 10) {
+    const start = -len / 2 + (cabBack ? r * 0.9 : r * 0.45);
+    const stop = len / 2 - (cabFront ? r * 1.2 : r * 0.45);
+    const win = Math.max(1.2, width * 0.22);
+    for (let x = start; x + win <= stop + 0.01; x += win * 1.9) {
+      ctx.fillRect(x, -r + width * 0.14, win, width * 0.2);
+      ctx.fillRect(x, r - width * 0.34, win, width * 0.2);
+    }
+  }
+  if (cabFront) {
+    ctx.beginPath();
+    ctx.roundRect(len / 2 - r * 0.95, -r * 0.6, r * 0.6, r * 1.2, r * 0.3);
+    ctx.fill();
+  }
+  return { canvas: c, w, h, cy: (width + o * 2 + 2) / 2 };
+}
+
+function makeTrainLayer() {
+  return L.Layer.extend({
+    onAdd(map) {
+      this._map = map;
+      this._canvas = L.DomUtil.create('canvas', 'train-canvas');
+      map.getPane('trains').appendChild(this._canvas);
+      this._ctx = this._canvas.getContext('2d');
+      this._sprites = new Map();
+      map.on('moveend resize zoomend viewreset', this._reset, this);
+      map.on('zoomstart', this._hide, this);
+      this._reset();
+    },
+    onRemove(map) {
+      map.off('moveend resize zoomend viewreset', this._reset, this);
+      map.off('zoomstart', this._hide, this);
+      this._canvas.remove();
+    },
+    _hide() {
+      this._canvas.style.opacity = '0';
+    },
+    // Place the canvas over the screen plus a margin, in map (layer) coordinates.
+    _reset() {
+      const map = this._map;
+      const size = map.getSize();
+      const pad = size.multiplyBy(TRAIN_PAD).round();
+      const origin = map.containerPointToLayerPoint([0, 0]).subtract(pad);
+      const w = size.x + pad.x * 2;
+      const h = size.y + pad.y * 2;
+      const dpr = window.devicePixelRatio || 1;
+      this._origin = origin;
+      L.DomUtil.setPosition(this._canvas, origin);
+      if (this._w !== w || this._h !== h) {
+        this._canvas.width = w * dpr;
+        this._canvas.height = h * dpr;
+        this._canvas.style.width = `${w}px`;
+        this._canvas.style.height = `${h}px`;
+        this._w = w;
+        this._h = h;
+      }
+      this._canvas.style.opacity = '1';
+      this.draw(this._items ?? [], this._style);
+    },
+    _sprite(color, len, width, cabFront, cabBack, style, dpr) {
+      const key = `${color}|${len.toFixed(1)}|${width.toFixed(1)}|${cabFront ? 1 : 0}${cabBack ? 1 : 0}|${dpr}`;
+      let sp = this._sprites.get(key);
+      if (!sp) {
+        sp = paintCar(color, len, width, cabFront, cabBack, style, dpr);
+        this._sprites.set(key, sp);
+      }
+      return sp;
+    },
+    draw(items, style) {
+      this._items = items;
+      this._style = style;
+      const ctx = this._ctx;
+      const map = this._map;
+      if (!ctx || !map || !style || !this._origin) return;
+      const dpr = window.devicePixelRatio || 1;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, this._w, this._h);
+      const zoom = map.getZoom();
+      const pixelOrigin = map.getPixelOrigin();
+      const o = this._origin;
+      // map position -> canvas position, without Leaflet's whole-pixel rounding
+      const at = (lat, lng) => {
+        const p = map.project([lat, lng], zoom);
+        return { x: p.x - pixelOrigin.x - o.x, y: p.y - pixelOrigin.y - o.y };
+      };
+      const s = Math.max(0.7, Math.min(1.6, (zoom - 10) / 4)); // cars grow as you zoom in
+      const carPx = Math.round(15 * s * 2) / 2;
+      const gapPx = 2.4 * s;
+      const width = Math.round(9 * s * 2) / 2;
+      const mpp = metresPerPixel(map);
+      const hits = [];
+      for (const it of items) {
+        const head = it.track ? pointOnTrack(it.track, it.along) : it;
+        const hp = at(head.lat, head.lng);
+        if (hp.x < -40 || hp.y < -40 || hp.x > this._w + 40 || hp.y > this._h + 40) continue;
+        const n = it.cars;
+        const parts = [];
+        for (let i = 0; i < n; i++) {
+          let F;
+          let B;
+          if (it.track) {
+            const front = it.along - it.dir * i * (carPx + gapPx) * mpp;
+            const back = front - it.dir * carPx * mpp;
+            const pf = pointOnTrack(it.track, front);
+            const pb = pointOnTrack(it.track, back);
+            F = at(pf.lat, pf.lng);
+            B = at(pb.lat, pb.lng);
+          } else {
+            const a = ((it.bearing - 90) * Math.PI) / 180;
+            const off = i * (carPx + gapPx);
+            F = { x: hp.x - Math.cos(a) * off, y: hp.y - Math.sin(a) * off };
+            B = { x: F.x - Math.cos(a) * carPx, y: F.y - Math.sin(a) * carPx };
+          }
+          parts.push({ F, B, i });
+        }
+        if (it.selected) {
+          // a thin ring around the whole train, so the line stays visible underneath
+          const mx = parts.reduce((a, p) => a + (p.F.x + p.B.x) / 2, 0) / parts.length;
+          const my = parts.reduce((a, p) => a + (p.F.y + p.B.y) / 2, 0) / parts.length;
+          const rad = (n * (carPx + gapPx)) / 2 + 9;
+          ctx.beginPath();
+          ctx.arc(mx, my, rad, 0, Math.PI * 2);
+          ctx.fillStyle = style.halo;
+          ctx.fill();
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = style.ring;
+          ctx.stroke();
+        }
+        // draw back to front so the leading cab sits on top
+        for (let k = parts.length - 1; k >= 0; k--) {
+          const { F, B, i } = parts[k];
+          const sp = this._sprite(it.color, carPx, width, i === 0, i === n - 1, style, dpr);
+          ctx.save();
+          ctx.translate((F.x + B.x) / 2, (F.y + B.y) / 2);
+          ctx.rotate(Math.atan2(F.y - B.y, F.x - B.x));
+          ctx.drawImage(sp.canvas, -sp.w / 2, -sp.cy, sp.w, sp.h);
+          ctx.restore();
+          hits.push({ id: it.id, x: (B.x + F.x) / 2, y: (B.y + F.y) / 2 });
+        }
+      }
+      this.hits = hits;
+    },
+    // The train drawn nearest a point on the screen, if one is within reach of a finger.
+    hit(x, y, reach = 18) {
+      if (!this._origin) return null;
+      const tl = this._map.containerPointToLayerPoint([0, 0]);
+      const cx = x + tl.x - this._origin.x;
+      const cy = y + tl.y - this._origin.y;
+      let best = null;
+      for (const h of this.hits ?? []) {
+        const d = Math.hypot(h.x - cx, h.y - cy);
+        if (d <= reach && (!best || d < best.d)) best = { id: h.id, d };
+      }
+      return best?.id ?? null;
+    },
+    // Where a train's cars were last drawn, in screen coordinates (for tests).
+    screenHits() {
+      if (!this._origin) return [];
+      const tl = this._map.containerPointToLayerPoint([0, 0]);
+      return (this.hits ?? []).map((h) => ({ id: h.id, x: h.x - tl.x + this._origin.x, y: h.y - tl.y + this._origin.y }));
+    },
+  });
+}
+
 async function viewMap() {
   loading('Loading the map');
-  const [stations] = await Promise.all([getStations(), loadLeaflet()]);
-  const css = getComputedStyle(document.documentElement);
-  const ink = css.getPropertyValue('--ink').trim();
-  const ticket = css.getPropertyValue('--ticket').trim();
-  const muted = css.getPropertyValue('--muted').trim();
+  const [stations, , linesData, statsData] = await Promise.all([
+    getStations(),
+    loadLeaflet(),
+    api('/api/map/lines').catch(() => ({ lines: [] })),
+    api('/api/map/stations').catch(() => ({ stations: [] })),
+  ]);
+  const stats = new Map(statsData.stations.map((s) => [s.id, s]));
+  const root = getComputedStyle(document.documentElement);
+  const tok = (n) => root.getPropertyValue(n).trim();
+  const motion = !reducedMotion();
+  let filter = null;
+
   app.innerHTML = `
     <h1 class="page-h">Map</h1>
-    <p class="page-sub">Bigger dots have more eggs hidden. Tap a station to open it.</p>
-    <div id="map" class="map"></div>`;
-  const map = L.map('map', { zoomControl: true }).setView(loc.pos ? [loc.pos.lat, loc.pos.lng] : [42.3555, -71.0805], loc.pos ? 14 : 12);
+    <p class="page-sub">Every station, every egg, and every train running right now.</p>
+    <section class="tk map-tk">
+      ${BAND_LINES}
+      <div class="map-bar">
+        <div class="chips" role="group" aria-label="Show a line">
+          <button type="button" class="chip" data-line="" aria-pressed="true">All</button>
+          ${MAP_LINES.map((l) => `<button type="button" class="chip" data-line="${l}" aria-pressed="false" style="--ln:${LINE_VAR[l]}"><i aria-hidden="true"></i>${l}</button>`).join('')}
+        </div>
+      </div>
+      <div class="map-wrap">
+        <div id="map" class="map"></div>
+        <div id="sheet" class="map-sheet" hidden></div>
+      </div>
+      <div class="tk-perf" aria-hidden="true"></div>
+      <div class="tk-bottom map-key">
+        <ul class="legend">
+          <li><span class="lg-stn has-eggs" style="--ln:var(--line-green)"><b>3</b></span>Eggs up</li>
+          <li><span class="lg-stn" style="--ln:var(--line-green)"></span>No eggs yet</li>
+          <li><span class="lg-stn mine" style="--ln:var(--line-green)"></span>You found eggs here</li>
+          <li><span class="lg-stn live" style="--ln:var(--line-green)"></span>Someone hunting now</li>
+          <li><span class="lg-car" style="--ln:var(--line-red)"><i></i></span>Live train</li>
+        </ul>
+        <div class="key-row">
+          <p class="map-foot" id="mapFoot">Connecting to live trains</p>
+          <label class="map-toggle"><input type="checkbox" id="showTrains" checked /> Show trains</label>
+        </div>
+      </div>
+    </section>`;
+
+  const map = L.map('map', {
+    zoomControl: false,
+    zoomSnap: 0.5,
+    zoomDelta: 0.5,
+    wheelPxPerZoomLevel: 100,
+    attributionControl: true,
+    fadeAnimation: false,
+  });
   state.map = map;
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18, attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+  const lineRenderer = L.canvas({ padding: 0.4, tolerance: 6 });
+  map.createPane('trains');
+  map.getPane('trains').style.zIndex = 450; // over the lines, under the station markers
+  map.getPane('trains').style.pointerEvents = 'none';
+  L.control.zoom({ position: 'topright' }).addTo(map);
+  // Esri's light gray canvas: quiet, almost no labels, and free to use without a key.
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
+    maxNativeZoom: 16,
+    maxZoom: 18,
+    updateWhenZooming: false,
+    keepBuffer: 4,
+    attribution: 'Tiles &copy; Esri, HERE, Garmin, &copy; OpenStreetMap contributors',
+  }).addTo(map);
+
+  const Locate = L.Control.extend({
+    options: { position: 'topright' },
+    onAdd() {
+      const b = L.DomUtil.create('button', 'map-locate');
+      b.type = 'button';
+      b.setAttribute('aria-label', 'Show where I am');
+      b.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/><circle cx="12" cy="12" r="7.5"/></svg>';
+      L.DomEvent.disableClickPropagation(b);
+      b.addEventListener('click', () => {
+        if (loc.pos) map.flyTo([loc.pos.lat, loc.pos.lng], 15, { duration: motion ? 0.8 : 0 });
+        else {
+          startLocation();
+          toast('Finding you. Allow location if your phone asks.');
+        }
+      });
+      return b;
+    },
+  });
+  new Locate().addTo(map);
+
+  // The lines, on one canvas: a cream casing under a solid colour, like the T map.
+  // Branches that share track (Green B/C/D/E, Red's Ashmont and Braintree) arrive as separate shapes a few
+  // metres apart. Each later branch is pulled onto the track already drawn wherever they run together,
+  // so there's one line there, and trains ride exactly on the line you see.
+  const MERGE_M = 20;
+  const tracks = new Map();
+  const lineLayers = [];
+  const allPts = [];
+  const drawnByFamily = new Map(); // family -> tracks drawn so far
+  const mergeOnto = (points, earlier) => {
+    if (!earlier.length) return points;
+    const out = [];
+    let prev = null; // { track, along } of the previous point if it was pulled onto earlier track
+    for (const [lat, lng] of points) {
+      let best = null;
+      for (const t of earlier) {
+        const sn = snapToTrack(t, lat, lng);
+        if (sn && sn.off <= MERGE_M && (!best || sn.off < best.off)) best = { track: t, along: sn.along, off: sn.off };
+      }
+      if (!best) {
+        out.push([lat, lng]);
+        prev = null;
+        continue;
+      }
+      // follow the earlier track's own bends between two pulled points, instead of cutting the corner
+      if (prev && prev.track === best.track) {
+        const { cum, points: tp } = best.track;
+        const lo = Math.min(prev.along, best.along);
+        const hi = Math.max(prev.along, best.along);
+        const between = [];
+        for (let i = 0; i < cum.length; i++) if (cum[i] > lo && cum[i] < hi) between.push(tp[i]);
+        if (best.along < prev.along) between.reverse();
+        out.push(...between);
+      }
+      const p = pointOnTrack(best.track, best.along);
+      out.push([p.lat, p.lng]);
+      prev = best;
+    }
+    return out;
+  };
+  for (const l of linesData.lines) {
+    const fam = family(l.routeId);
+    const earlier = drawnByFamily.get(fam) ?? [];
+    const points = mergeOnto(l.points, earlier);
+    const track = buildTrack(l.routeId, points);
+    drawnByFamily.set(fam, [...earlier, track]);
+    const opts = { renderer: lineRenderer, interactive: false, lineCap: 'round', lineJoin: 'round', smoothFactor: 0.5 };
+    const casing = L.polyline(points, { ...opts, color: tok('--ticket'), weight: 9, opacity: 1 }).addTo(map);
+    const stroke = L.polyline(points, { ...opts, color: l.color, weight: 5, opacity: 0.95 }).addTo(map);
+    lineLayers.push({ fam, casing, stroke });
+    if (!tracks.has(l.routeId)) tracks.set(l.routeId, []);
+    tracks.get(l.routeId).push(track);
+    allPts.push(...points);
+  }
+  if (loc.pos) map.setView([loc.pos.lat, loc.pos.lng], 14.5);
+  else if (allPts.length) map.fitBounds(L.latLngBounds(allPts).pad(-0.25));
+  else map.setView([42.352, -71.075], 12.5);
+
+  // Stations. Most are plain rings drawn on the canvas; the few with something going on
+  // (eggs up, your finds, someone hunting) get a richer marker with a count and a label.
+  const markers = new Map(); // id -> { kind: 'dom' | 'dot', layer }
+  const special = (s) => {
+    const st = stats.get(s.id);
+    return Boolean(st?.activeEggs || st?.yourFinds || st?.huntingNow);
+  };
+  const domIcon = (s, selected) => {
+    const st = stats.get(s.id);
+    const fams = familiesOf(s.lines);
+    const n = st?.activeEggs ?? 0;
+    const cls = ['stn', n ? 'has-eggs' : '', fams.length > 1 ? 'hub' : '', st?.huntingNow ? 'live' : '', st?.yourFinds ? 'mine' : '', selected ? 'sel' : ''].filter(Boolean).join(' ');
+    const size = n ? 26 : 14;
+    return L.divIcon({ className: 'stn-wrap', iconSize: [size, size], iconAnchor: [size / 2, size / 2], html: `<span class="${cls}" style="--ln:${LINE_VAR[fams[0]] ?? 'var(--ink)'}">${n ? `<b>${n}</b>` : ''}</span>` });
+  };
+  const dotStyle = (s, selected) => {
+    const fams = familiesOf(s.lines);
+    const ring = fams.length > 1 ? tok('--ink') : (s.lines[0]?.color ?? tok('--ink'));
+    return { renderer: lineRenderer, radius: selected ? 9 : 5.5, color: ring, weight: selected ? 4 : 3, fillColor: tok('--ticket'), fillOpacity: 1, opacity: 1 };
+  };
   for (const s of stations) {
-    L.circleMarker([s.lat, s.lng], {
-      radius: 5 + s.activeEggs * 1.6,
-      color: ticket,
-      weight: 2,
-      fillColor: s.lines[0]?.color ?? muted,
-      fillOpacity: s.activeEggs ? 1 : 0.55,
-    })
-      .addTo(map)
-      .bindPopup(`<strong>${esc(s.name)}</strong><br/>${s.activeEggs} of 5 eggs hidden<br/><a href="#/station/${encodeURIComponent(s.id)}">Open station</a>`);
+    let layer;
+    if (special(s)) {
+      layer = L.marker([s.lat, s.lng], { icon: domIcon(s, false), title: s.name, riseOnHover: true, zIndexOffset: 600 }).addTo(map);
+      layer.bindTooltip(esc(s.name), { permanent: true, direction: 'right', offset: [stats.get(s.id)?.activeEggs ? 14 : 8, 0], className: 'stn-label stn-label-eggs', interactive: false });
+      markers.set(s.id, { kind: 'dom', layer });
+    } else {
+      layer = L.circleMarker([s.lat, s.lng], dotStyle(s, false)).addTo(map);
+      layer.bindTooltip(esc(s.name), { direction: 'right', offset: [8, 0], className: 'stn-label stn-label-hover' });
+      markers.set(s.id, { kind: 'dot', layer });
+    }
+    layer.on('click', (e) => {
+      L.DomEvent.stopPropagation(e);
+      const id = e.containerPoint && trainLayer.hit(e.containerPoint.x, e.containerPoint.y, 10);
+      if (id) return selectTrain(id);
+      select(s);
+    });
   }
+  const zoomClass = () => map.getContainer().classList.toggle('z-eggs', map.getZoom() >= 13);
+  map.on('zoomend', zoomClass);
+  zoomClass();
+
+  const setSelected = (s, on) => {
+    const m = markers.get(s.id);
+    if (!m) return;
+    if (m.kind === 'dom') m.layer.setIcon(domIcon(s, on));
+    else m.layer.setStyle(dotStyle(s, on));
+  };
+  let selectedId = null;
+  function select(s, { fly = true } = {}) {
+    selectedTrain = null;
+    following = false;
+    if (selectedId) setSelected(stations.find((x) => x.id === selectedId), false);
+    selectedId = s.id;
+    setSelected(s, true);
+    const st = stats.get(s.id) ?? { activeEggs: 0, huntingNow: 0, findsThisMonth: 0, yourFinds: 0, keeper: null };
+    const fams = familiesOf(s.lines);
+    const dist = loc.pos ? distanceM(loc.pos, s) : null;
+    const sheet = $('#sheet');
+    sheet.hidden = false;
+    sheet.classList.remove('is-train');
+    sheet.style.setProperty('--ln', LINE_VAR[fams[0]] ?? 'var(--ink)');
+    sheet.innerHTML = `
+      <div class="sheet-band">
+        <span class="sheet-lines">${fams[0] ? `${fams[0]} Line` : 'Station'}${fams.slice(1).map((f) => `<span class="also" style="--ln:${LINE_VAR[f] ?? 'var(--ink)'}">${f}</span>`).join('')}</span>
+        <button class="sheet-x" type="button" id="sheetClose" aria-label="Close"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+      </div>
+      <div class="sheet-top">
+        <h2 class="sheet-h">${esc(s.name)}</h2>
+        <p class="sheet-sub">${dist != null ? (dist <= RANGE_METERS ? "You're here." : `${fmtDist(dist)} from you.`) : ''}</p>
+        ${st.keeper ? `<p class="stamp sheet-keeper">Keeper: ${esc(st.keeper.username)}</p>` : ''}
+      </div>
+      <div class="tk-perf" aria-hidden="true"></div>
+      <div class="sheet-bottom">
+        <dl class="sheet-stats">
+          <div class="${st.activeEggs ? 'is-on' : ''}"><dt>Eggs up</dt><dd>${st.activeEggs}<small>/5</small></dd></div>
+          <div><dt>Your finds</dt><dd>${st.yourFinds}</dd></div>
+          <div class="${st.huntingNow ? 'is-live' : ''}"><dt>Hunting now</dt><dd>${st.huntingNow}</dd></div>
+          <div><dt>This month</dt><dd>${st.findsThisMonth}</dd></div>
+        </dl>
+        <p class="sheet-note">${st.keeper ? `${esc(st.keeper.username)} has the most finds here this month (${st.keeper.finds}).` : 'No Keeper yet this month. The most finds here takes it.'}</p>
+        <a class="btn btn-block sheet-go" href="#/station/${encodeURIComponent(s.id)}">${st.activeEggs ? `Hunt at ${esc(s.name)}` : `Open ${esc(s.name)}`}</a>
+      </div>`;
+    $('#sheetClose').addEventListener('click', closeSheet);
+    if (fly) {
+      const z = Math.max(map.getZoom(), 14.5);
+      const target = map.unproject(map.project([s.lat, s.lng], z).add([0, sheet.offsetHeight / 2]), z);
+      map.flyTo(target, z, { duration: motion ? 0.7 : 0, easeLinearity: 0.2 });
+    }
+  }
+  function closeSheet() {
+    const sheet = $('#sheet');
+    selectedTrain = null;
+    following = false;
+    if (!sheet || sheet.hidden) return;
+    sheet.hidden = true;
+    if (selectedId) setSelected(stations.find((x) => x.id === selectedId), false);
+    selectedId = null;
+  }
+  // A tap on the map: a train if one is under the finger, otherwise close the card.
+  map.on('click', (e) => {
+    const id = trainLayer.hit(e.containerPoint.x, e.containerPoint.y);
+    if (id) return selectTrain(id);
+    closeSheet();
+  });
+  map.on('mousemove', (e) => {
+    map.getContainer().classList.toggle('over-train', Boolean(trainLayer.hit(e.containerPoint.x, e.containerPoint.y)));
+  });
+  map.on('dragstart', () => {
+    if (!following) return;
+    following = false;
+    const b = $('#followBtn');
+    if (b) { b.setAttribute('aria-pressed', 'false'); b.textContent = 'Follow train'; }
+  });
+
   if (loc.pos) {
-    L.circle([loc.pos.lat, loc.pos.lng], { radius: RANGE_METERS, color: ink, weight: 1, fillOpacity: 0.06 }).addTo(map);
-    L.circleMarker([loc.pos.lat, loc.pos.lng], { radius: 7, color: ticket, weight: 3, fillColor: ink, fillOpacity: 1 }).addTo(map).bindPopup('You are here');
+    L.circle([loc.pos.lat, loc.pos.lng], { renderer: lineRenderer, radius: RANGE_METERS, color: tok('--focus'), weight: 1.5, opacity: 0.5, fillColor: tok('--focus'), fillOpacity: 0.06, interactive: false }).addTo(map);
+    L.marker([loc.pos.lat, loc.pos.lng], {
+      icon: L.divIcon({ className: 'me-wrap', iconSize: [20, 20], iconAnchor: [10, 10], html: '<span class="me-dot" title="You"></span>' }),
+      zIndexOffset: 1000,
+      keyboard: false,
+      interactive: false,
+    }).addTo(map);
   }
+
+  // --- live trains, replayed a little behind their reports so they glide at the pace they really moved ---
+  const TrainLayer = makeTrainLayer();
+  const trainLayer = new TrainLayer().addTo(map);
+  const trains = new Map(); // id -> { fam, color, cars, hist: [{ t, track, along, lat, lng, bearing }], dir }
+  const rgba = (hex, a) => {
+    const h = hex.replace('#', '');
+    const n = parseInt(h.length === 3 ? [...h].map((c) => c + c).join('') : h, 16);
+    return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
+  };
+  const style = { casing: tok('--ticket'), glass: rgba(tok('--ticket'), 0.88), shadow: rgba(tok('--ink'), 0.25), halo: rgba(tok('--ticket'), 0.35), ring: rgba(tok('--ink'), 0.8) };
+  let clock = null; // ties report time to this page's clock: { dataMs, perf }
+  const renderTime = () => (clock ? clock.dataMs + (performance.now() - clock.perf) - PLAYBACK_DELAY_MS : 0);
+  const angleGap = (a, b) => Math.abs(((((a - b) % 360) + 540) % 360) - 180);
+
+  const snapFor = (v, prev) => {
+    // Stay on the branch the train was on if it still fits, so trains don't flip between Ashmont and Braintree.
+    if (prev?.track) {
+      const s = snapToTrack(prev.track, v.lat, v.lng);
+      if (s && s.off <= ON_TRACK_M) return { track: prev.track, ...s };
+    }
+    let best = null;
+    for (const t of tracks.get(v.routeId) ?? []) {
+      const s = snapToTrack(t, v.lat, v.lng);
+      if (s && (!best || s.off < best.off)) best = { track: t, ...s };
+    }
+    return best && best.off <= ON_TRACK_M ? best : null;
+  };
+
+  const ingest = (vehicles) => {
+    const newest = Math.max(0, ...vehicles.map((v) => Date.parse(v.updatedAt) || 0));
+    const predicted = clock ? clock.dataMs + (performance.now() - clock.perf) : 0;
+    if (!clock || Math.abs(newest - predicted) > 30_000) clock = { dataMs: newest || Date.now(), perf: performance.now() };
+    const seen = new Set();
+    for (const v of vehicles) {
+      seen.add(v.id);
+      const t = Date.parse(v.updatedAt) || newest;
+      const fam = family(v.routeId);
+      let tr = trains.get(v.id);
+      if (!tr) {
+        tr = { id: v.id, fam, color: v.color, cars: CARS[v.routeId] ?? CARS[fam] ?? 2, hist: [], dir: 0 };
+        trains.set(v.id, tr);
+      }
+      tr.v = v; // the latest report, for the train card
+      const last = tr.hist[tr.hist.length - 1];
+      if (last && t <= last.t) continue;
+      // A new trip direction (it turned around at the end of the line): work out its facing again.
+      if (tr.directionId != null && v.directionId != null && v.directionId !== tr.directionId) tr.dir = 0;
+      tr.directionId = v.directionId;
+      const snap = snapFor(v, last);
+      // Within a trip, trains only go forward. A report a little behind the last one is position noise: hold still.
+      if (snap && last?.track === snap.track && tr.dir && (snap.along - last.along) * tr.dir < 0 && Math.abs(snap.along - last.along) < BACKSTEP_M) {
+        snap.along = last.along;
+      }
+      const point = snap
+        ? { t, track: snap.track, along: snap.along, ...pointOnTrack(snap.track, snap.along), mbtaBearing: v.bearing ?? 0 }
+        : { t, track: null, along: null, lat: v.lat, lng: v.lng, bearing: v.bearing ?? 0 };
+      // Which way along the track this train faces, from the MBTA's own heading. Only used until it has moved.
+      if (snap && !tr.dir) tr.dir = angleGap(v.bearing ?? 0, point.bearing) <= 90 ? 1 : -1;
+      tr.hist.push(point);
+      const cutoff = renderTime() - 60_000;
+      while (tr.hist.length > 2 && tr.hist[1].t < cutoff) tr.hist.shift();
+    }
+    for (const id of trains.keys()) if (!seen.has(id)) trains.delete(id);
+  };
+
+  // Where each train's head is at time `rt`: on a track (track, along, dir) or, off the mapped track, a point and heading.
+  const positionAt = (tr, rt) => {
+    const h = tr.hist;
+    if (!h.length) return null;
+    const onTrack = (pt, along) => ({ track: pt.track, along, dir: tr.dir || 1, moving: false });
+    const still = (pt) => (pt.track ? onTrack(pt, pt.along) : { lat: pt.lat, lng: pt.lng, bearing: pt.bearing, moving: false });
+    if (!motion || rt >= h[h.length - 1].t) return still(h[h.length - 1]);
+    if (rt <= h[0].t) return still(h[0]);
+    let i = 0;
+    while (i < h.length - 2 && h[i + 1].t <= rt) i++;
+    const a = h[i];
+    const b = h[i + 1];
+    const k = (rt - a.t) / (b.t - a.t || 1);
+    if (a.track && a.track === b.track && Math.abs(b.along - a.along) < MAX_GLIDE_M) {
+      const moved = b.along - a.along;
+      // Only real movement changes the facing direction; jitter at a platform doesn't.
+      if (!tr.dir && Math.abs(moved) >= DIR_MIN_M) tr.dir = moved > 0 ? 1 : -1;
+      return { ...onTrack(a, a.along + moved * k), moving: Math.abs(moved) >= 1 };
+    }
+    return still(k < 0.5 ? a : b); // a jump (new trip, yard move): switch at the midpoint instead of sliding across the city
+  };
+
+  let raf = 0;
+  let showTrains = true;
+  let selectedTrain = null;
+  let following = false;
+  let movingNow = 0;
+  let lastItems = [];
+  const frame = () => {
+    raf = 0;
+    if (state.map !== map) return;
+    const rt = renderTime();
+    const items = [];
+    movingNow = 0;
+    if (showTrains) {
+      for (const tr of trains.values()) {
+        if (filter && tr.fam !== filter) continue;
+        const p = positionAt(tr, rt);
+        if (!p) continue;
+        if (p.moving) movingNow++;
+        items.push({ ...p, id: tr.id, color: tr.color, cars: tr.cars, selected: tr.id === selectedTrain });
+      }
+    }
+    if (following && selectedTrain) {
+      const it = items.find((x) => x.id === selectedTrain);
+      if (it) {
+        const head = it.track ? pointOnTrack(it.track, it.along) : it;
+        const lift = $('#sheet')?.offsetHeight ?? 0;
+        const z = map.getZoom();
+        map.panTo(map.unproject(map.project([head.lat, head.lng], z).add([0, lift / 2]), z), { animate: false });
+      }
+    }
+    trainLayer.draw(items, style);
+    lastItems = items;
+    if (motion) raf = requestAnimationFrame(frame);
+  };
+  const STATUS = { STOPPED_AT: 'Stopped at', INCOMING_AT: 'Pulling into', IN_TRANSIT_TO: 'On the way to' };
+  const CROWD = { MANY_SEATS_AVAILABLE: 'Seats free', FEW_SEATS_AVAILABLE: 'Few seats', STANDING_ROOM_ONLY: 'Standing room', CRUSHED_STANDING_ROOM_ONLY: 'Packed', FULL: 'Full' };
+  const ago = (iso) => {
+    const sec = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000));
+    return sec < 60 ? `${sec} s ago` : `${Math.round(sec / 60)} min ago`;
+  };
+  function renderTrainCard() {
+    const sheet = $('#sheet');
+    const tr = trains.get(selectedTrain);
+    if (!sheet) return;
+    if (!tr) {
+      sheet.innerHTML = `
+        <div class="sheet-band"><span class="sheet-lines">Train</span><button class="sheet-x" type="button" id="sheetClose" aria-label="Close"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
+        <div class="sheet-top"><h2 class="sheet-h">Trip finished</h2><p class="sheet-sub">This train isn't reporting any more. It probably reached the end of its trip.</p></div>`;
+      $('#sheetClose').addEventListener('click', closeSheet);
+      following = false;
+      return;
+    }
+    const v = tr.v;
+    const station = v.stopName ? stations.find((x) => x.name === v.stopName) : null;
+    const cars = v.carriages?.length ? v.carriages : v.label ? v.label.split('-').map((label) => ({ label, occupancy: null })) : [];
+    const crowdKey = (o) => (o === 'MANY_SEATS_AVAILABLE' ? 'low' : o === 'FEW_SEATS_AVAILABLE' ? 'mid' : o ? 'high' : '');
+    const heading = [v.directionName, v.destination && v.destination !== v.headsign ? `toward ${v.destination}` : ''].filter(Boolean).join(' ');
+    sheet.hidden = false;
+    sheet.classList.add('is-train');
+    sheet.style.setProperty('--ln', LINE_VAR[tr.fam] ?? 'var(--ink)');
+    sheet.innerHTML = `
+      <div class="sheet-band">
+        <span class="sheet-lines">${esc(v.line || `${tr.fam} Line`)} train${v.label ? `<span class="also train-no">No. ${esc(v.label.split('-')[0])}</span>` : ''}</span>
+        <button class="sheet-x" type="button" id="sheetClose" aria-label="Close"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+      </div>
+      <div class="sheet-top">
+        <h2 class="sheet-h">${v.headsign ? `To ${esc(v.headsign)}` : esc(v.line)}</h2>
+        <p class="sheet-sub">${v.stopName ? `${STATUS[v.status] ?? 'Near'} <b>${esc(v.stopName)}</b>` : 'Between stations'}${heading ? `, heading ${esc(heading)}` : ''}.</p>
+      </div>
+      <div class="tk-perf" aria-hidden="true"></div>
+      <div class="sheet-bottom">
+        ${cars.length ? `<div class="train-row"><p class="train-k">${plural(cars.length, 'car')}</p><ul class="train-cars" aria-label="Car numbers">${cars.map((c) => `<li class="${crowdKey(c.occupancy)}" title="${esc(CROWD[c.occupancy] ?? '')}">${esc(c.label)}</li>`).join('')}</ul></div>` : ''}
+        ${cars.some((c) => c.occupancy) ? '<p class="crowd-key"><i class="low"></i>Seats free <i class="mid"></i>Few seats <i class="high"></i>Standing</p>' : ''}
+        <p class="sheet-note">Reported ${v.updatedAt ? ago(v.updatedAt) : 'recently'}. Vehicle ${esc(v.id)}. The map runs about 25 s behind reports so trains glide.</p>
+        <div class="sheet-acts">
+          <button class="btn sheet-go" type="button" id="followBtn" aria-pressed="${following}">${following ? 'Following' : 'Follow train'}</button>
+          ${station ? `<a class="btn btn-ghost" href="#/station/${encodeURIComponent(station.id)}"><span class="clip">Open ${esc(station.name)}</span></a>` : ''}
+        </div>
+      </div>`;
+    $('#sheetClose').addEventListener('click', closeSheet);
+    $('#followBtn').addEventListener('click', (e) => {
+      following = !following;
+      e.currentTarget.setAttribute('aria-pressed', String(following));
+      e.currentTarget.textContent = following ? 'Following' : 'Follow train';
+      kick();
+    });
+  }
+  function selectTrain(id) {
+    if (selectedId) setSelected(stations.find((x) => x.id === selectedId), false);
+    selectedId = null;
+    if (selectedTrain !== id) following = false;
+    selectedTrain = id;
+    renderTrainCard();
+    kick();
+  }
+
+  const kick = () => {
+    if (!raf) raf = requestAnimationFrame(frame);
+  };
+  onCleanup(() => cancelAnimationFrame(raf));
+
+  const applyFilter = () => {
+    for (const { fam, casing, stroke } of lineLayers) {
+      const on = !filter || fam === filter;
+      stroke.setStyle({ opacity: on ? 0.95 : 0.16 });
+      casing.setStyle({ opacity: on ? 1 : 0.35 });
+    }
+    for (const s of stations) {
+      const on = !filter || familiesOf(s.lines).includes(filter);
+      const m = markers.get(s.id);
+      if (m.kind === 'dom') m.layer.setOpacity(on ? 1 : 0.3);
+      else m.layer.setStyle({ opacity: on ? 1 : 0.3, fillOpacity: on ? 1 : 0.3 });
+    }
+    kick();
+  };
+
+  const loadTrains = async () => {
+    if (state.map !== map) return;
+    try {
+      const { vehicles, error } = await api('/api/map/vehicles');
+      ingest(vehicles);
+      if (selectedTrain) renderTrainCard();
+      const counts = MAP_LINES.map((l) => [l, vehicles.filter((v) => family(v.routeId) === l).length]);
+      $('#mapFoot').textContent = error
+        ? 'Live trains are unavailable right now.'
+        : `${plural(vehicles.length, 'train')} running: ${counts.map(([l, n]) => `${n} ${l}`).join(', ')}. Live from the MBTA.`;
+      kick();
+    } catch {
+      $('#mapFoot').textContent = 'Live trains are unavailable right now.';
+    }
+  };
+  loadTrains();
+  every(VEHICLE_POLL_MS, loadTrains);
+  if (!motion) map.on('move zoomend', kick);
+
+  $('#showTrains').addEventListener('change', (e) => {
+    showTrains = e.target.checked;
+    kick();
+  });
+  app.querySelectorAll('.chip').forEach((c) =>
+    c.addEventListener('click', () => {
+      filter = c.dataset.line || null;
+      app.querySelectorAll('.chip').forEach((x) => x.setAttribute('aria-pressed', String(x === c)));
+      applyFilter();
+      const pts = linesData.lines.filter((l) => !filter || family(l.routeId) === filter).flatMap((l) => l.points);
+      if (pts.length) map.flyToBounds(L.latLngBounds(pts).pad(0.05), { duration: motion ? 0.7 : 0 });
+    }),
+  );
+
+  const n = nearestStation(stations);
+  if (isInRange(n)) select(n.station, { fly: false });
+  window.__lookoutMap = { trains: () => trains.size, moving: () => movingNow, drawn: () => lastItems.map((it) => { const h = it.track ? pointOnTrack(it.track, it.along) : it; const p = subpixelPoint(map, h.lat, h.lng); return [p.x, p.y, it.dir ?? 0]; }), lines: () => lineLayers.map((l) => l.stroke.getLatLngs().map((x) => [x.lat, x.lng])), hits: () => trainLayer.screenHits(), ids: () => lastItems.map((it) => it.id), describe: (id) => { const t = trains.get(id); return t && { id, line: t.v?.line, status: t.v?.status, stop: t.v?.stopName, headsign: t.v?.headsign, hist: t.hist.map((h) => Math.round(h.along ?? -1)) }; }, map };
 }
 
 // ---------- boot ----------

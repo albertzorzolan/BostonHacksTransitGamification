@@ -24,7 +24,7 @@ const serveFrontend = env.SERVE_FRONTEND !== 'false' && fs.existsSync(frontendDi
 
 const app = await createApp({
   db,
-  mbta: createMbta({ apiKey: env.MBTA_API_KEY, cacheFile: path.join(ROOT, 'data', 'stations.json') }),
+  mbta: createMbta({ apiKey: env.MBTA_API_KEY, cacheFile: path.join(ROOT, 'data', 'stations.json'), shapesFile: path.join(ROOT, 'data', 'shapes.json') }),
   geminiKey: env.GEMINI_API_KEY ?? '',
   geminiModel: env.GEMINI_MODEL || 'gemini-2.5-flash',
   frontendDir: serveFrontend ? frontendDir : null,

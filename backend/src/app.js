@@ -13,6 +13,7 @@ const MAX_BODY_BYTES = 12 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const HOUSEKEEPING_EVERY_MS = 60_000;
 const SESSION_TOUCH_MS = 60 * 60_000; // refresh last_seen / expiry at most hourly
+const HUNTING_NOW_MS = 15 * 60_000; // a round started in the last 15 minutes counts as hunting now
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -93,6 +94,7 @@ export async function createApp({
 
   // Retiring stale eggs runs lazily on station reads, at most once a minute per instance.
   let lastHousekeeping = -Infinity;
+  let mapLinesCache = null; // route shapes, per instance
   async function housekeeping() {
     const t = now();
     if (t.getTime() - lastHousekeeping < HOUSEKEEPING_EVERY_MS) return;
@@ -514,6 +516,73 @@ export async function createApp({
       });
     },
 
+    // ----- map -----
+    // Route shapes to draw the lines. Loaded once per instance; empty if the MBTA API can't be reached.
+    async mapLines() {
+      if (!mapLinesCache) {
+        try {
+          mapLinesCache = typeof mbta.shapes === 'function' ? await mbta.shapes() : [];
+        } catch (err) {
+          console.warn('[mbta] could not load shapes:', err.message);
+          return { lines: [] };
+        }
+      }
+      return { lines: mapLinesCache };
+    },
+
+    // Live train positions (the MBTA client caches these for a few seconds).
+    async mapVehicles() {
+      try {
+        return { vehicles: typeof mbta.vehicles === 'function' ? await mbta.vehicles() : [] };
+      } catch (err) {
+        return { vehicles: [], error: `Live trains unavailable (${err.message}).` };
+      }
+    },
+
+    // Per-station numbers for the map: eggs up, people hunting now, finds this month,
+    // your finds there, and this month's Keeper (most finds at the station).
+    async mapStations(ctx) {
+      await ensureStations();
+      await housekeeping();
+      const t = now();
+      const month = game.monthKey(t);
+      const since = new Date(t.getTime() - HUNTING_NOW_MS);
+      const [eggs, hunting, monthFinds, mine, keepers] = await Promise.all([
+        db.many(`select station_id, count(*)::int as n from eggs where status = 'active' group by station_id`),
+        db.many(
+          `select e.station_id, count(distinct a.user_id)::int as n
+             from attempts a join eggs e on e.id = a.egg_id
+            where a.started_at > $1 group by e.station_id`,
+          [since],
+        ),
+        db.many(`select station_id, count(*)::int as n from finds where month = $1 group by station_id`, [month]),
+        ctx.user
+          ? db.many(`select station_id, count(*)::int as n from finds where user_id = $1 group by station_id`, [ctx.user.id])
+          : [],
+        db.many(
+          `select station_id, username, n from (
+             select f.station_id, u.username, count(*)::int as n,
+                    row_number() over (partition by f.station_id order by count(*) desc, sum(f.points) desc, u.username) as r
+               from finds f join users u on u.id = f.user_id
+              where f.month = $1 group by f.station_id, u.username) x
+            where r = 1`,
+          [month],
+        ),
+      ]);
+      const by = (rows) => new Map(rows.map((r) => [r.station_id, r]));
+      const [e, h, m, me, k] = [eggs, hunting, monthFinds, mine, keepers].map(by);
+      return {
+        stations: stations.map((s) => ({
+          id: s.id,
+          activeEggs: e.get(s.id)?.n ?? 0,
+          huntingNow: h.get(s.id)?.n ?? 0,
+          findsThisMonth: m.get(s.id)?.n ?? 0,
+          yourFinds: me.get(s.id)?.n ?? 0,
+          keeper: k.get(s.id) ? { username: k.get(s.id).username, finds: k.get(s.id).n } : null,
+        })),
+      };
+    },
+
     // Rider level, today's challenge, stamps, and the stations and lines you've found eggs on.
     // All derived from finds, attempts and eggs: nothing extra is stored.
     async progress(ctx) {
@@ -651,6 +720,9 @@ export async function createApp({
     ['POST', /^\/api\/eggs$/, api.createEgg, 'optional'],
     ['POST', /^\/api\/eggs\/([^/]+)\/report$/, api.reportEgg, 'optional'],
     ['GET', /^\/api\/me\/progress$/, api.progress, 'optional'],
+    ['GET', /^\/api\/map\/lines$/, api.mapLines, 'none'],
+    ['GET', /^\/api\/map\/vehicles$/, api.mapVehicles, 'none'],
+    ['GET', /^\/api\/map\/stations$/, api.mapStations, 'optional'],
     ['GET', /^\/api\/leaderboard$/, api.leaderboard, 'none'],
   ];
 

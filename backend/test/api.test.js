@@ -308,3 +308,36 @@ test('progress: rider level, daily challenge, stamps, stations and lines', async
   assert.ok(['transfer', 'racer', 'climber', 'triple'].includes(p.today.id));
   assert.equal(p.today.target >= p.today.progress, true);
 });
+
+test('map: per-station stats, keeper and hunting now; lines and trains degrade to empty without the MBTA', async () => {
+  const sal = await user('sal');
+  const tia = await user('tia');
+  await ok('/api/eggs', { stationId: 'place-kencl', level: 3, image: IMG }, sal);
+  const eggId = (await ok('/api/stations/place-kencl')).slots[2].egg.id;
+
+  // tia starts a round: she's hunting at Kenmore now, then finds it.
+  const round = await ok('/api/attempts', { eggId, mode: 'fixed' }, tia);
+  let m = await ok('/api/map/stations', null, tia);
+  let ken = m.stations.find((s) => s.id === 'place-kencl');
+  assert.ok(ken.huntingNow >= 1, 'a round started just now counts as hunting');
+  clock += 30_000;
+  await ok(`/api/attempts/${round.attempt.id}/find`, { image: IMG }, tia);
+
+  m = await ok('/api/map/stations', null, tia);
+  ken = m.stations.find((s) => s.id === 'place-kencl');
+  assert.equal(ken.yourFinds, 1);
+  assert.ok(ken.findsThisMonth >= 1);
+  assert.ok(ken.keeper && typeof ken.keeper.username === 'string');
+  assert.equal(m.stations.length, 2, 'one row per station');
+
+  const anon = await ok('/api/map/stations');
+  assert.equal(anon.stations.find((s) => s.id === 'place-kencl').yourFinds, 0, 'no player, no personal count');
+
+  clock += 16 * 60_000; // past the 15-minute window
+  m = await ok('/api/map/stations');
+  assert.equal(m.stations.find((s) => s.id === 'place-kencl').huntingNow, 0);
+
+  // The fake MBTA has no shapes or vehicles: the endpoints answer with empty lists instead of failing.
+  assert.deepEqual(await ok('/api/map/lines'), { lines: [] });
+  assert.deepEqual((await ok('/api/map/vehicles')).vehicles, []);
+});
