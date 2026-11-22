@@ -1245,13 +1245,17 @@ export async function createApp({
       if (/[<>]/.test(name)) fail(400, 'What it is can only be plain words.');
       // Screen the photo first: no faces, a real object to find, not a blank wall.
       // Cheap checks (slot taken, find already used) still run before the Gemini call.
-      if (!body?.findId) {
-        if (await slots.activeEgg(col, undefined, s.id, level)) fail(409, 'This level already has an egg. Find it first to earn the right to hide the next one.');
+      // Hiding without a find: an empty slot goes live at once; a busy slot queues the egg.
+      // A player can only have a few eggs waiting, so the queues can't be flooded.
+      const waiting = () => col.eggs.countDocuments({ createdBy: user._id, status: 'pool', queued: true, activatedAt: null });
+      if (!body?.findId && (await slots.activeEgg(col, undefined, s.id, level)) && (await waiting()) >= game.MAX_QUEUED_EGGS) {
+        fail(409, `You already have ${game.MAX_QUEUED_EGGS} eggs waiting. Hide more once one goes live.`);
       }
       const screening = await screen({ jpeg: image.data, type: image.contentType, name, apiKey: geminiKey, model: geminiModel });
       if (!screening.ok) fail(screening.problem === 'unavailable' ? 503 : 422, screening.message);
       const t = now();
       const eggId = crypto.randomUUID();
+      let queued = false;
 
       await tx(async (session) => {
         await slots.lockSlot(col, session, s.id, level);
@@ -1266,18 +1270,15 @@ export async function createApp({
           if ((t - find.foundAt) / 60000 > game.HIDE_WINDOW_MINUTES) fail(409, 'Too long since your find to hide the next egg.');
           await col.finds.updateOne({ _id: find._id }, { $set: { canHide: false } }, { session });
         } else if (await slots.activeEgg(col, session, s.id, level)) {
-          fail(409, 'This level already has an egg. Find it first to earn the right to hide the next one.');
+          queued = true;
         }
         const photoId = await savePhoto(session, image);
         const displayPhotoId = blurred ? await savePhoto(session, blurred) : undefined;
-        await slots.placeEgg(
-          col,
-          session,
-          { _id: eggId, stationId: s.id, level, photoId, ...(displayPhotoId && { displayPhotoId }), name, hint, createdBy: user._id },
-          t,
-        );
+        const doc = { _id: eggId, stationId: s.id, level, photoId, ...(displayPhotoId && { displayPhotoId }), name, hint, createdBy: user._id };
+        if (queued) await slots.queueEgg(col, session, doc, t);
+        else await slots.placeEgg(col, session, doc, t);
       });
-      return { egg: { id: eggId, stationId: s.id, level } };
+      return { egg: { id: eggId, stationId: s.id, level, queued } };
     },
 
     async reportEgg(ctx) {

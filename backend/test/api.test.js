@@ -25,6 +25,7 @@ const STATIONS = [
   { id: 'test-clock', name: 'Test Clock', lat: 42.37, lng: -71.08, lines: [{ id: 'Blue', name: 'Blue Line', color: '#003DA5' }] },
   { id: 'test-map', name: 'Test Map', lat: 42.41, lng: -71.12, lines: [{ id: 'Green-B', name: 'Green Line B', color: '#00843D' }] },
   { id: 'test-screen', name: 'Test Screen', lat: 42.43, lng: -71.14, lines: [{ id: 'Red', name: 'Red Line', color: '#DA291C' }] },
+  { id: 'test-queue', name: 'Test Queue', lat: 42.44, lng: -71.15, lines: [{ id: 'Red', name: 'Red Line', color: '#DA291C' }] },
   { id: 'test-map', name: 'Test Map', lat: 42.41, lng: -71.12, lines: [{ id: 'Orange', name: 'Orange Line', color: '#ED8B00' }] },
 ];
 let fakeVehicles = []; // live trains, for the train lobby tests
@@ -140,7 +141,6 @@ test('full round: hide, find, hide next, leaderboard', async () => {
 
   assert.equal((await call('/api/eggs', { name: 'sticker', stationId: 'place-kencl', level: 2, image: IMG })).status, 401, 'must be signed in');
   await ok('/api/eggs', { name: 'sticker', stationId: 'place-kencl', level: 2, image: IMG, hint: 'by the stairs' }, ana);
-  assert.equal((await call('/api/eggs', { name: 'sticker', stationId: 'place-kencl', level: 2, image: IMG }, ana)).status, 409, 'slot is taken');
 
   const st = await ok('/api/stations/place-kencl', null, ben);
   const egg = st.slots.find((s) => s.level === 2).egg;
@@ -976,9 +976,11 @@ test('photo screen: a rejected egg photo is never hidden, and the player is told
   assert.equal((await hide()).status, 200);
   assert.equal(screened.length, n + 1);
   assert.ok(Buffer.isBuffer(screened.at(-1).jpeg));
-  // A slot that's already taken is refused before spending a Gemini call.
+  // A player at the queue limit is refused before spending a Gemini call.
+  await db.col.eggs.insertMany([1, 2, 3].map((i) => ({ _id: `q-${hider.id}-${i}`, stationId: 'test-screen', level: 1, createdBy: hider.id, status: 'pool', queued: true, activatedAt: null, createdAt: new Date(clock) })));
   assert.equal((await hide()).status, 409);
   assert.equal(screened.length, n + 1);
+  await db.col.eggs.deleteMany({ _id: { $in: [1, 2, 3].map((i) => `q-${hider.id}-${i}`) } });
 });
 
 test('egg name: required, passed to the photo screen, rejected when it does not match, shown to finders', async () => {
@@ -999,4 +1001,22 @@ test('egg name: required, passed to the photo screen, rejected when it does not 
   const egg = (await ok('/api/stations/test-screen', null, finder)).slots[1].egg;
   const round = await ok('/api/attempts', { eggId: egg.id }, finder);
   assert.equal(round.egg.name, 'red sticker', 'finders see what it is');
+});
+
+test('hide without a quest: an empty slot goes live, a busy slot queues the egg until the live one is found', async () => {
+  const [a, b, finder] = [await user('q_a'), await user('q_b'), await user('q_finder')];
+  const hide = (who) => ok('/api/eggs', { name: 'sticker', stationId: 'test-queue', level: 1, image: IMG }, who);
+  const live = await hide(a);
+  assert.equal(live.egg.queued, false, 'empty slot: live at once');
+  const q = await hide(b);
+  assert.equal(q.egg.queued, true, 'busy slot: queued');
+  assert.equal((await ok('/api/stations/test-queue')).slots[0].egg.id, live.egg.id, 'the live egg stays up');
+  // Once the live egg is found, the queued one rotates in.
+  const round = await ok('/api/attempts', { eggId: live.egg.id }, finder);
+  await ok(`/api/attempts/${round.attempt.id}/find`, { image: IMG }, finder);
+  assert.equal((await ok('/api/stations/test-queue')).slots[0].egg.id, q.egg.id);
+  // At most MAX_QUEUED_EGGS waiting per player.
+  const { MAX_QUEUED_EGGS } = await import('../src/game.js');
+  for (let i = 0; i < MAX_QUEUED_EGGS; i++) assert.equal((await hide(a)).egg.queued, true);
+  assert.equal((await call('/api/eggs', { name: 'sticker', stationId: 'test-queue', level: 1, image: IMG }, a)).status, 409);
 });

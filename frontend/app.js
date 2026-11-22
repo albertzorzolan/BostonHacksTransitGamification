@@ -1200,7 +1200,13 @@ async function showStation(id, { here = false, distance = null } = {}) {
         <p class="clear-note">${card.cleared ? '<b>Cleared.</b> Every egg here is punched.' : `<b>${card.found} of ${card.playable}</b> found here`}</p>
       </div>` : ''}
     </div>
-    <ol class="stubs">${stubsHtml(slots)}</ol>`;
+    <ol class="stubs">${stubsHtml(slots)}</ol>
+    <div class="hide-any">
+      <button id="hideAny" class="btn btn-ghost btn-block" type="button" aria-expanded="false">+ Hide an egg</button>
+      <div id="hidePick" class="hide-chips" hidden>${slots
+        .map((sl) => `<button class="hide-chip" type="button" data-hide="${sl.level}"><b>${sl.level}</b>${esc(sl.name)}<span class="hide-when">${sl.egg ? 'Queue' : 'Live'}</span></button>`)
+        .join('')}</div>
+    </div>`;
 
   app.querySelectorAll('[data-play]').forEach((btn) =>
     btn.addEventListener('click', async () => {
@@ -1218,6 +1224,12 @@ async function showStation(id, { here = false, distance = null } = {}) {
       }
     }),
   );
+  // Hide any level, any time: an empty slot goes live, a busy one queues behind the live egg.
+  $('#hideAny')?.addEventListener('click', (e) => {
+    const pick = $('#hidePick');
+    pick.hidden = !pick.hidden;
+    e.currentTarget.setAttribute('aria-expanded', String(!pick.hidden));
+  });
   app.querySelectorAll('[data-hide]').forEach((btn) =>
     btn.addEventListener('click', () => {
       state.pendingHide = { stationId: id, stationName: station.name, level: Number(btn.dataset.hide), findId: null };
@@ -1602,10 +1614,10 @@ function viewHide() {
     btn.textContent = 'Checking your photo';
     $('#err').innerHTML = '';
     try {
-      await api('/api/eggs', { stationId: hide.stationId, level: hide.level, findId: hide.findId, name, hint: $('#hint').value, image });
+      const { egg } = await api('/api/eggs', { stationId: hide.stationId, level: hide.level, findId: hide.findId, name, hint: $('#hint').value, image });
       state.pendingHide = null;
       state.stations = null; // egg counts changed
-      toast('Egg hidden. Now someone else has to find it.');
+      toast(egg.queued ? 'Egg queued. It goes live once the current one is found.' : 'Egg hidden. Now someone else has to find it.');
       location.hash = `#/station/${encodeURIComponent(hide.stationId)}`;
     } catch (err) {
       $('#err').innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;

@@ -52,6 +52,15 @@ export async function retireEgg(col, session, egg, now) {
   }
 }
 
+// Hiding without a find into a slot that already has a live egg: the new egg waits in the
+// slot's pool, and rotateAfterFind (or retireEgg) brings it in once the live egg is found.
+export async function queueEgg(col, session, egg, now) {
+  await col.eggs.insertOne(
+    { ...egg, createdAt: now, status: 'pool', queued: true, activatedAt: null, timesFound: 0, avgFindSeconds: null },
+    { session },
+  );
+}
+
 // A newly hidden egg takes the slot; whatever was there goes to the pool.
 export async function placeEgg(col, session, egg, now) {
   await col.eggs.updateMany({ stationId: egg.stationId, level: egg.level, status: 'active' }, { $set: { status: 'pool' } }, { session });

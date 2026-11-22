@@ -769,3 +769,7 @@ html[data-line="Orange"] .msg.mine .msg-cap { color: var(--ink); }
 .activity-scroll { max-height: min(46dvh, 360px); overflow-y: auto; overscroll-behavior: contain; border-radius: var(--radius);
   -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent); padding-bottom: 20px; }
 .activity-scroll:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+
+.hide-any { display: grid; gap: var(--space-xs); margin-top: var(--space-sm); }
+.hide-any .hide-chips[hidden] { display: none; }
+.hide-chip .hide-when { color: var(--muted); font-weight: 600; font-size: var(--text-xs); }
