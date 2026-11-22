@@ -9,6 +9,8 @@ import * as game from './game.js';
 import * as slots from './slots.js';
 import * as auth from './auth.js';
 import { blurredCopy } from './images.js';
+import * as trains from './trains.js';
+import { addSeed, removeSeed } from './seed.js';
 
 // Vercel functions accept request bodies up to 4.5 MB; phones send ~0.3 MB after downscaling.
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
@@ -60,6 +62,8 @@ export async function createApp({
   now = () => new Date(),
   frontendDir = null,
   corsOrigins = ['*'],
+  seedToken = '', // enables POST /api/admin/seed (demo filler data); off when empty
+  trainSim = false, // testing: a button that puts you on a live train without the GPS check
 }) {
   const { col, tx } = db;
 
@@ -83,7 +87,7 @@ export async function createApp({
   const photoUrl = (id) => `/photos/${id}.jpg`;
   const publicUser = (u) => ({ id: u._id, username: u.username, createdAt: u.createdAt });
   // Only the player themself sees their chat name: it's what keeps the group chat anonymous.
-  const selfUser = (u) => ({ ...publicUser(u), chatName: u.chatName ?? null });
+  const selfUser = (u) => ({ ...publicUser(u), chatName: u.chatName ?? null, ...(u.tester && { tester: true }) });
   const requireUser = (ctx) => ctx.user ?? fail(401, 'Sign in to play.');
   const hasFound = (userId, eggId, session) => col.finds.findOne({ userId, eggId }, { session, projection: { _id: 1 } });
 
@@ -197,10 +201,17 @@ export async function createApp({
     const [r] = await col.payouts
       .aggregate([
         { $match: { userId } },
-        { $group: { _id: null, allTime: { $sum: '$points' }, month: { $sum: { $cond: [{ $eq: ['$month', month] }, '$points', 0] } } } },
+        {
+          $group: {
+            _id: null,
+            allTime: { $sum: '$points' },
+            month: { $sum: { $cond: [{ $eq: ['$month', month] }, '$points', 0] } },
+            hider: { $sum: { $cond: [{ $in: ['$kind', ['lobby', 'lobby_donor']] }, 0, '$points'] } }, // bounty shares only
+          },
+        },
       ])
       .toArray();
-    return { allTime: r?.allTime ?? 0, month: r?.month ?? 0 };
+    return { allTime: r?.allTime ?? 0, month: r?.month ?? 0, hider: r?.hider ?? 0 };
   }
 
   // ---------- sessions ----------
@@ -343,15 +354,13 @@ export async function createApp({
   // The chat is anonymous: a message names its sender only by chat name, and carries no
   // user id (just whether it's yours), so it can't be matched to the group's leaderboard.
   const publicMessage = (m, viewerId, names) => {
-    const s = game.stickerById.get(m.sticker);
+    const s = m.sticker ? game.stickerById.get(m.sticker) : null;
     return {
       id: m._id,
       seq: m.seq,
       mine: m.userId === viewerId,
       name: names.get(m.userId) ?? 'Anonymous rider',
-      sticker: m.sticker,
-      emoji: s?.emoji ?? '🥚',
-      label: s?.label ?? '',
+      ...(m.text != null ? { text: m.text } : { sticker: m.sticker, emoji: s?.emoji ?? '🥚', label: s?.label ?? '' }),
       createdAt: m.createdAt,
     };
   };
@@ -422,6 +431,110 @@ export async function createApp({
     };
   }
 
+  // ---------- train lobbies ----------
+  // One lobby per train journey (MBTA trip). Riders verified on that train can join, chat under
+  // their anonymous chat names, and donate eggs they've found toward the lobby's pledge limit.
+  // Reaching the limit pays every donor; a journey that ends first returns the eggs.
+  const lockLobby = (session, id) => col.locks.updateOne({ _id: `lobby:${id}` }, { $inc: { v: 1 } }, { upsert: true, session });
+
+  async function liveVehicles() {
+    try {
+      return typeof mbta.vehicles === 'function' ? await mbta.vehicles() : null;
+    } catch {
+      return null; // feed down: no new verifications, and lobbies don't end on a missing train
+    }
+  }
+
+  // A player's eggs that can still be pledged: found eggs not yet pledged anywhere, by level.
+  // Pledging marks the find (finds.pledgedIn), so an egg can only ever be pledged once. The
+  // find itself stays, so the egg collection on the profile is unchanged.
+  async function pledgeableEggs(userId, session) {
+    const rows = await col.finds
+      .aggregate([{ $match: { userId, pledgedIn: { $exists: false } } }, { $group: { _id: '$level', n: { $sum: 1 } } }], { session })
+      .toArray();
+    const by = new Map(rows.map((r) => [r._id, r.n]));
+    const levels = game.LEVELS.map((l) => ({ level: l.level, name: l.name, points: l.points, count: by.get(l.level) ?? 0 }));
+    return { levels, points: levels.reduce((n, l) => n + l.points * l.count, 0) };
+  }
+
+  // Ends a lobby whose journey is over: the trip has left the live feed for a while, or it's
+  // been running implausibly long. Pledged eggs stay pledged either way.
+  async function settleLobby(lobby, vehicles) {
+    if (lobby.status === 'ended') return lobby;
+    const t = now();
+    if (vehicles?.some((v) => v.tripId === lobby.tripId)) {
+      if (t - lobby.lastSeenAt > 30_000) await col.lobbies.updateOne({ _id: lobby._id, status: { $ne: 'ended' } }, { $set: { lastSeenAt: t } });
+      return { ...lobby, lastSeenAt: t };
+    }
+    const gone = vehicles && t - lobby.lastSeenAt > trains.LOBBY_GONE_MS;
+    if (!gone && t - lobby.createdAt <= trains.LOBBY_MAX_MS) return lobby;
+    const outcome = lobby.status === 'reached' ? 'reached' : 'missed';
+    await col.lobbies.updateOne({ _id: lobby._id, status: { $ne: 'ended' } }, { $set: { status: 'ended', endedAt: t, outcome } });
+    return { ...lobby, status: 'ended', endedAt: t, outcome };
+  }
+
+  async function publicLobby(lobby, userId, { full = true } = {}) {
+    const members = await col.lobbyMembers.find({ lobbyId: lobby._id }).sort({ joinedAt: 1 }).toArray();
+    const me = members.find((m) => m.userId === userId);
+    const atTarget = members.filter((m) => (m.pledged ?? 0) >= trains.PLEDGE_TARGET).length;
+    const base = {
+      id: lobby._id,
+      tripId: lobby.tripId,
+      line: lobby.line,
+      routeId: lobby.routeId,
+      headsign: lobby.headsign,
+      status: lobby.status, // open | reached | ended
+      outcome: lobby.outcome ?? null, // when ended: reached | missed
+      riders: members.length,
+      atTarget,
+      target: trains.PLEDGE_TARGET,
+      minRiders: trains.MIN_RIDERS,
+      joined: Boolean(me),
+      yourPledged: me?.pledged ?? 0,
+    };
+    if (!full) return base;
+    const [names, stash] = await Promise.all([chatNames(members.map((m) => m.userId)), pledgeableEggs(userId)]);
+    return {
+      ...base,
+      bonus: trains.BONUS_POINTS,
+      donorBonus: trains.DONOR_BONUS_PER_EGG,
+      // Riders by anonymous chat name and a per-lobby id (never a user id), so you can donate to one.
+      ridersList: members.map((m) => ({
+        id: m._id,
+        name: names.get(m.userId) ?? 'Anonymous rider',
+        you: m.userId === userId,
+        pledged: m.pledged ?? 0,
+        need: Math.max(0, trains.PLEDGE_TARGET - (m.pledged ?? 0)),
+        donatedEggs: m.donatedEggs ?? 0,
+      })),
+      stash,
+      createdAt: lobby.createdAt,
+    };
+  }
+
+  async function memberLobby(ctx, id) {
+    const user = requireUser(ctx);
+    if (!isUuid(id)) fail(404, 'Lobby not found');
+    let lobby = (await col.lobbies.findOne({ _id: id })) ?? fail(404, 'Lobby not found');
+    if (!(await col.lobbyMembers.findOne({ lobbyId: id, userId: user._id }))) fail(403, "You're not in this train's lobby.");
+    lobby = await settleLobby(lobby, await liveVehicles());
+    return { user, lobby };
+  }
+
+  const publicLobbyMessage = (m, viewerId, names) => {
+    const s = m.sticker ? game.stickerById.get(m.sticker) : null;
+    return {
+      id: m._id,
+      seq: m.seq,
+      mine: m.userId === viewerId,
+      name: names.get(m.userId) ?? 'Anonymous rider',
+      ...(m.help ? { help: m.help } : s ? { sticker: m.sticker, emoji: s.emoji, label: s.label } : { text: m.text }),
+      reportedByYou: (m.reports ?? []).includes(viewerId),
+      createdAt: m.createdAt,
+    };
+  };
+  const LOBBY_REPORTS_TO_HIDE = 3;
+
   // ---------- handlers ----------
   const api = {
     // ?gemini=1 also checks that the photo-check model is reachable with the configured key.
@@ -441,6 +554,7 @@ export async function createApp({
         bountyCap: game.BOUNTY_CAP,
         hiderShare: game.HIDER_SHARE,
         passwordMin: auth.PASSWORD_MIN,
+        trainSim,
         stickers: game.STICKERS,
       };
     },
@@ -502,6 +616,243 @@ export async function createApp({
       const user = requireUser(ctx);
       await col.users.updateOne({ _id: user._id }, { $set: { notificationsSeenAt: now() } });
       return { ok: true };
+    },
+
+    // ----- trains -----
+    // The phone sends a GPS fix about every 20 s. Returns the train you're next to (if any),
+    // whether you're verified on it, its lobby, and the open lobby you're already in.
+    async trainCheck(ctx) {
+      const user = requireUser(ctx);
+      const t = now();
+      const { lat, lng, accuracy } = ctx.body ?? {};
+      const fix = { lat: Number(lat), lng: Number(lng), accuracy: Number(accuracy) || 0 };
+      if (!Number.isFinite(fix.lat) || !Number.isFinite(fix.lng) || Math.abs(fix.lat) > 90 || Math.abs(fix.lng) > 180) fail(400, 'Send a GPS position.');
+      const vehicles = await liveVehicles();
+      let onTrain = null;
+      const near = vehicles && fix.accuracy <= trains.MAX_ACCURACY_M ? trains.nearestTrain(fix, vehicles) : null;
+      if (near) {
+        const v = near.vehicle;
+        const sighting = { _id: crypto.randomUUID(), userId: user._id, tripId: v.tripId, vehicleId: v.id, at: t, user: { lat: fix.lat, lng: fix.lng }, train: { lat: v.lat, lng: v.lng } };
+        const earlier = await col.trainSightings
+          .find({ userId: user._id, tripId: v.tripId, at: { $gte: new Date(t - trains.PAIR_MAX_MS), $lte: new Date(t - trains.PAIR_MIN_MS) } })
+          .toArray();
+        await col.trainSightings.insertOne(sighting);
+        const already = user.onTrain?.tripId === v.tripId && user.onTrain.until > t;
+        const verified = already || earlier.some((a) => trains.rodeAlong(a, sighting));
+        if (verified) {
+          const until = new Date(t.getTime() + trains.ON_TRAIN_FOR_MS);
+          await col.users.updateOne({ _id: user._id }, { $set: { onTrain: { tripId: v.tripId, routeId: v.routeId, line: v.line, headsign: v.headsign ?? v.destination, until } } });
+        }
+        const lobby = await col.lobbies.findOne({ tripId: v.tripId });
+        onTrain = {
+          tripId: v.tripId,
+          line: v.line,
+          routeId: v.routeId,
+          headsign: v.headsign ?? v.destination,
+          verified,
+          lobby: lobby ? { id: lobby._id, riders: lobby.memberCount, status: lobby.status } : null,
+        };
+      }
+      // Verified a little while ago but no match right now (a tunnel, a GPS jump): still on that
+      // train for ON_TRAIN_FOR_MS, so the option to join doesn't flicker away.
+      if (!onTrain?.verified && user.onTrain?.until > t) {
+        const ride = user.onTrain;
+        const lobby = await col.lobbies.findOne({ tripId: ride.tripId });
+        onTrain = { tripId: ride.tripId, line: ride.line, routeId: ride.routeId, headsign: ride.headsign, verified: true, lobby: lobby ? { id: lobby._id, riders: lobby.memberCount, status: lobby.status } : null };
+      }
+      // The open lobby you're in (you can stay after getting off, until the journey ends).
+      const membership = await col.lobbyMembers.find({ userId: user._id }).sort({ joinedAt: -1 }).limit(1).next();
+      let current = membership && (await col.lobbies.findOne({ _id: membership.lobbyId }));
+      if (current) current = await settleLobby(current, vehicles);
+      return { onTrain, lobby: current && current.status !== 'ended' ? await publicLobby(current, user._id, { full: false }) : null };
+    },
+
+    // Testing only: verify the player on a live train without the GPS check, the nearest one to
+    // { lat, lng } if sent. Everything after that is the real flow. Allowed when trainSim is on
+    // (local dev) or for accounts flagged users.tester (scripts/tester.js), never for others.
+    async simulateTrain(ctx) {
+      const user = requireUser(ctx);
+      if (!trainSim && !user.tester) fail(404, 'Not found');
+      const vehicles = (await liveVehicles())?.filter((v) => v.tripId) ?? [];
+      if (!vehicles.length) fail(503, 'No live trains right now to simulate a ride on.');
+      const { lat, lng } = ctx.body ?? {};
+      const at = Number.isFinite(Number(lat)) && Number.isFinite(Number(lng)) ? { lat: Number(lat), lng: Number(lng) } : null;
+      const moving = vehicles.filter((v) => v.status === 'IN_TRANSIT_TO');
+      const pool = moving.length ? moving : vehicles;
+      const v = at ? pool.reduce((a, b) => (trains.distanceM(at, b) < trains.distanceM(at, a) ? b : a)) : pool[0];
+      const until = new Date(now().getTime() + trains.ON_TRAIN_FOR_MS);
+      const ride = { tripId: v.tripId, routeId: v.routeId, line: v.line, headsign: v.headsign ?? v.destination, until, simulated: true };
+      await col.users.updateOne({ _id: user._id }, { $set: { onTrain: ride } });
+      return { onTrain: { tripId: ride.tripId, line: ride.line, routeId: ride.routeId, headsign: ride.headsign, verified: true, simulated: true } };
+    },
+
+    // Join (or open) the lobby for the train you're verified on.
+    async joinLobby(ctx) {
+      const user = requireUser(ctx);
+      const t = now();
+      const ride = user.onTrain;
+      if (!ride || !(ride.until > t) || (ctx.body?.tripId && ctx.body.tripId !== ride.tripId)) {
+        fail(403, "We haven't confirmed you're on this train yet. Keep the app open for a minute while the train moves.");
+      }
+      let lobby = await col.lobbies.findOne({ tripId: ride.tripId });
+      if (!lobby) {
+        try {
+          lobby = { _id: crypto.randomUUID(), tripId: ride.tripId, routeId: ride.routeId, line: ride.line, headsign: ride.headsign, status: 'open', limit: null, pledged: 0, memberCount: 0, msgSeq: 0, createdAt: t, lastSeenAt: t };
+          await col.lobbies.insertOne(lobby);
+        } catch (err) {
+          if (!isDuplicateKey(err)) throw err;
+          lobby = await col.lobbies.findOne({ tripId: ride.tripId }); // another rider opened it first
+        }
+      }
+      if (lobby.status === 'ended') fail(409, "This train's journey is over.");
+      await ensureChatName(user);
+      try {
+        await col.lobbyMembers.insertOne({ _id: crypto.randomUUID(), lobbyId: lobby._id, userId: user._id, joinedAt: t, pledged: 0 });
+        lobby = await col.lobbies.findOneAndUpdate({ _id: lobby._id }, { $inc: { memberCount: 1 } }, { returnDocument: 'after' });
+      } catch (err) {
+        if (!isDuplicateKey(err)) throw err; // already in: fine
+      }
+      return { lobby: await publicLobby(lobby, user._id) };
+    },
+
+    async lobby(ctx) {
+      const { user, lobby } = await memberLobby(ctx, ctx.params[0]);
+      return { lobby: await publicLobby(lobby, user._id) };
+    },
+
+    // Pledge found eggs for yourself, or donate them to another rider (body.for = their rider id).
+    // body.eggs = { level: count }; each egg counts its level's points. An egg is pledged once,
+    // ever. The goal is reached when every rider has PLEDGE_TARGET points in their name: then
+    // every rider gets BONUS_POINTS and donors get DONOR_BONUS_PER_EGG per egg given to others.
+    async pledge(ctx) {
+      const { user, lobby: l } = await memberLobby(ctx, ctx.params[0]);
+      if (l.status !== 'open') fail(409, l.status === 'reached' ? 'This lobby already reached its goal.' : "This train's journey is over.");
+      const want = Object.entries(ctx.body?.eggs ?? {})
+        .map(([level, n]) => [Number(level), Number(n)])
+        .filter(([level, n]) => game.LEVELS.some((x) => x.level === level) && Number.isInteger(n) && n > 0);
+      if (!want.length) fail(400, 'Pick at least one egg to pledge.');
+      if (want.reduce((n, [, c]) => n + c, 0) > 20) fail(400, 'Pledge at most 20 eggs at a time.');
+      const t = now();
+      const result = await tx(async (session) => {
+        await lockUser(session, user._id);
+        await lockLobby(session, l._id);
+        const lobby = await col.lobbies.findOne({ _id: l._id }, { session });
+        if (lobby.status !== 'open') fail(409, 'This lobby already reached its goal.');
+        const forId = ctx.body?.for ?? null;
+        const target = forId
+          ? (isUuid(forId) && (await col.lobbyMembers.findOne({ _id: forId, lobbyId: lobby._id }, { session }))) || fail(404, 'That rider is not in this lobby.')
+          : await col.lobbyMembers.findOne({ lobbyId: lobby._id, userId: user._id }, { session });
+        if ((target.pledged ?? 0) >= trains.PLEDGE_TARGET) fail(409, target.userId === user._id ? `You already have ${trains.PLEDGE_TARGET} pts pledged.` : `They already have ${trains.PLEDGE_TARGET} pts.`);
+        // Take the oldest unpledged finds of each level and mark them pledged (only if still unpledged).
+        const findIds = [];
+        let points = 0;
+        for (const [level, n] of want) {
+          const rows = await col.finds.find({ userId: user._id, level, pledgedIn: { $exists: false } }, { session, projection: { _id: 1 } }).sort({ foundAt: 1, _id: 1 }).limit(n).toArray();
+          if (rows.length < n) fail(400, `You only have ${rows.length} unpledged ${game.levelInfo(level).name} ${rows.length === 1 ? 'egg' : 'eggs'}.`);
+          findIds.push(...rows.map((r) => r._id));
+          points += game.levelInfo(level).points * n;
+        }
+        const r = await col.finds.updateMany({ _id: { $in: findIds }, pledgedIn: { $exists: false } }, { $set: { pledgedIn: lobby._id, pledgedAt: t } }, { session });
+        if (r.modifiedCount !== findIds.length) fail(409, 'Some of those eggs were just pledged. Try again.');
+        const donated = target.userId !== user._id;
+        await col.pledges.insertOne({ _id: crypto.randomUUID(), lobbyId: lobby._id, userId: user._id, forMemberId: target._id, forUserId: target.userId, findIds, eggs: findIds.length, points, at: t }, { session });
+        await col.lobbyMembers.updateOne({ _id: target._id }, { $inc: { pledged: points } }, { session });
+        if (donated) await col.lobbyMembers.updateOne({ lobbyId: lobby._id, userId: user._id }, { $inc: { donatedEggs: findIds.length } }, { session });
+        const members = await col.lobbyMembers.find({ lobbyId: lobby._id }, { session }).toArray();
+        const reached = members.length >= trains.MIN_RIDERS && members.every((m) => (m.pledged ?? 0) >= trains.PLEDGE_TARGET);
+        if (reached) {
+          await col.lobbies.updateOne({ _id: lobby._id }, { $set: { status: 'reached', reachedAt: t } }, { session });
+          const month = game.monthKey(t);
+          const payouts = members.map((m) => ({ _id: crypto.randomUUID(), userId: m.userId, kind: 'lobby', lobbyId: lobby._id, stationId: null, month, points: trains.BONUS_POINTS, createdAt: t }));
+          for (const m of members.filter((x) => x.donatedEggs)) {
+            payouts.push({ _id: crypto.randomUUID(), userId: m.userId, kind: 'lobby_donor', lobbyId: lobby._id, stationId: null, month, points: trains.DONOR_BONUS_PER_EGG * m.donatedEggs, createdAt: t });
+          }
+          await col.payouts.insertMany(payouts, { session });
+        }
+        return { eggs: findIds.length, points, donated, reached };
+      });
+      const fresh = await col.lobbies.findOne({ _id: l._id });
+      return { ...result, lobby: await publicLobby(fresh, user._id) };
+    },
+
+    // "Help me reach 100": posts a help request in the lobby chat that others can answer by donating.
+    async askHelp(ctx) {
+      const { user, lobby } = await memberLobby(ctx, ctx.params[0]);
+      if (lobby.status !== 'open') fail(409, 'This lobby is not taking pledges.');
+      const member = await col.lobbyMembers.findOne({ lobbyId: lobby._id, userId: user._id });
+      const need = trains.PLEDGE_TARGET - (member.pledged ?? 0);
+      if (need <= 0) fail(409, `You already have ${trains.PLEDGE_TARGET} pts pledged.`);
+      const t = now();
+      if (member.askedAt && t - member.askedAt < 60_000) fail(429, 'You just asked. Give the others a minute.');
+      await col.lobbyMembers.updateOne({ _id: member._id }, { $set: { askedAt: t } });
+      const message = await tx(async (session) => {
+        const lb = await col.lobbies.findOneAndUpdate({ _id: lobby._id }, { $inc: { msgSeq: 1 } }, { session, returnDocument: 'after' });
+        const m = { _id: crypto.randomUUID(), lobbyId: lobby._id, seq: lb.msgSeq, userId: user._id, help: { riderId: member._id, need }, reports: [], createdAt: t };
+        await col.lobbyMessages.insertOne(m, { session });
+        return m;
+      });
+      const u = await ensureChatName(user);
+      return { message: publicLobbyMessage(message, user._id, new Map([[user._id, u.chatName]])) };
+    },
+
+    async lobbyMessages(ctx) {
+      const { user, lobby } = await memberLobby(ctx, ctx.params[0]);
+      const after = Number(ctx.query.get('after'));
+      const visible = { lobbyId: lobby._id, hidden: { $ne: true }, reports: { $ne: user._id } };
+      const rows = Number.isInteger(after) && after >= 0
+        ? await col.lobbyMessages.find({ ...visible, seq: { $gt: after } }).sort({ seq: 1 }).limit(CHAT_PAGE).toArray()
+        : (await col.lobbyMessages.find(visible).sort({ seq: -1 }).limit(CHAT_PAGE).toArray()).reverse();
+      const lastSeq = (await col.lobbies.findOne({ _id: lobby._id }, { projection: { msgSeq: 1 } }))?.msgSeq ?? 0;
+      const names = await chatNames(rows.map((m) => m.userId));
+      return { messages: rows.map((m) => publicLobbyMessage(m, user._id, names)), lastSeq };
+    },
+
+    // A sticker, or short text (filtered: no links, no slurs). Anonymous like group chat.
+    async sendLobbyMessage(ctx) {
+      const { user: member, lobby } = await memberLobby(ctx, ctx.params[0]);
+      if (lobby.status === 'ended') fail(409, "This train's journey is over.");
+      const user = await ensureChatName(member);
+      let content;
+      if (ctx.body?.sticker != null) {
+        const sticker = game.stickerById.get(String(ctx.body.sticker));
+        if (!sticker) fail(400, 'Pick one of the stickers.');
+        content = { sticker: sticker.id };
+      } else {
+        const r = trains.cleanText(ctx.body?.text);
+        if (r.error) fail(400, r.error);
+        content = { text: r.text };
+      }
+      const t = now();
+      const recent = await col.lobbyMessages.countDocuments({ lobbyId: lobby._id, userId: user._id, createdAt: { $gt: new Date(t.getTime() - CHAT_RATE.seconds * 1000) } });
+      if (recent >= CHAT_RATE.messages) fail(429, 'Easy there! Wait a few seconds.');
+      const message = await tx(async (session) => {
+        const l = await col.lobbies.findOneAndUpdate({ _id: lobby._id }, { $inc: { msgSeq: 1 } }, { session, returnDocument: 'after' });
+        const m = { _id: crypto.randomUUID(), lobbyId: lobby._id, seq: l.msgSeq, userId: user._id, ...content, reports: [], createdAt: t };
+        await col.lobbyMessages.insertOne(m, { session });
+        return m;
+      });
+      return { message: publicLobbyMessage(message, user._id, new Map([[user._id, user.chatName]])) };
+    },
+
+    // Hides a message for you at once, and for everyone after LOBBY_REPORTS_TO_HIDE reports.
+    async reportLobbyMessage(ctx) {
+      const [id, messageId] = ctx.params;
+      const { user } = await memberLobby(ctx, id);
+      const m = (await col.lobbyMessages.findOne({ _id: messageId, lobbyId: id })) ?? fail(404, 'Message not found');
+      if (m.userId === user._id) fail(400, "You can't report your own message.");
+      const r = await col.lobbyMessages.findOneAndUpdate({ _id: m._id }, { $addToSet: { reports: user._id } }, { returnDocument: 'after' });
+      if (r.reports.length >= LOBBY_REPORTS_TO_HIDE && !r.hidden) await col.lobbyMessages.updateOne({ _id: m._id }, { $set: { hidden: true } });
+      return { ok: true };
+    },
+
+    // Demo filler data, for an operator. Off (404) unless SEED_TOKEN is configured, and the
+    // token must come in the x-seed-token header. Body { remove: true } takes it all out.
+    async adminSeed({ req, body }) {
+      const sent = Buffer.from(String(req.headers['x-seed-token'] ?? ''));
+      const want = Buffer.from(seedToken);
+      if (!seedToken || seedToken.length < 24) fail(404, 'Not found');
+      if (sent.length !== want.length || !crypto.timingSafeEqual(sent, want)) fail(403, 'Forbidden');
+      return body?.remove ? { removed: await removeSeed(col) } : { seeded: await addSeed(col, now()) };
     },
 
     // Change your username (public) and/or chat name (anonymous). Send only the ones you change.
@@ -684,7 +1035,8 @@ export async function createApp({
         ...(viewerId === id && { activity: await activityFor(user, myEggIds) }),
         monthPoints: (totals?.month ?? 0) + paid.month,
         allTimePoints: (totals?.allTime ?? 0) + paid.allTime,
-        hiderPoints: paid.allTime, // all-time points from bounties on eggs this player hid
+        hiderPoints: paid.hider, // all-time points from bounties on eggs this player hid
+        lobbyPoints: paid.allTime - paid.hider, // train lobby bonuses
         monthRank: rankIndex >= 0 ? rankIndex + 1 : null,
         findsByLevel,
         eggsHidden: myEggIds.length,
@@ -1272,21 +1624,30 @@ export async function createApp({
       const [id] = ctx.params;
       const { user: member } = await memberGroup(ctx, id);
       const user = await ensureChatName(member);
-      const sticker = game.stickerById.get(String(ctx.body?.sticker ?? ''));
-      if (!sticker) fail(400, 'Pick one of the stickers.');
+      // A sticker, or short text (emoji welcome) through the same filter as train lobbies.
+      let content;
+      if (ctx.body?.sticker != null) {
+        const sticker = game.stickerById.get(String(ctx.body.sticker));
+        if (!sticker) fail(400, 'Pick one of the stickers.');
+        content = { sticker: sticker.id };
+      } else {
+        const r = trains.cleanText(ctx.body?.text);
+        if (r.error) fail(400, r.error);
+        content = { text: r.text };
+      }
       const t = now();
       const recent = await col.groupMessages.countDocuments({
         groupId: id,
         userId: user._id,
         createdAt: { $gt: new Date(t.getTime() - CHAT_RATE.seconds * 1000) },
       });
-      if (recent >= CHAT_RATE.messages) fail(429, 'Easy there! Wait a few seconds before the next sticker.');
+      if (recent >= CHAT_RATE.messages) fail(429, 'Easy there! Wait a few seconds before the next message.');
       // The per-group counter runs in the same transaction as the insert, so messages
       // commit in seq order and a poller using ?after=<seq> never skips one.
       const message = await tx(async (session) => {
         const g = await col.groups.findOneAndUpdate({ _id: id }, { $inc: { msgSeq: 1 } }, { session, returnDocument: 'after' });
         if (!g) fail(404, 'Group not found');
-        const m = { _id: crypto.randomUUID(), groupId: id, seq: g.msgSeq, userId: user._id, sticker: sticker.id, createdAt: t };
+        const m = { _id: crypto.randomUUID(), groupId: id, seq: g.msgSeq, userId: user._id, ...content, createdAt: t };
         await col.groupMessages.insertOne(m, { session });
         return m;
       });
@@ -1341,6 +1702,16 @@ export async function createApp({
     ['GET', /^\/api\/me\/progress$/, api.progress, 'optional'],
     ['POST', /^\/api\/me\/names$/, api.updateNames, 'optional'],
     ['GET', /^\/api\/me\/notifications$/, api.notifications, 'optional'],
+    ['POST', /^\/api\/admin\/seed$/, api.adminSeed, 'none'],
+    ['POST', /^\/api\/trains\/check$/, api.trainCheck, 'optional'],
+    ['POST', /^\/api\/trains\/lobby$/, api.joinLobby, 'optional'],
+    ['POST', /^\/api\/trains\/simulate$/, api.simulateTrain, 'optional'],
+    ['GET', /^\/api\/lobbies\/([^/]+)$/, api.lobby, 'optional'],
+    ['POST', /^\/api\/lobbies\/([^/]+)\/pledge$/, api.pledge, 'optional'],
+    ['POST', /^\/api\/lobbies\/([^/]+)\/help$/, api.askHelp, 'optional'],
+    ['GET', /^\/api\/lobbies\/([^/]+)\/messages$/, api.lobbyMessages, 'optional'],
+    ['POST', /^\/api\/lobbies\/([^/]+)\/messages$/, api.sendLobbyMessage, 'optional'],
+    ['POST', /^\/api\/lobbies\/([^/]+)\/messages\/([^/]+)\/report$/, api.reportLobbyMessage, 'optional'],
     ['POST', /^\/api\/me\/notifications\/seen$/, api.notificationsSeen, 'optional'],
     ['GET', /^\/api\/map\/lines$/, api.mapLines, 'none'],
     ['GET', /^\/api\/map\/vehicles$/, api.mapVehicles, 'none'],

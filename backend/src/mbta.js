@@ -144,6 +144,7 @@ export function createMbta({ apiKey, cacheFile, shapesFile } = {}) {
         const dir = dirs[routeId];
         return {
           id: v.id,
+          tripId: v.relationships?.trip?.data?.id ?? null, // one journey: train lobbies are keyed by it
           routeId,
           color: LINES[routeId].color,
           lat: a.latitude,

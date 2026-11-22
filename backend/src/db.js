@@ -17,6 +17,11 @@ export async function createDb({ uri, dbName = 'egghunt', maxPoolSize = 10 }) {
     finds: db.collection('finds'),
     // Points that aren't a find: a hider's share of a bounty. Leaderboards add these to finds.
     payouts: db.collection('payouts'),
+    trainSightings: db.collection('trainSightings'),
+    lobbies: db.collection('lobbies'),
+    lobbyMembers: db.collection('lobbyMembers'),
+    pledges: db.collection('pledges'),
+    lobbyMessages: db.collection('lobbyMessages'),
     reports: db.collection('reports'),
     locks: db.collection('locks'),
     groups: db.collection('groups'),
@@ -45,6 +50,18 @@ export async function createDb({ uri, dbName = 'egghunt', maxPoolSize = 10 }) {
     col.attempts.createIndex({ userId: 1, eggId: 1, startedAt: -1 }), // a player's clock on an egg
     col.attempts.createIndex({ eggId: 1, startedAt: 1 }), // players an egg has beaten (bounty)
     col.payouts.createIndex({ userId: 1, month: 1 }),
+    // Train lobbies: one per trip (journey), ever.
+    col.trainSightings.createIndex({ userId: 1, tripId: 1, at: -1 }),
+    col.trainSightings.createIndex({ at: 1 }, { expireAfterSeconds: 3600 }),
+    col.lobbies.createIndex({ tripId: 1 }, { unique: true }),
+    col.lobbies.createIndex({ status: 1 }),
+    col.lobbyMembers.createIndex({ lobbyId: 1, userId: 1 }, { unique: true }),
+    col.lobbyMembers.createIndex({ userId: 1, joinedAt: -1 }),
+    col.pledges.createIndex({ userId: 1, status: 1 }),
+    col.pledges.createIndex({ lobbyId: 1, status: 1 }),
+    col.lobbyMessages.createIndex({ lobbyId: 1, seq: 1 }, { unique: true }),
+    col.lobbyMessages.createIndex({ lobbyId: 1, userId: 1, createdAt: -1 }),
+    col.lobbyMessages.createIndex({ createdAt: 1 }, { expireAfterSeconds: 7 * 86400 }),
     col.payouts.createIndex({ month: 1, stationId: 1 }),
     col.finds.createIndex({ userId: 1, eggId: 1 }, { unique: true }), // each egg scores once per player
     col.finds.createIndex({ month: 1, stationId: 1 }),
