@@ -24,6 +24,7 @@ const STATIONS = [
   { id: 'test-activity', name: 'Test Activity', lat: 42.4, lng: -71.11, lines: [{ id: 'Red', name: 'Red Line', color: '#DA291C' }] },
   { id: 'test-clock', name: 'Test Clock', lat: 42.37, lng: -71.08, lines: [{ id: 'Blue', name: 'Blue Line', color: '#003DA5' }] },
   { id: 'test-bounty', name: 'Test Bounty', lat: 42.38, lng: -71.09, lines: [{ id: 'Blue', name: 'Blue Line', color: '#003DA5' }] },
+  { id: 'test-map', name: 'Test Map', lat: 42.41, lng: -71.12, lines: [{ id: 'Orange', name: 'Orange Line', color: '#ED8B00' }] },
 ];
 const fakeMbta = {
   loadStations: async () => STATIONS,
@@ -783,4 +784,37 @@ test('leaderboard: this month or all time', async () => {
   assert.deepEqual(all.rows.slice(0, 2).map((r) => [r.username, r.points, r.rank]), [['lb_old', 500, 1], ['lb_new', 400, 2]]);
   const station = await ok('/api/leaderboard?period=all&stationId=test-count');
   assert.ok(station.rows.some((r) => r.username === 'lb_old'), 'all time works per station too');
+});
+
+test('map: per-station stats, keeper and hunting now; lines and trains degrade to empty without the MBTA', async () => {
+  const sal = await user('sal');
+  const tia = await user('tia');
+  await ok('/api/eggs', { stationId: 'test-map', level: 3, image: IMG }, sal);
+  const eggId = (await ok('/api/stations/test-map')).slots[2].egg.id;
+
+  // tia starts a round: she's hunting there now, then finds it.
+  const round = await ok('/api/attempts', { eggId, mode: 'fixed' }, tia);
+  let m = await ok('/api/map/stations', null, tia);
+  let ken = m.stations.find((s) => s.id === 'test-map');
+  assert.ok(ken.huntingNow >= 1, 'a round started just now counts as hunting');
+  clock += 30_000;
+  await ok(`/api/attempts/${round.attempt.id}/find`, { image: IMG }, tia);
+
+  m = await ok('/api/map/stations', null, tia);
+  ken = m.stations.find((s) => s.id === 'test-map');
+  assert.equal(ken.yourFinds, 1);
+  assert.ok(ken.findsThisMonth >= 1);
+  assert.ok(ken.keeper && typeof ken.keeper.username === 'string');
+  assert.equal(m.stations.length, STATIONS.length, 'one row per station');
+
+  const anon = await ok('/api/map/stations');
+  assert.equal(anon.stations.find((s) => s.id === 'test-map').yourFinds, 0, 'no player, no personal count');
+
+  clock += 16 * 60_000; // past the 15-minute window
+  m = await ok('/api/map/stations');
+  assert.equal(m.stations.find((s) => s.id === 'test-map').huntingNow, 0);
+
+  // The fake MBTA has no shapes or vehicles: the endpoints answer with empty lists instead of failing.
+  assert.deepEqual(await ok('/api/map/lines'), { lines: [] });
+  assert.deepEqual((await ok('/api/map/vehicles')).vehicles, []);
 });
