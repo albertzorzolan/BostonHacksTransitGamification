@@ -422,8 +422,8 @@ async function viewTrain() {
       <div class="tk-perf" aria-hidden="true"></div>
       <div class="tk-bottom stack">
         ${onTrain?.verified ? '<button id="joinLobby" class="btn btn-ink btn-block btn-l" type="button">Join the train lobby</button>' : '<button id="recheck" class="btn btn-ghost btn-block" type="button">Check again</button>'}
-        ${!onTrain?.verified && (state.config?.trainSim || state.user?.tester) ? '<button id="simulate" class="btn btn-primary btn-block" type="button">🧪 Simulate a train ride (test)</button><p class="field-hint">Testing only: puts you on a real live train without the GPS check, so you can try the lobby and the pledge.</p>' : ''}
-        ${onTrain?.simulated ? '<p class="field-hint">🧪 Simulated ride (testing).</p>' : ''}
+        ${!onTrain?.verified && (state.config?.trainSim || state.user?.tester) ? '<button id="simulate" class="btn btn-primary btn-block" type="button">🧪 Simulate a train ride (test)</button><p class="field-hint">Testing only: puts you on a real live train without the GPS check, so you can try the lobby and the pledge. If another tester already has a lobby open, you join their train.</p>' : ''}
+        ${onTrain?.simulated ? `<p class="field-hint">🧪 Simulated ride (testing).${onTrain.sharedLobby ? ' Same train as the other tester, so you join their lobby.' : ''}</p>` : ''}
         <p class="field-hint">In the lobby, riders donate eggs they've found. When the pledges reach the lobby's limit (2 per rider), every donor gets +50. If the ride ends first, your eggs come back.</p>
         <div id="err"></div>
       </div>
@@ -512,7 +512,16 @@ async function viewLobby(id) {
       <ol class="riders">${riders}</ol>
       ${lobby.status === 'open' ? `
       <div class="pledge-box">
-        <p class="pledge-for">${forRider ? `Donating to <b>${esc(recipient.name)}</b> (needs ${recipient.need}) <button class="link" type="button" id="forMe">Pledge for me instead</button>` : me.need ? `Pledging for <b>you</b> (you need ${me.need})` : 'You have 100. Help someone above.'}</p>
+        ${(() => {
+          // Who the eggs go to: you, or any rider still short of 100 (a donation).
+          const others = lobby.ridersList.filter((r) => !r.you && r.need > 0);
+          const chip = (id, label, need, on) => `<button type="button" class="for-chip ${on ? 'is-on' : ''}" data-for="${id}" aria-pressed="${on}" ${need ? '' : 'disabled'}>${label}<small>${need ? `needs ${need}` : '✓ 100'}</small></button>`;
+          return `<p class="next-label">Pledge for</p>
+            <div class="for-chips">${chip('me', 'You', me.need, !forRider)}${others.map((r) => chip(esc(r.id), `🎁 ${esc(r.name)}`, r.need, forRider === r.id)).join('')}</div>
+            <p class="pledge-for">${forRider ? `Donating to <b>${esc(recipient.name)}</b>. You get +${lobby.donorBonus} per egg when the lobby reaches its goal.`
+              : others.length ? (me.need ? 'Pledging for you. Tap a rider to donate to them instead.' : 'You have 100. Tap a rider to donate to them.')
+              : lobby.riders < 2 ? 'Donating opens when another rider joins.' : me.need ? 'Pledging for you.' : 'Everyone has 100.'}</p>`;
+        })()}
         <ul class="stash">${lobby.stash.levels
           .map((l) => {
             const c = pick[l.level] ?? 0;
@@ -546,7 +555,34 @@ async function viewLobby(id) {
     <section class="tk"><div id="feed" class="feed" aria-live="polite">${chat.messages.length ? chat.messages.map(msgHtml).join('') : '<div class="empty"><p>Say hi to your fellow riders.</p></div>'}</div></section>
     ${lobby.status === 'ended' ? '' : `<form id="say" class="say"><input id="sayText" class="input" maxlength="140" placeholder="Message the train" autocomplete="off" /><button class="btn btn-ink" type="submit">Send</button></form>
     <div id="sayErr"></div>
-    <div class="stickers">${(state.config?.stickers ?? []).map((st) => `<button class="stk" type="button" data-sticker="${esc(st.id)}" aria-label="Send ${esc(st.label)}"><span aria-hidden="true">${esc(st.emoji)}</span><small>${esc(st.label)}</small></button>`).join('')}</div>`}`;
+    <div class="stickers">${(state.config?.stickers ?? []).map((st) => `<button class="stk" type="button" data-sticker="${esc(st.id)}" aria-label="Send ${esc(st.label)}"><span aria-hidden="true">${esc(st.emoji)}</span><small>${esc(st.label)}</small></button>`).join('')}</div>`}
+    ${state.config?.trainSim || state.user?.tester ? '<div class="account"><button id="switchLobby" class="btn btn-ghost" type="button">🧪 Switch to the shared test lobby</button></div>' : ''}`;
+
+  // Testers: hop onto the train where another tester's lobby is open (or a fresh one).
+  $('#switchLobby')?.addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    try {
+      const r = await api('/api/trains/simulate', loc.pos ? { lat: loc.pos.lat, lng: loc.pos.lng } : {});
+      state.simTrain = r.onTrain;
+      if (r.onTrain.lobbyId === lobby.id) {
+        toast("You're already in the shared test lobby.");
+        e.target.disabled = false;
+        return;
+      }
+      const { lobby: joined } = await api('/api/trains/lobby', { tripId: r.onTrain.tripId });
+      state.train = { ...(state.train ?? {}), onTrain: r.onTrain, lobby: joined };
+      if (joined.id === lobby.id) {
+        toast('No other tester lobby is open, so you stay here. Have the other account tap Switch.');
+        e.target.disabled = false;
+        return;
+      }
+      toast(r.onTrain.sharedLobby ? 'Joined the other tester’s lobby.' : 'No other tester lobby open: moved to a new one.');
+      location.hash = `#/lobby/${encodeURIComponent(joined.id)}`;
+    } catch (err) {
+      toast(err.message);
+      e.target.disabled = false;
+    }
+  });
 
   const feed = $('#feed');
   feed.scrollTop = feed.scrollHeight;
@@ -581,7 +617,7 @@ async function viewLobby(id) {
     app.querySelectorAll('[data-inc]').forEach((b) => b.addEventListener('click', () => { pick[b.dataset.inc] = (pick[b.dataset.inc] ?? 0) + 1; drawPledge(); }));
     app.querySelectorAll('[data-dec]').forEach((b) => b.addEventListener('click', () => { pick[b.dataset.dec] = Math.max(0, (pick[b.dataset.dec] ?? 0) - 1); drawPledge(); }));
     $('#pledge').querySelectorAll('[data-help]').forEach((b) => b.addEventListener('click', () => help(b.dataset.help)));
-    $('#forMe')?.addEventListener('click', () => { forRider = null; drawPledge(); });
+    app.querySelectorAll('[data-for]').forEach((b) => b.addEventListener('click', () => { forRider = b.dataset.for === 'me' ? null : b.dataset.for; drawPledge(); }));
     $('#askHelp')?.addEventListener('click', async (e) => {
       e.target.disabled = true;
       try {

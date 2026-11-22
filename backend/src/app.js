@@ -710,13 +710,24 @@ export async function createApp({
       if (!vehicles.length) fail(503, 'No live trains right now to simulate a ride on.');
       const { lat, lng } = ctx.body ?? {};
       const at = Number.isFinite(Number(lat)) && Number.isFinite(Number(lng)) ? { lat: Number(lat), lng: Number(lng) } : null;
+      // Testers should meet in one lobby: if a tester already has an open lobby on a train that's
+      // still running, everyone simulating joins that train. Otherwise the nearest moving train.
+      const live = new Map(vehicles.map((v) => [v.tripId, v]));
+      const testers = (await col.users.find({ tester: true }, { projection: { _id: 1 } }).toArray()).map((u) => u._id);
+      const withTesters = new Set(await col.lobbyMembers.distinct('lobbyId', { userId: { $in: testers } }));
+      const mine = new Set(await col.lobbyMembers.distinct('lobbyId', { userId: user._id }));
+      // Prefer another tester's lobby over your own, then the busiest, then the newest.
+      const open = (await col.lobbies.find({ _id: { $in: [...withTesters] }, status: { $ne: 'ended' } }).toArray())
+        .filter((l) => live.has(l.tripId))
+        .sort((a, b) => (mine.has(a._id) - mine.has(b._id)) || (b.memberCount - a.memberCount) || (b.createdAt - a.createdAt));
+      const shared = open[0] ?? null;
       const moving = vehicles.filter((v) => v.status === 'IN_TRANSIT_TO');
       const pool = moving.length ? moving : vehicles;
-      const v = at ? pool.reduce((a, b) => (trains.distanceM(at, b) < trains.distanceM(at, a) ? b : a)) : pool[0];
+      const v = shared ? live.get(shared.tripId) : at ? pool.reduce((a, b) => (trains.distanceM(at, b) < trains.distanceM(at, a) ? b : a)) : pool[0];
       const until = new Date(now().getTime() + trains.ON_TRAIN_FOR_MS);
       const ride = { tripId: v.tripId, routeId: v.routeId, line: v.line, headsign: v.headsign ?? v.destination, until, simulated: true };
       await col.users.updateOne({ _id: user._id }, { $set: { onTrain: ride } });
-      return { onTrain: { tripId: ride.tripId, line: ride.line, routeId: ride.routeId, headsign: ride.headsign, verified: true, simulated: true } };
+      return { onTrain: { tripId: ride.tripId, line: ride.line, routeId: ride.routeId, headsign: ride.headsign, verified: true, simulated: true, sharedLobby: Boolean(shared), lobbyId: shared?._id ?? null } };
     },
 
     // Join (or open) the lobby for the train you're verified on.
