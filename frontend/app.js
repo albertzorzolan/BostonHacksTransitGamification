@@ -613,6 +613,61 @@ async function viewHere() {
   return showLocating(stations);
 }
 
+// ---------- next trains, both directions ----------
+// One row per line and direction at a station: where it goes, the next train, and the two after it.
+// Green Line branches share a row per direction (each train shows its own branch).
+const minsText = (sec) => (sec < 60 ? 'Now' : `${Math.round(sec / 60)} min`);
+function trainRows(trains) {
+  const rows = new Map();
+  for (const t of trains) {
+    if (t.seconds <= -20) continue;
+    const fam = family(t.routeId);
+    const key = `${fam}|${t.directionId ?? t.headsign}`;
+    if (!rows.has(key)) rows.set(key, { fam, color: t.color, dirName: t.directionName, destination: t.destination, trains: [] });
+    rows.get(key).trains.push(t);
+  }
+  const order = { Red: 0, Mattapan: 1, Orange: 2, Blue: 3, Green: 4 };
+  return [...rows.values()].sort((a, b) => (order[a.fam] ?? 9) - (order[b.fam] ?? 9) || String(a.dirName).localeCompare(String(b.dirName)));
+}
+function trainBoardHtml(trains, error) {
+  const rows = trainRows(trains);
+  if (!rows.length) return `<p class="dirs-none">${esc(trainsUnavailable(error))}</p>`;
+  return `<ul class="dirs">${rows
+    .map((r) => {
+      const [next, ...more] = r.trains;
+      const green = r.fam === 'Green';
+      const bound = r.dirName ? `${r.dirName}bound` : '';
+      const title = green ? bound || 'Green Line' : r.destination || next.headsign || r.fam;
+      const branch = (t) => (green && /^Green-[A-E]$/.test(t.routeId) ? `${t.routeId.slice(-1)} ` : '');
+      const sub = [
+        green ? `${branch(next)}${next.headsign}` : next.headsign && next.headsign !== title ? `To ${next.headsign}` : bound,
+        more.length ? `then ${more.slice(0, 2).map((t) => (green ? `${branch(t)}${minsText(t.seconds)}` : minsText(t.seconds))).join(', ')}` : '',
+      ].filter(Boolean).join(', ');
+      return `<li style="--ln:${esc(r.color)}">
+        <span class="route" aria-hidden="true"></span>
+        <div class="dirs-txt"><p class="dirs-to">${esc(title)}</p>${sub ? `<p class="dirs-sub">${esc(sub)}</p>` : ''}</div>
+        <p class="dirs-min">${next.seconds < 60 ? '<span class="now">Now</span>' : `${Math.round(next.seconds / 60)}<small>min</small>`}</p>
+      </li>`;
+    })
+    .join('')}</ul>`;
+}
+// Fills `box` with the station's board and refreshes it every 30 s while the page is open.
+function startTrainBoard(box, stationId) {
+  if (!box) return;
+  const load = async () => {
+    if (!box.isConnected) return;
+    try {
+      const { trains, error } = await api(`/api/stations/${encodeURIComponent(stationId)}/predictions`);
+      box.innerHTML = trainBoardHtml(trains, error);
+    } catch (err) {
+      box.innerHTML = trainBoardHtml([], err.message);
+    }
+  };
+  load();
+  every(30_000, load);
+}
+const TRAIN_BOARD = '<div class="train-board" aria-live="polite"><p class="next-label">Next trains</p><div id="next"><p class="dirs-none">Loading live times</p></div></div>';
+
 const BAND_LINES = '<div class="band band-lines" aria-hidden="true"><i style="--ln:var(--line-red)"></i><i style="--ln:var(--line-orange)"></i><i style="--ln:var(--line-blue)"></i><i style="--ln:var(--line-green)"></i></div>';
 
 function showLocating(stations) {
@@ -651,6 +706,7 @@ function showNearby(stations, n) {
       </div>
       <div class="tk-perf" aria-hidden="true"></div>
       <div class="tk-bottom stack">
+        ${TRAIN_BOARD}
         <a class="btn btn-primary btn-block" href="#/station/${encodeURIComponent(n.station.id)}">See ${esc(n.station.name)}</a>
         <a class="btn btn-ghost btn-block" href="#/map">Open the map</a>
       </div>
@@ -658,6 +714,7 @@ function showNearby(stations, n) {
     <h2 class="sec-h">Stations near you</h2>
     ${stationSearch()}`;
   wireStationSearch(stations);
+  startTrainBoard($('#next'), n.station.id);
 }
 
 function stationSearch() {
@@ -738,7 +795,7 @@ async function showStation(id, { here = false, distance = null } = {}) {
       </div>
       <div class="tk-perf" aria-hidden="true"></div>
       <div class="tk-bottom">
-        <div id="next" class="next-row"><span class="route" aria-hidden="true"></span><div><p class="next-label">Next train</p><p class="next-to next-none">Loading live times</p></div></div>
+        ${TRAIN_BOARD}
       </div>
     </section>
     ${challengeTicket(state.progress?.today)}
@@ -777,23 +834,7 @@ async function showStation(id, { here = false, distance = null } = {}) {
     }),
   );
 
-  const loadTrains = async () => {
-    const box = $('#next');
-    if (!box) return;
-    try {
-      const { trains, error } = await api(`/api/stations/${encodeURIComponent(id)}/predictions`);
-      const t = trains.find((x) => x.seconds > -20);
-      box.innerHTML = t
-        ? `<span class="route" style="--ln:${esc(t.color)}" aria-hidden="true"></span>
-           <div><p class="next-label">Next train${t.line ? `, ${esc(t.line)}` : ''}</p><p class="next-to">${esc(t.headsign || t.line)}</p></div>
-           <p class="next-min">${t.seconds < 60 ? '<span class="now">Now</span>' : `${Math.round(t.seconds / 60)}<small>min</small>`}</p>`
-        : `<span class="route" aria-hidden="true"></span><div><p class="next-label">Next train</p><p class="next-to next-none">${esc(trainsUnavailable(error))}</p></div>`;
-    } catch (err) {
-      box.innerHTML = `<span class="route" aria-hidden="true"></span><div><p class="next-label">Next train</p><p class="next-to next-none">${esc(trainsUnavailable(err.message))}</p></div>`;
-    }
-  };
-  loadTrains();
-  every(30_000, loadTrains);
+  startTrainBoard($('#next'), id);
 
   // Running clocks on this page keep counting down; when one hits zero, reload to show the lock.
   const running = [...app.querySelectorAll('[data-ends]')];
