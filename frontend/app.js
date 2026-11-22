@@ -107,6 +107,7 @@ const ordinal = (n) => {
   return `${n}${s[(v - 20) % 10] || s[v] || s[0]}`;
 };
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+const anA = (word) => (/^[aeiou]/i.test(String(word)) ? 'an' : 'a'); // "an Easy egg", "a Hard egg"
 
 // The server refreshes a session's last-seen time at most once an hour, so don't claim more precision than that.
 const relTime = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
@@ -1831,13 +1832,14 @@ function activityList(items) {
   const row = (a) => {
     const [icon, text, pts] =
       a.type === 'found' ? ['🥚', `Found the ${esc(a.levelName)} egg at ${at(a)}`, `+${a.points}`]
-      : a.type === 'hid' ? ['📍', `Hid a ${esc(a.levelName)} egg at ${at(a)}`]
+      : a.type === 'hid' ? ['📍', `Hid ${anA(a.levelName)} ${esc(a.levelName)} egg at ${at(a)}`]
       : a.type === 'egg_found' ? ['👀', `<b>${esc(a.by)}</b> found your ${esc(a.levelName)} egg at ${at(a)}`]
       : a.type === 'joined_group' ? ['👥', `Joined <a href="#/group/${encodeURIComponent(a.groupId)}">${esc(a.groupName)}</a>`]
       : ['🎟️', 'Joined Lookout'];
     return `<li><span class="act-ic" aria-hidden="true">${icon}</span><p>${text}<small>${fmtWhen(a.at)}</small></p>${pts ? `<b class="act-pts">${pts}</b>` : ''}</li>`;
   };
-  return `<ol class="activity">${items.map(row).join('')}</ol>`;
+  // Its own scroll box, so a long history doesn't stretch the whole profile page.
+  return `<div class="activity-scroll" tabindex="0" aria-label="Activity"><ol class="activity">${items.map(row).join('')}</ol></div>`;
 }
 
 // Username (public: leaderboards, profile) and chat name (anonymous: group chats only).
@@ -2006,7 +2008,7 @@ async function viewNotifications() {
   const row = (n) =>
     n.type === 'egg_found'
       ? `<li class="${n.unseen ? 'is-new' : ''}"><span class="act-ic" aria-hidden="true">🎉</span><p><b>${esc(n.by)}</b> found your ${esc(n.levelName)} egg at ${at(n)}<small>${fmtWhen(n.at)}${n.unseen ? ' · New' : ''}</small></p><b class="act-pts">+${n.points}</b></li>`
-      : `<li class="nt-egg"><img src="${apiUrl(n.photoUrl)}" alt="Your egg at ${esc(n.stationName)}" loading="lazy" /><p>You hid a ${esc(n.levelName)} egg${n.name ? ` (${esc(n.name)})` : ''} at ${at(n)}${n.hint ? `<small>Hint: ${esc(n.hint)}</small>` : ''}<small>${fmtWhen(n.at)} · ${EGG_STATUS[n.status] ?? esc(n.status)} · ${n.timesFound ? `found ${plural(n.timesFound, 'time')}` : 'not found yet'}</small></p></li>`;
+      : `<li class="nt-egg"><img src="${apiUrl(n.photoUrl)}" alt="Your egg at ${esc(n.stationName)}" loading="lazy" /><p>You hid ${anA(n.levelName)} ${esc(n.levelName)} egg${n.name ? ` (${esc(n.name)})` : ''} at ${at(n)}${n.hint ? `<small>Hint: ${esc(n.hint)}</small>` : ''}<small>${fmtWhen(n.at)} · ${EGG_STATUS[n.status] ?? esc(n.status)} · ${n.timesFound ? `found ${plural(n.timesFound, 'time')}` : 'not found yet'}</small></p></li>`;
   const ask = 'Notification' in window && Notification.permission === 'default';
   app.innerHTML = `
     <h1 class="page-h">Notifications</h1>
@@ -2017,7 +2019,7 @@ async function viewNotifications() {
     </div>
     ${ask ? '<div class="nt-ask"><button id="allow" class="btn btn-ghost" type="button">🔔 Turn on alerts</button></div>' : ''}
     ${data.items.length
-      ? `<ol class="activity nt-list">${data.items.map(row).join('')}</ol>`
+      ? `<div class="activity-scroll" tabindex="0" aria-label="Notifications"><ol class="activity nt-list">${data.items.map(row).join('')}</ol></div>`
       : '<div class="empty"><p>No eggs yet</p><a class="btn btn-ghost" href="#/">Find a station</a></div>'}`;
   $('#allow')?.addEventListener('click', async () => {
     const r = await Notification.requestPermission().catch(() => 'denied');
