@@ -877,7 +877,6 @@ function viewSignup(mode = 'register') {
       <div class="tk-top">
         <span class="brand brand-l"><img src="icon.svg" alt="" width="36" height="36" />Lookout</span>
         <h1 class="welcome-h">Find what's hiding in your station.</h1>
-        <p class="welcome-p">Riders photograph small things in MBTA stations. You get the photo and a timer. Find it, take a photo, and score for your line.</p>
       </div>
       <div class="tk-perf" aria-hidden="true"></div>
       <div class="tk-bottom stack">
@@ -886,18 +885,15 @@ function viewSignup(mode = 'register') {
           <button type="button" role="tab" data-mode="login" aria-selected="${!registering}">Sign in</button>
         </div>
         ${registering ? `<label class="field-label" for="email">Email</label>
-        <input id="email" class="input" type="email" maxlength="254" autocomplete="email" autocapitalize="none" inputmode="email" required />
-        <p class="field-hint">Private. Only you see it, and you can sign in with it.</p>` : ''}
+        <input id="email" class="input" type="email" maxlength="254" autocomplete="email" autocapitalize="none" inputmode="email" required />` : ''}
         <label class="field-label" for="username">${registering ? 'Username' : 'Username or email'}</label>
-        <input id="username" class="input" maxlength="${registering ? 20 : 254}" autocomplete="username" autocapitalize="none" ${registering ? 'placeholder="e.g. kenmore_kid"' : ''} required />
-        ${registering ? '<p class="field-hint">Shown on leaderboards. Group chats use a separate anonymous name.</p>' : ''}
-        <label class="field-label" for="password">Password ${registering ? `<span class="opt">(at least ${min} characters)</span>` : ''}</label>
-        <input id="password" class="input" type="password" maxlength="200" ${registering ? `minlength="${min}"` : ''} autocomplete="${registering ? 'new-password' : 'current-password'}" required />
+        <input id="username" class="input" maxlength="${registering ? 20 : 254}" autocomplete="username" autocapitalize="none" required />
+        <label class="field-label" for="password">Password</label>
+        <input id="password" class="input" type="password" maxlength="200" ${registering ? `minlength="${min}" placeholder="At least ${min} characters"` : ''} autocomplete="${registering ? 'new-password' : 'current-password'}" required />
         <button class="btn btn-ink btn-block btn-l">${registering ? 'Start playing' : 'Sign in'}</button>
         <div id="err"></div>
       </div>
-    </form>
-    <div id="teaser"></div>`;
+    </form>`;
   app.querySelectorAll('.seg button').forEach((b) => b.addEventListener('click', () => viewSignup(b.dataset.mode)));
   $('#auth').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -919,12 +915,6 @@ function viewSignup(mode = 'register') {
       btn.disabled = false;
     }
   });
-  api('/api/leaderboard')
-    .then((b) => {
-      const t = $('#teaser');
-      if (t && b.lines.length) t.innerHTML = lineWar(b.lines, { title: 'Line war this month', sub: 'Every find scores for its line' });
-    })
-    .catch(() => {});
 }
 
 // Accounts made before emails were required add one before they keep playing.
