@@ -399,7 +399,7 @@ export async function createApp({
   const NOTIFY_LIMIT = 40;
   async function notificationsFor(user, { summary = false } = {}) {
     const seenAt = user.notificationsSeenAt ?? user.createdAt;
-    const mine = await col.eggs.find({ createdBy: user._id }, { projection: { photoId: 1, stationId: 1, level: 1, status: 1, createdAt: 1, timesFound: 1, hint: 1 } }).sort({ createdAt: -1 }).toArray();
+    const mine = await col.eggs.find({ createdBy: user._id }, { projection: { photoId: 1, stationId: 1, level: 1, status: 1, createdAt: 1, timesFound: 1, hint: 1, name: 1 } }).sort({ createdAt: -1 }).toArray();
     const eggIds = mine.map((e) => e._id);
     const none = async () => [];
     const [unseenFinds, finds] = await Promise.all([
@@ -417,6 +417,7 @@ export async function createApp({
       type: 'egg_hidden',
       at: e.createdAt,
       ...where(e),
+      name: e.name ?? null,
       hint: e.hint ?? null,
       photoUrl: photoUrl(e.photoId),
       timesFound: e.timesFound ?? 0,
@@ -790,6 +791,7 @@ export async function createApp({
           level: egg.level,
           levelName: info.name,
           points: info.points,
+          name: egg.name ?? null,
           hint: egg.hint,
           imageUrl: photoUrl(await displayPhotoId(egg)),
           blur: info.blur ? (info.blur >= 12 ? 'heavy' : 'light') : null,
@@ -972,12 +974,17 @@ export async function createApp({
         }
       }
       const hint = String(body?.hint ?? '').trim().slice(0, 80);
+      // What the photo shows, in the hider's words ("sticker", "red sign"). Checked against the photo.
+      const name = String(body?.name ?? '').trim().replace(/\s+/g, ' ');
+      if (name.length < 2) fail(400, 'Say what it is, like "sticker" or "red sign".');
+      if (name.length > 40) fail(400, 'Keep what it is short: 40 characters at most.');
+      if (/[<>]/.test(name)) fail(400, 'What it is can only be plain words.');
       // Screen the photo first: no faces, a real object to find, not a blank wall.
       // Cheap checks (slot taken, find already used) still run before the Gemini call.
       if (!body?.findId) {
         if (await slots.activeEgg(col, undefined, s.id, level)) fail(409, 'This level already has an egg. Find it first to earn the right to hide the next one.');
       }
-      const screening = await screen({ jpeg: image.data, type: image.contentType, apiKey: geminiKey, model: geminiModel });
+      const screening = await screen({ jpeg: image.data, type: image.contentType, name, apiKey: geminiKey, model: geminiModel });
       if (!screening.ok) fail(screening.problem === 'unavailable' ? 503 : 422, screening.message);
       const t = now();
       const eggId = crypto.randomUUID();
@@ -1002,7 +1009,7 @@ export async function createApp({
         await slots.placeEgg(
           col,
           session,
-          { _id: eggId, stationId: s.id, level, photoId, ...(displayPhotoId && { displayPhotoId }), hint, createdBy: user._id },
+          { _id: eggId, stationId: s.id, level, photoId, ...(displayPhotoId && { displayPhotoId }), name, hint, createdBy: user._id },
           t,
         );
       });

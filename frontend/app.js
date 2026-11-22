@@ -1006,10 +1006,11 @@ function viewPlay() {
     <section class="tk play-tk">
       <div class="tk-top">
         <div class="egg-photo">
-          <img src="${apiUrl(egg.imageUrl)}" alt="The egg to find: a photo of something in this station" />
+          <img src="${apiUrl(egg.imageUrl)}" alt="The egg to find: ${egg.name ? esc(egg.name) : 'a photo of something in this station'}" />
           ${tag ? `<p class="first-tag">${esc(tag)}</p>` : ''}
           ${egg.blur ? `<p class="blur-tag">${egg.blur === 'heavy' ? 'Heavily blurred' : 'Blurred'}: ${esc(egg.levelName)}</p>` : ''}
         </div>
+        ${egg.name ? `<p class="hint"><b>Find</b> ${esc(egg.name)}</p>` : ''}
         ${egg.hint ? `<p class="hint"><b>Hint</b> ${esc(egg.hint)}</p>` : ''}
       </div>
       <div class="tk-perf" aria-hidden="true"></div>
@@ -1288,6 +1289,9 @@ function viewHide() {
       </div>
       <div class="tk-perf" aria-hidden="true"></div>
       <div class="tk-bottom">
+        <label class="field-label" for="eggName">What is it?</label>
+        <input id="eggName" class="input" maxlength="40" required placeholder="e.g. sticker, red sign, cracked tile" />
+        <p class="field-hint">Finders see this. It has to match what's in the photo.</p>
         <label class="field-label" for="hint">Hint <span class="opt">(optional, one line)</span></label>
         <input id="hint" class="input" maxlength="80" placeholder="e.g. near the stairs to outbound" />
         <p class="clock-ctx">You score when your egg beats people. Each player who runs out of time adds to its bounty, and you get half when someone finally finds it. An egg nobody finds pays nothing, so make it hard but findable.</p>
@@ -1319,11 +1323,17 @@ function viewHide() {
 
   $('#submit').addEventListener('click', async () => {
     const btn = $('#submit');
+    const name = $('#eggName').value.trim();
+    if (name.length < 2) {
+      $('#err').innerHTML = '<div class="notice bad">Say what it is, like "sticker" or "red sign".</div>';
+      $('#eggName').focus();
+      return;
+    }
     btn.disabled = true;
     btn.textContent = 'Checking your photo';
     $('#err').innerHTML = '';
     try {
-      await api('/api/eggs', { stationId: hide.stationId, level: hide.level, findId: hide.findId, hint: $('#hint').value, image });
+      await api('/api/eggs', { stationId: hide.stationId, level: hide.level, findId: hide.findId, name, hint: $('#hint').value, image });
       state.pendingHide = null;
       state.stations = null; // egg counts changed
       toast('Egg hidden. Now someone else has to find it.');
@@ -1643,7 +1653,7 @@ async function viewNotifications() {
   const row = (n) =>
     n.type === 'egg_found'
       ? `<li class="${n.unseen ? 'is-new' : ''}"><span class="act-ic" aria-hidden="true">🎉</span><p><b>${esc(n.by)}</b> found your ${esc(n.levelName)} egg at ${at(n)}<small>${fmtWhen(n.at)}${n.unseen ? ' · New' : ''}</small></p><b class="act-pts">+${n.points}</b></li>`
-      : `<li class="nt-egg"><img src="${apiUrl(n.photoUrl)}" alt="Your egg at ${esc(n.stationName)}" loading="lazy" /><p>You hid a ${esc(n.levelName)} egg at ${at(n)}${n.hint ? `<small>Hint: ${esc(n.hint)}</small>` : ''}<small>${fmtWhen(n.at)} · ${EGG_STATUS[n.status] ?? esc(n.status)} · ${n.timesFound ? `found ${plural(n.timesFound, 'time')}` : 'not found yet'}</small></p></li>`;
+      : `<li class="nt-egg"><img src="${apiUrl(n.photoUrl)}" alt="Your egg at ${esc(n.stationName)}" loading="lazy" /><p>You hid a ${esc(n.levelName)} egg${n.name ? ` (${esc(n.name)})` : ''} at ${at(n)}${n.hint ? `<small>Hint: ${esc(n.hint)}</small>` : ''}<small>${fmtWhen(n.at)} · ${EGG_STATUS[n.status] ?? esc(n.status)} · ${n.timesFound ? `found ${plural(n.timesFound, 'time')}` : 'not found yet'}</small></p></li>`;
   const ask = 'Notification' in window && Notification.permission === 'default';
   app.innerHTML = `
     <h1 class="page-h">Notifications</h1>
