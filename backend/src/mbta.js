@@ -58,9 +58,10 @@ export function createMbta({ apiKey, cacheFile, shapesFile } = {}) {
     const hit = predCache.get(stopId);
     if (hit && Date.now() - hit.at < PREDICTION_CACHE_MS) return withFreshSeconds(hit.trains);
 
-    const json = await get(
-      `/predictions?filter[stop]=${encodeURIComponent(stopId)}&filter[route_type]=0,1&include=trip`,
-    );
+    const [json, dirs] = await Promise.all([
+      get(`/predictions?filter[stop]=${encodeURIComponent(stopId)}&filter[route_type]=0,1&include=trip`),
+      directions().catch(() => ({})), // "North" / "Alewife" for each route and direction
+    ]);
     const headsigns = new Map(
       (json.included ?? []).filter((i) => i.type === 'trip').map((t) => [t.id, t.attributes.headsign]),
     );
@@ -76,6 +77,8 @@ export function createMbta({ apiKey, cacheFile, shapesFile } = {}) {
           color: LINES[routeId]?.color ?? '#555555',
           headsign: headsigns.get(tripId) ?? '',
           directionId: p.attributes.direction_id,
+          directionName: dirs[routeId]?.names?.[p.attributes.direction_id] ?? '',
+          destination: dirs[routeId]?.destinations?.[p.attributes.direction_id] ?? '',
           status: p.attributes.status,
           at: time,
         };
@@ -200,5 +203,6 @@ function withFreshSeconds(trains) {
   return trains
     .map((t) => ({ ...t, seconds: Math.round((Date.parse(t.at) - now) / 1000) }))
     .filter((t) => t.seconds > -30)
-    .slice(0, 8);
+    // up to 3 per route and direction, so a busy line (Green at Park Street) can't crowd out the others
+    .filter((t, _, all) => all.filter((x) => x.routeId === t.routeId && x.directionId === t.directionId).indexOf(t) < 3);
 }

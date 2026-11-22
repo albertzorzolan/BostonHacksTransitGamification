@@ -228,6 +228,16 @@ html[data-line="Orange"] .btn-primary:hover { color: var(--ticket); }
 .next-min { font-weight: 800; font-stretch: 80%; font-size: 2.4rem; line-height: 1; font-variant-numeric: tabular-nums; }
 .next-min small { font-size: var(--text-sm); font-weight: 600; font-stretch: 100%; margin-left: var(--space-3xs); color: var(--ink-2); }
 .next-min .now { font-size: 1.4rem; color: var(--here); }
+.train-board { display: grid; gap: var(--space-xs); }
+.dirs { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-sm); }
+.dirs li { display: grid; grid-template-columns: 6px minmax(0, 1fr) auto; gap: var(--space-sm); align-items: center; }
+.dirs-txt { min-width: 0; }
+.dirs-to { font-weight: 800; font-stretch: var(--wide); font-size: 1.1rem; line-height: 1.15; overflow-wrap: anywhere; }
+.dirs-sub { color: var(--ink-2); font-size: var(--text-sm); line-height: 1.3; }
+.dirs-min { font-weight: 800; font-stretch: 80%; font-size: 1.9rem; line-height: 1; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.dirs-min small { font-size: var(--text-sm); font-weight: 600; font-stretch: 100%; margin-left: var(--space-3xs); color: var(--ink-2); }
+.dirs-min .now { font-size: 1.2rem; color: var(--here); }
+.dirs-none { color: var(--ink-2); font-size: var(--text-sm); font-weight: 600; }
 
 /* daily challenge: a dashed seal waiting for ink */
 .challenge { display: grid; grid-template-columns: 44px 1fr auto; gap: var(--space-sm); align-items: center; padding: var(--space-sm) var(--space-md); border-radius: var(--radius); background: var(--ticket); box-shadow: inset 0 0 0 2px var(--stamp); }
