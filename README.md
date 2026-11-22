@@ -94,7 +94,7 @@ To host `frontend/` somewhere else, set `window.EGG_API_BASE` in `frontend/confi
 - **Rules:**
   - You can't play your own egg, and each egg scores once per player.
   - An egg is retired after 3 reports, or after 7 days live with no finds.
-- **Leaderboard:** this month (Boston time) for everyone, by station, or by line (Red / Orange / Blue / Green). Points include hiders' bounty shares. Tap a player to see their stats and recent finds.
+- **Leaderboard:** switch between **this month** (Boston time, resets on the 1st) and **all time**, for everyone, by station, or by line (Red / Orange / Blue / Green). Points include hiders' bounty shares. Tap a player to see their stats and recent finds.
 
 ## Map
 

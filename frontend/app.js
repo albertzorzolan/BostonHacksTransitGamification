@@ -1239,18 +1239,26 @@ async function viewLeaderboard() {
   loading();
   const stations = await getStations();
   let { mode } = state.board;
+  let period = state.board.period ?? 'month'; // 'month' | 'all'
   let stationId = state.board.stationId || state.lastStationId || stations.find((s) => s.activeEggs)?.id || stations[0]?.id;
   const monthLabel = new Date().toLocaleString('en-US', { month: 'long', timeZone: 'America/New_York' });
   const nextMonth = new Date();
   nextMonth.setMonth(nextMonth.getMonth() + 1, 1);
   const resetLabel = nextMonth.toLocaleString('en-US', { month: 'long', day: 'numeric', timeZone: 'America/New_York' });
 
+  const heading = () => (period === 'month'
+    ? `<h1 class="page-h">${esc(monthLabel)}</h1><p class="page-sub">Everything resets on ${esc(resetLabel)}. Tap a player to see their profile.</p>`
+    : '<h1 class="page-h">All time</h1><p class="page-sub">Every point since the game began. Tap a player to see their profile.</p>');
+
   app.innerHTML = `
-    <h1 class="page-h">${esc(monthLabel)}</h1>
-    <p class="page-sub">Everything resets on ${esc(resetLabel)}. Tap a player to see their tickets.</p>
+    <div class="seg" id="periodSeg" role="tablist" aria-label="Period">
+      <button type="button" role="tab" data-period="month" aria-selected="${period === 'month'}">This month</button>
+      <button type="button" role="tab" data-period="all" aria-selected="${period === 'all'}">All time</button>
+    </div>
+    <div id="lbHead">${heading()}</div>
     <div id="versus"></div>
     <div id="war"></div>
-    <div class="seg" role="tablist" aria-label="Players">
+    <div class="seg" id="modeSeg" role="tablist" aria-label="Players">
       <button type="button" role="tab" data-mode="all" aria-selected="${mode === 'all'}">Everyone</button>
       <button type="button" role="tab" data-mode="station" aria-selected="${mode === 'station'}">One station</button>
     </div>
@@ -1265,10 +1273,10 @@ async function viewLeaderboard() {
   const draw = async () => {
     const box = $('#board');
     box.innerHTML = '<div class="empty"><div class="spin" aria-hidden="true"></div></div>';
-    const q = mode === 'station' ? `?stationId=${encodeURIComponent(stationId)}` : '';
-    const data = await api(`/api/leaderboard${q}`);
+    const q = new URLSearchParams({ period, ...(mode === 'station' && { stationId }) });
+    const data = await api(`/api/leaderboard?${q}`);
     if (mode === 'all') {
-      $('#war').innerHTML = data.lines.length ? lineWar(data.lines) : '';
+      $('#war').innerHTML = data.lines.length ? lineWar(data.lines, period === 'all' ? { sub: "Points at each line's stations, all time" } : {}) : '';
       const mine = data.rows.find((r) => r.userId === state.user.id);
       const rival = mine && data.rows.find((r) => r.rank === mine.rank - 1);
       $('#versus').innerHTML = mine && rival
@@ -1279,7 +1287,7 @@ async function viewLeaderboard() {
             <div class="vs-bar" aria-hidden="true"><span style="--p:${Math.round((mine.points / Math.max(1, rival.points)) * 100)}%"></span></div>
           </section>`
         : mine?.rank === 1
-          ? `<section class="tk versus versus-top"><p class="vs-top"><b>You're 1st this month</b> with ${mine.points} points.</p></section>`
+          ? `<section class="tk versus versus-top"><p class="vs-top"><b>You're 1st ${period === 'month' ? 'this month' : 'of all time'}</b> with ${mine.points} points.</p></section>`
           : '';
     }
     if (!data.rows.length) {
@@ -1301,10 +1309,18 @@ async function viewLeaderboard() {
       .join('')}</ol>`;
   };
 
-  app.querySelectorAll('.seg button').forEach((b) =>
+  app.querySelectorAll('#periodSeg button').forEach((b) =>
+    b.addEventListener('click', () => {
+      period = state.board.period = b.dataset.period;
+      app.querySelectorAll('#periodSeg button').forEach((x) => x.setAttribute('aria-selected', String(x === b)));
+      $('#lbHead').innerHTML = heading();
+      draw();
+    }),
+  );
+  app.querySelectorAll('#modeSeg button').forEach((b) =>
     b.addEventListener('click', () => {
       mode = state.board.mode = b.dataset.mode;
-      app.querySelectorAll('.seg button').forEach((x) => x.setAttribute('aria-selected', String(x === b)));
+      app.querySelectorAll('#modeSeg button').forEach((x) => x.setAttribute('aria-selected', String(x === b)));
       $('#stationPick').hidden = mode !== 'station';
       draw();
     }),

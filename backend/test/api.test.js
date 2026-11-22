@@ -769,3 +769,17 @@ test('bounty: players an egg beats build a pot; the finder takes it and the hide
   assert.equal((await ok('/api/me/progress', null, hider)).level.points, 15);
   assert.equal((await ok('/api/leaderboard?stationId=test-bounty')).rows.find((x) => x.username === 'bhider').points, 15);
 });
+
+test('leaderboard: this month or all time', async () => {
+  const [old, now_] = [await user('lb_old'), await user('lb_new')];
+  // lb_old scores 10 this month, then the month rolls over and lb_new scores 10 too.
+  await db.col.finds.insertOne({ _id: 'lb-old-find', userId: old.id, eggId: 'lb-egg-1', stationId: 'test-count', level: 1, points: 500, month: '2001-01', foundAt: new Date('2001-01-15') });
+  await db.col.finds.insertOne({ _id: 'lb-new-find', userId: now_.id, eggId: 'lb-egg-2', stationId: 'test-count', level: 1, points: 400, month: '2001-02', foundAt: new Date('2001-02-15') });
+  const month = await ok('/api/leaderboard?month=2001-02');
+  assert.deepEqual([month.period, month.month, month.rows.map((r) => r.username)], ['month', '2001-02', ['lb_new']]);
+  const all = await ok('/api/leaderboard?period=all');
+  assert.deepEqual([all.period, all.month], ['all', null]);
+  assert.deepEqual(all.rows.slice(0, 2).map((r) => [r.username, r.points, r.rank]), [['lb_old', 500, 1], ['lb_new', 400, 2]]);
+  const station = await ok('/api/leaderboard?period=all&stationId=test-count');
+  assert.ok(station.rows.some((r) => r.username === 'lb_old'), 'all time works per station too');
+});
