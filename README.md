@@ -97,11 +97,10 @@ To host `frontend/` somewhere else, set `window.EGG_API_BASE` in `frontend/confi
 
 ## Map
 
-- **Every station's egg count:** a badge in its line colour when it has eggs.
-- **Faded badges:** shown once you've found (or hidden) every egg there.
-- **Empty stations:** a grey "0" when zoomed in, and a small dot when zoomed out to city level, so the map stays readable.
-- **Totals above the map:** eggs hidden, stations with eggs, and how many are left for you.
-- **Fresh counts:** `/api/stations` returns `activeEggs` for every station and `totals`. When you're signed in, it also returns `playable`, the eggs that aren't yours and that you haven't found yet.
+- **Lines drawn like the T map** from MBTA route shapes (`/api/map/lines`, cached in `backend/data/shapes.json`), with line filter chips and a find-me button.
+- **Live trains** (`/api/map/vehicles`, cached 15 s) drawn as cars gliding along the real track, about 25 s behind their reports. Tap a train for its destination, current stop, direction, car numbers and crowding; Follow keeps it centred.
+- **Stations:** a badge with the egg count where eggs are up, a dot when you've found eggs there, a pulsing ring when someone is hunting now. Tap one for its card: eggs up, your finds, players hunting now, finds this month and the station's Keeper (most finds this month) (`/api/map/stations`).
+- **Totals above the map:** eggs hidden, stations with eggs, and how many are left for you. `/api/stations` returns `activeEggs` for every station and `totals`; signed in, it also returns `playable` (eggs that aren't yours and you haven't found).
 
 ## Progress
 

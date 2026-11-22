@@ -15,6 +15,7 @@ const MAX_BODY_BYTES = 4 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 2.5 * 1024 * 1024;
 const HOUSEKEEPING_EVERY_MS = 60_000;
 const SESSION_TOUCH_MS = 60 * 60_000; // refresh last_seen / expiry at most hourly
+const HUNTING_NOW_MS = 15 * 60_000; // a round started in the last 15 minutes counts as hunting now
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -122,6 +123,7 @@ export async function createApp({
 
   // Retiring stale eggs runs lazily on station reads, at most once a minute per instance.
   let lastHousekeeping = -Infinity;
+  let mapLinesCache = null; // route shapes, per instance
   async function housekeeping() {
     const t = now();
     if (t.getTime() - lastHousekeeping < HOUSEKEEPING_EVERY_MS) return;
@@ -992,6 +994,77 @@ export async function createApp({
       });
     },
 
+    // ----- map -----
+    // Route shapes to draw the lines. Loaded once per instance; empty if the MBTA API can't be reached.
+    async mapLines() {
+      if (!mapLinesCache) {
+        try {
+          mapLinesCache = typeof mbta.shapes === 'function' ? await mbta.shapes() : [];
+        } catch (err) {
+          console.warn('[mbta] could not load shapes:', err.message);
+          return { lines: [] };
+        }
+      }
+      return { lines: mapLinesCache };
+    },
+
+    // Live train positions (the MBTA client caches these for a few seconds).
+    async mapVehicles() {
+      try {
+        return { vehicles: typeof mbta.vehicles === 'function' ? await mbta.vehicles() : [] };
+      } catch (err) {
+        return { vehicles: [], error: `Live trains unavailable (${err.message}).` };
+      }
+    },
+
+    // Per-station numbers for the map: eggs up, people hunting now, finds this month,
+    // your finds there, and this month's Keeper (most finds at the station).
+    async mapStations(ctx) {
+      await ensureStations();
+      await housekeeping();
+      const t = now();
+      const month = game.monthKey(t);
+      const since = new Date(t.getTime() - HUNTING_NOW_MS);
+      const count = (c, match, key = '$stationId') => c.aggregate([{ $match: match }, { $group: { _id: key, n: { $sum: 1 } } }]).toArray();
+      const [eggs, hunting, monthFinds, mine, keepers] = await Promise.all([
+        count(col.eggs, { status: 'active' }),
+        // Players who started a round in the last 15 minutes, per station (attempts only know the egg).
+        col.attempts
+          .aggregate([
+            { $match: { startedAt: { $gt: since } } },
+            { $lookup: { from: col.eggs.collectionName, localField: 'eggId', foreignField: '_id', as: 'e' } },
+            { $group: { _id: { $first: '$e.stationId' }, users: { $addToSet: '$userId' } } },
+            { $project: { n: { $size: '$users' } } },
+          ])
+          .toArray(),
+        count(col.finds, { month }),
+        ctx.user ? count(col.finds, { userId: ctx.user._id }) : [],
+        // This month's Keeper per station: most finds, then most points, then username.
+        col.finds
+          .aggregate([
+            { $match: { month } },
+            { $group: { _id: { stationId: '$stationId', userId: '$userId' }, n: { $sum: 1 }, points: { $sum: '$points' } } },
+            { $lookup: { from: col.users.collectionName, localField: '_id.userId', foreignField: '_id', as: 'u' } },
+            { $set: { username: { $first: '$u.username' } } },
+            { $sort: { n: -1, points: -1, username: 1 } },
+            { $group: { _id: '$_id.stationId', username: { $first: '$username' }, n: { $first: '$n' } } },
+          ])
+          .toArray(),
+      ]);
+      const by = (rows) => new Map(rows.map((r) => [r._id, r]));
+      const [e, h, m, me, k] = [eggs, hunting, monthFinds, mine, keepers].map(by);
+      return {
+        stations: stations.map((s) => ({
+          id: s.id,
+          activeEggs: e.get(s.id)?.n ?? 0,
+          huntingNow: h.get(s.id)?.n ?? 0,
+          findsThisMonth: m.get(s.id)?.n ?? 0,
+          yourFinds: me.get(s.id)?.n ?? 0,
+          keeper: k.get(s.id) ? { username: k.get(s.id).username, finds: k.get(s.id).n } : null,
+        })),
+      };
+    },
+
     // Rider level, today's challenge, stamps, and the stations and lines you've found eggs on.
     // All derived from finds, attempts and eggs: nothing extra is stored.
     async progress(ctx) {
@@ -1269,6 +1342,9 @@ export async function createApp({
     ['POST', /^\/api\/me\/names$/, api.updateNames, 'optional'],
     ['GET', /^\/api\/me\/notifications$/, api.notifications, 'optional'],
     ['POST', /^\/api\/me\/notifications\/seen$/, api.notificationsSeen, 'optional'],
+    ['GET', /^\/api\/map\/lines$/, api.mapLines, 'none'],
+    ['GET', /^\/api\/map\/vehicles$/, api.mapVehicles, 'none'],
+    ['GET', /^\/api\/map\/stations$/, api.mapStations, 'optional'],
     ['GET', /^\/api\/leaderboard$/, api.leaderboard, 'none'],
     ['GET', /^\/api\/groups$/, api.groups, 'optional'],
     ['POST', /^\/api\/groups$/, api.createGroup, 'optional'],

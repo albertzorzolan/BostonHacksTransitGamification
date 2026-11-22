@@ -36,7 +36,7 @@ async function build({ frontendDir = null } = {}) {
   });
   const app = await createApp({
     db,
-    mbta: createMbta({ apiKey: env.MBTA_API_KEY, cacheFile: path.join(BACKEND, 'data', 'stations.json') }),
+    mbta: createMbta({ apiKey: env.MBTA_API_KEY, cacheFile: path.join(BACKEND, 'data', 'stations.json'), shapesFile: path.join(BACKEND, 'data', 'shapes.json') }),
     geminiKey: env.GEMINI_API_KEY ?? '',
     geminiModel: env.GEMINI_MODEL || 'gemini-3.1-flash-lite,gemini-3-flash-preview',
     frontendDir,
